@@ -1,1 +1,20 @@
+// Smoke-test source file for `mtnc check` (Phase 1: lexer stage only).
+// Pulled from patterns shown in Document 1 / Document 2 examples.
 
+/// Computes simple interest on a principal amount.
+fn calculateInterest(principal: f64, rate: f64) -> f64 {
+    return principal * rate;
+}
+
+fn main() {
+    let x: i32 = 10;
+    let y = x + 10;
+    let name = "Mountain";
+    let ratio = 0.5f32;
+    let big = 1_000_000;
+    let hex = 0x2A;
+
+    #target(native) {
+        // native-only code would go here
+    }
+}
