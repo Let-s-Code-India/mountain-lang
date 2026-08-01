@@ -1,1 +1,39 @@
+name: CI (Phase 1 — build & test)
 
+# Minimal, test-only CI: single platform (Ubuntu), just cargo build + cargo
+# test. This exists purely to get a real, externally-verified pass/fail
+# signal for phases where the sandbox this was authored in has no Rust
+# toolchain or crates.io access. The full Windows/Mac/Linux/Android
+# release-artifact build matrix is correctly scoped to Phase 24 of the
+# Document 25 roadmap — this workflow is intentionally NOT that yet.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mtnc
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run test suite
+        run: cargo test --verbose
+
+      - name: Smoke test — mtnc --version
+        run: cargo run -- --version
+
+      - name: Smoke test — mtnc check on example .mtn file
+        run: cargo run -- check examples
