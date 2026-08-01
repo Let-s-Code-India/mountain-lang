@@ -1,0 +1,21 @@
+[package]
+name = "mtnc"
+version = "0.1.0"
+edition = "2021"
+description = "Compiler for the Mountain programming language (Phase 1: scaffold, manifest parsing, lexer)"
+
+# Deliberate design decision for Phase 1 (see PROGRESS.md):
+# zero external crates so this builds with nothing but a stock rustc/cargo
+# and no crates.io registry access. serde/toml/clap (or equivalents) will
+# be considered starting from the phase where we first need real CI/registry
+# access (Phase 24 at the latest); until then everything here is hand-rolled.
+
+[[bin]]
+name = "mtnc"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
