@@ -103,6 +103,47 @@ process with the user:
    by the same general fix. (`Op::Eq` also collides with prelude `Eq`;
    already safe since `Op` is never glob-imported anywhere.)
 
+### CI Run #2 — FAILED (different bug, same category)
+`cargo build` failed with E0659 ("`Keyword`/`Op`/`Delim` is ambiguous").
+Root cause: `lexer.rs`'s test module had **two simultaneous glob imports**
+— `use super::*;` (bringing in the `Keyword`/`Op`/`Delim` *types*) and
+`use crate::token::TokenKind::*;` (bringing in `TokenKind`'s variants,
+which are *also* named `Keyword`/`Op`/`Delim`). Every constructor call
+like `Op(Op::Dot)` became ambiguous between "the `Op` type" and "the
+`TokenKind::Op` variant". This is the same bug *category* as CI Run #1
+(unqualified access to a glob-imported name colliding with something else
+in scope), but a different concrete instance the earlier fix didn't touch,
+since that fix only audited `token.rs`'s own `Display` impls, not every
+file's imports.
+
+**Fix:** removed `use crate::token::TokenKind::*;` entirely; every
+`TokenKind` variant reference across all 24 lexer unit tests is now
+fully qualified (`TokenKind::Op(Op::Dot)`, etc.). Verified via a script
+(not by eye) that after the fix, exactly two `use ...::*;` remain in the
+whole `src/` tree — both are ordinary `use super::*;` in `#[cfg(test)]`
+modules, and neither co-occurs with a second glob import of a colliding
+enum's variants (the actual danger pattern). Grep output confirming this:
+
+```
+$ grep -rn "::\*" mtnc/src/
+mtnc/src/lexer.rs:451:    use super::*;
+mtnc/src/manifest.rs:189:    use super::*;
+```
+(all other grep hits were comment text referencing the removed imports,
+not live code)
+
+Also ran a systematic, whole-crate script check (not manual inspection)
+for the general shape of this bug: for every `pub enum` in the crate,
+does any variant name equal the name of a different declared type?
+Result: exactly the three already-known cases —
+`TokenKind::Keyword`/`TokenKind::Op`/`TokenKind::Delim` colliding with
+the `Keyword`/`Op`/`Delim` types — and nothing else anywhere in the
+crate (`TomlValue`'s `Bool`/`Str`/`Array` variants collide with nothing).
+This pattern is structurally inherent to a wrapper enum like `TokenKind`
+and isn't a problem by itself — it's only a problem when both the type
+and the wrapping enum's variants are glob-imported into one scope at
+once, which no longer happens anywhere in the crate.
+
 ### Design decisions made (flagged, not silently assumed)
 1. **Primitive type names (`i32`, `f64`, `bool`, `String`, etc.) are
    lexed as plain identifiers, not keywords.** Documents 2/3 only list
