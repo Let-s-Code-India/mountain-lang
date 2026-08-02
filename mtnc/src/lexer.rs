@@ -449,7 +449,17 @@ pub fn tokenize(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::token::TokenKind::*;
+    // No `use crate::token::TokenKind::*;` here — see the policy note in
+    // token.rs's Keyword::from_str. TokenKind's own variants are named
+    // `Keyword`, `Op`, and `Delim`, which are *also* the names of the
+    // wrapped types brought in by `use super::*` above (Keyword, Op,
+    // Delim are re-exported from token.rs through lexer.rs's own
+    // `use crate::token::{...}`). Glob-importing both into this module
+    // at once made every `Op(Op::Dot)`/`Keyword(Keyword::Let)`/
+    // `Delim(Delim::Semi)` constructor call ambiguous (E0659) — Rust
+    // couldn't tell whether `Op` meant the type or the `TokenKind::Op`
+    // variant. Every variant below is fully qualified as `TokenKind::X`
+    // instead.
 
     /// Strips the trailing Eof token for easier comparison against
     /// expected-kind lists in tests below.
@@ -457,23 +467,25 @@ mod tests {
         let (toks, _errs) = tokenize(src);
         toks.into_iter()
             .map(|t| t.kind)
-            .filter(|k| !matches!(k, Eof))
+            .filter(|k| !matches!(k, TokenKind::Eof))
             .collect()
     }
 
     fn texts(src: &str) -> Vec<String> {
         let (toks, _errs) = tokenize(src);
         toks.into_iter()
-            .filter(|t| !matches!(t.kind, Eof))
+            .filter(|t| !matches!(t.kind, TokenKind::Eof))
             .map(|t| match t.kind {
-                Keyword(k) => format!("{:?}", k).to_lowercase(),
-                Ident(s) | Int(s) | IntHex(s) | IntOct(s) | IntBin(s) | Float(s)
-                | Str(s) | RawStr(s) | Char(s) | DocComment(s) | Error(s) => s,
-                Bool(b) => b.to_string(),
-                Null => "null".to_string(),
-                Op(o) => o.to_string(),
-                Delim(d) => d.to_string(),
-                Eof => unreachable!(),
+                TokenKind::Keyword(k) => format!("{:?}", k).to_lowercase(),
+                TokenKind::Ident(s) | TokenKind::Int(s) | TokenKind::IntHex(s)
+                | TokenKind::IntOct(s) | TokenKind::IntBin(s) | TokenKind::Float(s)
+                | TokenKind::Str(s) | TokenKind::RawStr(s) | TokenKind::Char(s)
+                | TokenKind::DocComment(s) | TokenKind::Error(s) => s,
+                TokenKind::Bool(b) => b.to_string(),
+                TokenKind::Null => "null".to_string(),
+                TokenKind::Op(o) => o.to_string(),
+                TokenKind::Delim(d) => d.to_string(),
+                TokenKind::Eof => unreachable!(),
             })
             .collect()
     }
@@ -482,7 +494,7 @@ mod tests {
 
     #[test]
     fn primitive_type_name_is_plain_identifier() {
-        assert_eq!(kinds("i32"), vec![Ident("i32".into())]);
+        assert_eq!(kinds("i32"), vec![TokenKind::Ident("i32".into())]);
     }
 
     #[test]
@@ -491,7 +503,7 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(toks.len(), 10); // 9 keywords + Eof
         for t in &toks[..9] {
-            assert!(matches!(t.kind, Keyword(_)), "expected keyword, got {:?}", t.kind);
+            assert!(matches!(t.kind, TokenKind::Keyword(_)), "expected keyword, got {:?}", t.kind);
         }
     }
 
@@ -502,9 +514,9 @@ mod tests {
         // cross-check against Document 3's category list, before the
         // Rust port. See PROGRESS.md.
         assert_eq!(kinds("300 as i32"), vec![
-            Int("300".into()),
-            Keyword(Keyword::As),
-            Ident("i32".into()),
+            TokenKind::Int("300".into()),
+            TokenKind::Keyword(Keyword::As),
+            TokenKind::Ident("i32".into()),
         ]);
     }
 
@@ -513,10 +525,10 @@ mod tests {
         assert_eq!(
             kinds("userName _cache HTTPRequest2 max_retries"),
             vec![
-                Ident("userName".into()),
-                Ident("_cache".into()),
-                Ident("HTTPRequest2".into()),
-                Ident("max_retries".into()),
+                TokenKind::Ident("userName".into()),
+                TokenKind::Ident("_cache".into()),
+                TokenKind::Ident("HTTPRequest2".into()),
+                TokenKind::Ident("max_retries".into()),
             ]
         );
     }
@@ -541,7 +553,7 @@ mod tests {
     fn doc_comment_retained() {
         let (toks, errs) = tokenize("/// computes interest\nfn f() {}");
         assert!(errs.is_empty());
-        assert!(matches!(&toks[0].kind, DocComment(s) if s == "/// computes interest"));
+        assert!(matches!(&toks[0].kind, TokenKind::DocComment(s) if s == "/// computes interest"));
     }
 
     // --- Doc 2 §6.1: integer literals ---
@@ -551,11 +563,11 @@ mod tests {
         assert_eq!(
             kinds("42 0x2A 0o52 0b101010 1_000_000"),
             vec![
-                Int("42".into()),
-                IntHex("0x2A".into()),
-                IntOct("0o52".into()),
-                IntBin("0b101010".into()),
-                Int("1_000_000".into()),
+                TokenKind::Int("42".into()),
+                TokenKind::IntHex("0x2A".into()),
+                TokenKind::IntOct("0o52".into()),
+                TokenKind::IntBin("0b101010".into()),
+                TokenKind::Int("1_000_000".into()),
             ]
         );
     }
@@ -567,10 +579,10 @@ mod tests {
         assert_eq!(
             kinds("3.14 2.0e10 0.5f32 1.0f64"),
             vec![
-                Float("3.14".into()),
-                Float("2.0e10".into()),
-                Float("0.5f32".into()),
-                Float("1.0f64".into()),
+                TokenKind::Float("3.14".into()),
+                TokenKind::Float("2.0e10".into()),
+                TokenKind::Float("0.5f32".into()),
+                TokenKind::Float("1.0f64".into()),
             ]
         );
     }
@@ -579,7 +591,7 @@ mod tests {
 
     #[test]
     fn string_with_escapes() {
-        assert_eq!(kinds(r#""line1\nline2""#), vec![Str(r#""line1\nline2""#.into())]);
+        assert_eq!(kinds(r#""line1\nline2""#), vec![TokenKind::Str(r#""line1\nline2""#.into())]);
     }
 
     #[test]
@@ -589,13 +601,13 @@ mod tests {
         // before the string is ever seen. Caught by the Python harness.
         assert_eq!(
             kinds(r#"r"C:\no\escapes\here""#),
-            vec![RawStr(r#"r"C:\no\escapes\here""#.into())]
+            vec![TokenKind::RawStr(r#"r"C:\no\escapes\here""#.into())]
         );
     }
 
     #[test]
     fn char_literal() {
-        assert_eq!(kinds("'a'"), vec![Char("'a'".into())]);
+        assert_eq!(kinds("'a'"), vec![TokenKind::Char("'a'".into())]);
     }
 
     #[test]
@@ -608,7 +620,10 @@ mod tests {
 
     #[test]
     fn bool_null_literals() {
-        assert_eq!(kinds("true false null"), vec![Bool(true), Bool(false), Null]);
+        assert_eq!(
+            kinds("true false null"),
+            vec![TokenKind::Bool(true), TokenKind::Bool(false), TokenKind::Null]
+        );
     }
 
     // --- Doc 4: full operator round-trip ---
@@ -617,8 +632,10 @@ mod tests {
     fn arithmetic_operators() {
         assert_eq!(
             kinds("+ - * / % **"),
-            vec![Op(Op::Plus), Op(Op::Minus), Op(Op::Star), Op(Op::Slash),
-                 Op(Op::Percent), Op(Op::StarStar)]
+            vec![
+                TokenKind::Op(Op::Plus), TokenKind::Op(Op::Minus), TokenKind::Op(Op::Star),
+                TokenKind::Op(Op::Slash), TokenKind::Op(Op::Percent), TokenKind::Op(Op::StarStar),
+            ]
         );
     }
 
@@ -635,10 +652,10 @@ mod tests {
         assert_eq!(
             kinds("x <<= 1;"),
             vec![
-                Ident("x".into()),
-                Op(Op::ShlEq),
-                Int("1".into()),
-                Delim(Delim::Semi),
+                TokenKind::Ident("x".into()),
+                TokenKind::Op(Op::ShlEq),
+                TokenKind::Int("1".into()),
+                TokenKind::Delim(Delim::Semi),
             ]
         );
     }
@@ -651,7 +668,9 @@ mod tests {
     #[test]
     fn question_question_is_one_token() {
         assert_eq!(kinds("a ?? b"), vec![
-            Ident("a".into()), Op(Op::QuestionQuestion), Ident("b".into())
+            TokenKind::Ident("a".into()),
+            TokenKind::Op(Op::QuestionQuestion),
+            TokenKind::Ident("b".into()),
         ]);
     }
 
@@ -660,10 +679,10 @@ mod tests {
         assert_eq!(
             kinds("result?.field"),
             vec![
-                Ident("result".into()),
-                Op(Op::Question),
-                Op(Op::Dot),
-                Ident("field".into()),
+                TokenKind::Ident("result".into()),
+                TokenKind::Op(Op::Question),
+                TokenKind::Op(Op::Dot),
+                TokenKind::Ident("field".into()),
             ]
         );
     }
@@ -685,7 +704,9 @@ mod tests {
         let (toks, errs) = tokenize("let x = 5 $ let y = 6;");
         assert_eq!(errs.len(), 1);
         // lexing continued past the bad char: both `let` statements present
-        let kw_count = toks.iter().filter(|t| matches!(t.kind, Keyword(Keyword::Let))).count();
+        let kw_count = toks.iter()
+            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Let)))
+            .count();
         assert_eq!(kw_count, 2);
     }
 
