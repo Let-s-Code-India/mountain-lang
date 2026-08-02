@@ -63,6 +63,46 @@ process with the user:
    the user. This phase is not being marked 🟢 until that real run is
    confirmed green, per explicit user instruction.
 
+### CI Run #1 — FAILED (real signal, as expected process)
+`cargo build` failed with 3 compile errors: E0428, E0308, E0618. Root cause
+(confirmed by tracing, cross-checked against the actual error codes):
+
+1. **E0428 — duplicate `Select` variant.** Document 3 lists `select` once
+   under Category D (concurrency `select { case ... }`) and again under
+   Category H (database query-context CRUD keyword). These are the same
+   lexical token reused in two grammatical contexts, not two reserved
+   words — collapsed to a single `Keyword::Select` variant. Disambiguating
+   *which* meaning applies is correctly the Parser's job (Phase 2+), not
+   the Lexer's.
+2. **E0308 / E0618 — prelude shadowing via glob import.** `Keyword::from_str`
+   had `use Keyword::*;` in scope, and several Mountain keywords are
+   spelled identically to Rust prelude items (`Result`, `Ok`, `Err`,
+   `Option`, `Some`, `None`, `Copy`, `Clone`, `Drop`, `Send`, `Sync`,
+   `Sized`, `Default`, `From`, `Into`, `Box`, `Fn` — **17 total**, audited
+   programmatically, see below). The glob import shadowed
+   `std::option::Option::{Some,None}` with the unit variants
+   `Keyword::{Some,None}` inside that function, breaking `Some(x)`
+   (E0618: unit variant isn't callable) and `return None` (E0308: wrong
+   type returned).
+
+   **Fix applied generally, not as a one-off patch:** removed the glob
+   import; every `Keyword` variant reference in `from_str` is now fully
+   qualified (`Keyword::Let`, `Keyword::Ok`, etc.), and the function
+   signature uses `std::option::Option<Keyword>` explicitly. Applied the
+   same "never glob-import a local enum, always qualify" policy to the
+   `Op`/`Delim` `Display` impls too, even though those weren't actually
+   broken (pattern-position matching only resolves through the value
+   namespace, so `Eq => "="` in a `match` arm doesn't hit the same
+   ambiguity a constructor call does) — kept consistent so there's no
+   asymmetric exception for a future reader/editor to trip over.
+
+   Full audit of every `Keyword` variant against the Rust 2021 prelude,
+   run programmatically rather than by inspection:
+   `Box, Clone, Copy, Default, Drop, Err, Fn, From, Into, None, Ok,
+   Option, Result, Send, Sized, Some, Sync` — 17 collisions, all covered
+   by the same general fix. (`Op::Eq` also collides with prelude `Eq`;
+   already safe since `Op` is never glob-imported anywhere.)
+
 ### Design decisions made (flagged, not silently assumed)
 1. **Primitive type names (`i32`, `f64`, `bool`, `String`, etc.) are
    lexed as plain identifiers, not keywords.** Documents 2/3 only list
