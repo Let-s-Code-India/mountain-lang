@@ -12,7 +12,6 @@ spec series).
 ├── .github/workflows/ci.yml   # Phase 1 minimal CI (Ubuntu, build+test only)
 └── mtnc/                      # the actual Rust cargo project
     ├── Cargo.toml
-    ├── PROGRESS.md
     ├── src/
     │   ├── lib.rs
     │   ├── main.rs             # CLI: mtnc build / mtnc check
