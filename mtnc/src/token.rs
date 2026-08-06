@@ -187,6 +187,28 @@ impl Keyword {
             _ => return std::option::Option::None,
         })
     }
+
+    /// Reverse of `from_str`: the original source spelling of a keyword.
+    /// Needed because several Document 3 keywords double as ordinary
+    /// path/module-name segments in real usage (Document 24 §1's `use
+    /// std::db::query;` — `query` is a Category H keyword, yet appears
+    /// here as a plain module-path segment). Most keywords' source
+    /// spelling is exactly their lowercased variant name; the handful
+    /// with non-lowercase source spelling (`Result`, `Ok`, `Err`,
+    /// `Option`, `Some`, `None`, `Self`) are special-cased.
+    pub fn as_source_text(&self) -> String {
+        match self {
+            Keyword::Result => "Result".to_string(),
+            Keyword::Ok => "Ok".to_string(),
+            Keyword::Err => "Err".to_string(),
+            Keyword::Option => "Option".to_string(),
+            Keyword::Some => "Some".to_string(),
+            Keyword::None => "None".to_string(),
+            Keyword::SelfValue => "self".to_string(),
+            Keyword::SelfType => "Self".to_string(),
+            other => format!("{:?}", other).to_lowercase(),
+        }
+    }
 }
 
 /// Operator tokens (Document 4). Word-shaped operators (`as`) are
