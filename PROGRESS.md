@@ -12,7 +12,16 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 
 ## Phase 1 — Project Scaffold, `mountain.toml` Parsing, CLI Skeleton, Lexer
 
-**Status: 🟡 Code complete, logic-verified — pending real CI confirmation**
+**Status: 🟢 Complete — confirmed via real GitHub Actions CI run**
+
+CI run confirmed externally: 29 unit tests + 6 integration tests, 0
+failures, including the specific exit-criteria tests
+(`invalid_character_recoverable_lexing_continues`,
+`unterminated_string_is_recoverable_not_a_crash`,
+`deliberately_invalid_source_is_rejected_not_silently_accepted`). This
+is a real `cargo test` result from GitHub Actions, not sandbox tracing —
+per the standing rule agreed with the user, Phase 1 was not marked 🟢
+until this external confirmation came back.
 
 ### Scope (per Document 25 §2.3)
 - `cargo` project scaffold
@@ -200,7 +209,202 @@ once, which no longer happens anywhere in the crate.
 ---
 
 ## Phase 2 — Parser
-**Status: ⚪ Not started**
+
+**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+
+### Scope (per Document 25 §2.3)
+Hand-written recursive-descent parser with Pratt parsing for expressions,
+producing an untyped AST, covering Document 4 (operator precedence),
+Document 9 (control flow grammar), and Document 23 (authoritative EBNF).
+
+### What was built
+- `src/ast.rs` — full AST node types for the whole Document 23 grammar
+  surface: items (fn/struct/enum/trait/impl/mod/use/import/const/static/
+  type-alias/table/index/schema/ui/component/server/actor/target-block),
+  generics/where-clauses, types, patterns, statements/blocks, and the
+  full expression grammar (33 `Expr` variants).
+- `src/parser.rs` — the parser itself: token-stream helpers, item-level
+  parsing with error recovery (Document 17 §2's synchronize-to-next-item
+  strategy, extended from Document 25 Phase 1's lexer-level precedent),
+  and a Pratt expression parser whose binding-power table was verified
+  against Document 4 §10/§11 via an **executed Python prototype (26/26
+  cases passing)** before being ported to Rust — see the process note
+  below.
+- `tests/parser_doc24.rs` — round-trips Document 24's 6 example programs
+  through Lexer→Parser.
+- Inline `#[cfg(test)]` module in `parser.rs` — 20 unit tests, including
+  all 26 of the Python-verified precedence cases ported 1:1 (Document 4
+  §11's exact verification-pass cases plus the full §10 table spot-check),
+  a non-chaining-comparison rejection test, and a parser-level error-
+  recovery test (one malformed top-level item doesn't block the rest of
+  the file from parsing).
+
+### Process note: verification approach (same discipline as Phase 1)
+Cannot run `cargo build`/`cargo test` in this sandbox (same constraint as
+Phase 1 — no toolchain, no network). Verification performed instead via:
+
+1. **Pratt-parser precedence engine prototyped and executed in Python**
+   (`proto2/pratt_proto.py` + `proto2/run_pratt_tests.py`, not part of
+   the deliverable) before writing any Rust. Found and fixed two real
+   logic bugs this way:
+   - Unary operators were binding looser than `**` (produced `-(a**b)`
+     instead of the correct `(-a)**b`) — fixed by parsing the unary
+     operand via `parse_prefix()` directly rather than `parse_expr(bp)`.
+   - Non-chaining comparison rejection (`a < b < c`) wasn't actually
+     triggering, because giving comparison operators equal left/right
+     binding power let the *second* occurrence get silently absorbed by
+     a fresh recursive call (with its own fresh "have I seen a
+     comparison yet" state) instead of staying in the same stack frame
+     where the check could see it. Fixed by using `(l_bp, l_bp+1)` like
+     ordinary left-associative operators, so a repeated same-row
+     operator stays in the frame that's tracking it.
+   - Final result: 26/26 cases passing, including every row of Document
+     4 §10's table spot-checked pairwise and both exact cases from §11.
+2. **Ported the verified logic 1:1 to Rust**, then applied the Phase-1
+   lesson proactively from the start: every enum reference is fully
+   qualified, no glob-importing a local enum's own variants anywhere
+   `use crate::ast::*` or similar could create the CI-run-#2 class of
+   ambiguity. Verified this **systematically with scripts**, not by
+   eye, before claiming it:
+   - Whole-crate check for the actual danger pattern (wrapper-enum
+     variant name == another declared type name, PLUS both glob-imported
+     into the same scope): only the already-known `TokenKind::{Keyword,
+     Op,Delim}` case exists anywhere in the crate; nothing new introduced.
+   - Every top-level `ast.rs` type name checked against the Rust 2021
+     prelude (the `use crate::ast::*` in `parser.rs` is a full-file glob
+     import) — zero collisions.
+   - The two new local-enum glob imports in the test module
+     (`use BinaryOp::*`, `use AssignOp::*`) checked the same way:
+     `AssignOp::Eq` does collide with the prelude's `Eq` trait, but every
+     occurrence within that scope is in **pattern position** (match arms
+     only), which — per the mechanism already proven safe in Phase 1's
+     `Op`/`Delim` `Display` impls — cannot hit the ambiguity, since
+     pattern resolution only searches the value namespace, not the type
+     namespace where the trait lives.
+3. **Cross-referenced every AST struct-literal and enum-variant usage in
+   `parser.rs` against the actual declarations in `ast.rs`** with a
+   script (not by eye), after this exact review caught two real
+   regressions during editing (see below).
+4. **Systematically scanned all 6 Document 24 examples with the Python
+   lexer harness** for every keyword token appearing in "word" position
+   (path segment after `::`, method/field name after `.`, or immediately
+   before `:` as a would-be named-argument label) — this caught a whole
+   class of real bugs (below) that manual reading of the examples had
+   missed on the first two passes.
+
+### Real bugs found and fixed during this phase (not just claimed — each traced)
+- **Two AST enum variants were accidentally deleted by earlier
+  `str_replace` edits** (`Expr::Return` and `Expr::Throw` both briefly
+  vanished while inserting doc-comments for adjacent variants). Caught
+  immediately by the field/variant cross-reference script — not by
+  compiling, since compiling isn't available here — which is exactly why
+  that script exists as a standing check now, not a one-off.
+- **`use std::db::query;` / `use std::net::server;` would fail to
+  parse** — `query`/`server` are Document 3 keywords, but `use`-path
+  segments were parsed with `expect_ident()`, which rejects keyword
+  tokens outright.
+- **Named-argument labels `on:`/`bind:` (Document 24 §2) would fail** —
+  same root cause, in `parse_arg`'s named-argument lookahead.
+- **`.match(...)`, `.insert(...)`, `.send(...)`, `.recv(...)`,
+  `.message(...)`, `.listen(...)` as method names (Document 24 §1/§4/§5)
+  would all fail** — same root cause, in the postfix `.name` parser.
+- **The single biggest one: `Some(x)` / `None` / `Ok(x)` / `Err(x)` as
+  match patterns — used constantly across Documents 1–24 — would have
+  failed to parse at all**, because `parse_pattern`'s catch-all branch
+  also called `expect_ident()` first, before ever reaching the
+  tuple-struct-pattern logic that would otherwise have handled them.
+- **`server::Http::bind(...)` / `TextDecoration::None` /
+  `MatchingEngine::spawn()` as path *expressions*** (not just patterns)
+  had the same problem one level up: the primary-expression entry gate
+  itself (`check_ident() || check_kw(SelfValue)`) didn't admit a leading
+  keyword at all, so execution never even reached the path-building loop.
+
+**General fix** (not five one-off patches): added `Keyword::as_source_text()`
+(token.rs) — the reverse of `Keyword::from_str` — and a parser-level
+`expect_word()` helper that accepts a plain identifier *or* a keyword
+used as an ordinary word, applied at every name-like position where this
+collision is real: `use`/`import` path segments, named-argument labels,
+postfix `.field`/`.method` names, struct-literal field names, pattern
+heads, and expression path segments. This is a real, structural
+consequence of Mountain's own keyword surface being large (Document 3's
+~95+ keywords) while also reusing many of those same words as ordinary
+stdlib/method/module names (Document 15/16/19's own examples do this
+constantly) — not a parser implementation mistake so much as something
+the grammar itself needs to tolerate, which `expect_word()` now does
+uniformly rather than via scattered special cases.
+
+### Flagged deviations from Document 23 (need explicit sign-off)
+Document 23 was treated as ground truth per this phase's instructions,
+but 6 concrete cases were found where Document 24's *required-to-parse*
+example code doesn't fit Document 23's literal grammar. Each is a small,
+localized, documented extension (or, in one case, an acknowledged open
+gap) rather than a silent reinterpretation:
+
+1. **`fn` inside `ui`/`component` blocks** (`ast.rs`'s `UiItem::Fn`) —
+   Document 23 §10's `ui_item` production only lists
+   `state_decl | prop_decl | render_block | mount_block | unmount_block`.
+   Document 24 §2 declares methods (`fn addTask(borrow mut self) {...}`)
+   directly inside `ui TodoApp { }`. Implemented permissively so §2 parses.
+2. **`try { } catch (e) { }` as an expression**, not just a statement
+   (`Expr::TryCatch`) — Document 23 §8's `try_stmt` is statement-only.
+   Document 24 §1 uses it as `let body = try { ... } catch (e) { ... };`.
+3. **`return expr` usable as a match-arm body expression**
+   (`Expr::Return`), not just a statement — Document 24 §1 has
+   `_ => return HttpResponse::notFound(),` with no enclosing block.
+4. **`style { ... }` / `layout { ... } { ... }` postfix modifiers**
+   (`Expr::Styled`, `Expr::Layout`) — absent from Document 23's EBNF
+   entirely (not a differing snippet — a missing production), but
+   grounded in Document 18 §7/§7.1's own concrete examples rather than
+   invented from nothing. Needed for Document 24 §2 to parse.
+5. **Const-generic argument values** (`Type::ConstArg`) — Document 23's
+   `generic_args` grammar only allows `type`, but Document 8 §8's
+   `Matrix<f64, 2, 3>` needs numeric literals in that position.
+6. **Turbofish (`::<T>`) parsed and discarded** at call sites (Document
+   8 §2, Document 16 §1.21.1's `.parse::<u64>()`) — not tracked in the
+   AST yet since Phase 2's AST is untyped by design (Document 17 §3);
+   this is a pure syntax-acceptance fix, revisit when generics need real
+   representation (Phase 5).
+
+### Known open gap — NOT resolved, explicit ask
+**Document 24 §3's `tensor<f32>[784]` type syntax does not parse**, and
+unlike the cases above, there's no other spec document with a concrete
+example to ground a reasonable extension against — Document 8 §8 and
+Document 16 §1.9 both use tensor/matrix types but never show this exact
+"generic type immediately followed by a `[N]` shape suffix" spelling.
+Document 23's only `[...]` type production is `[T; N]` (array-of-T),
+which is structurally different. `tests/parser_doc24.rs`'s
+`doc24_example3_ai_training_loop_up_to_known_gap` test isolates this:
+everything else in Example 3 (struct/impl, named args, closures over
+tuples, `gradient(..., respectTo: ...)`, `for epoch in 0..10`) is
+asserted to parse cleanly, and the tensor-shape fragment is asserted to
+still fail, with a comment pointing back here. **This needs your
+guidance** — options as I see them: (a) treat `tensor<f32>[784]` as
+sugar for a `Named("tensor", [f32; expr])`-shaped const-generic array
+type, (b) treat the trailing `[N]` as a distinct postfix "shape"
+annotation attached to the type, or (c) something else you have in mind
+for Document 8's own tensor-shape story. I didn't want to guess at
+which one is intended and bake it into the parser unilaterally.
+
+### Exit criteria (Document 25 §2.3) — self-assessment
+> "Parser round-trips every code example in Doc 24 into a correct AST;
+> precedence table (Doc 4 §10) verified via the exact test cases in
+> Doc 4 §11"
+
+- Document 4 §11's exact cases + full §10 table (26 cases): ✅ passing
+  (Python-verified, then ported and re-verified by direct comparison).
+- Document 24 examples 1, 2, 4, 5, 6: ✅ parse cleanly (asserted in
+  `tests/parser_doc24.rs`, pending real `cargo test` confirmation).
+- Document 24 example 3: ⚠️ parses except for the flagged tensor-shape
+  gap above — **not fully met**, blocked on your input.
+- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+
+### `.github/workflows/ci.yml`
+No changes needed — `cargo test --verbose` already picks up the new
+`tests/parser_doc24.rs` file and the new unit tests in `parser.rs`
+automatically; the workflow itself doesn't need to know about individual
+test files.
+
+---
 
 ## Phases 3–25
 **Status: ⚪ Not started**
