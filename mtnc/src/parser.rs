@@ -1794,6 +1794,12 @@ mod tests {
                 to_sexpr(callee),
                 args.iter().map(|a| to_sexpr(&a.value)).collect::<Vec<_>>().join(", ")
             ),
+            Expr::MethodCall { receiver, name, args } => format!(
+                "(methodcall {} {} [{}])",
+                to_sexpr(receiver),
+                name,
+                args.iter().map(|a| to_sexpr(&a.value)).collect::<Vec<_>>().join(", ")
+            ),
             Expr::Index { expr, index } => format!("(index {} {})", to_sexpr(expr), to_sexpr(index)),
             Expr::Range { lo, hi, inclusive } => format!("({} {} {})", if *inclusive { ".." } else { ".." }, to_sexpr(lo), to_sexpr(hi)),
             other => format!("{:?}", other),
@@ -1932,7 +1938,19 @@ mod tests {
         assert_eq!(to_sexpr(&parse_expr_str("a.b.c")), "(. (. a b) c)");
     }
     #[test] fn call_then_field() {
-        assert_eq!(to_sexpr(&parse_expr_str("a.b(1).c")), "(. (call (. a b) [1]) c)");
+        // a.b(1) is a single MethodCall node (receiver=a, name=b, args=[1]),
+        // not Field(a,b) generically Call'd -- Document 23's postfix_op
+        // grammar combines ".IDENT" with an optional "(args)" as ONE
+        // production, and the parser correctly builds one MethodCall
+        // node when the parens are present. The original expected value
+        // here ("(call (. a b) [1])") was carried over from the Python
+        // precedence-prototype, which never modeled method calls as a
+        // distinct case (it only needed to validate precedence/
+        // associativity, not full postfix semantics) -- it's the
+        // prototype's simplification that was wrong here, not this
+        // parser. Corrected to match what the AST is actually supposed
+        // to produce.
+        assert_eq!(to_sexpr(&parse_expr_str("a.b(1).c")), "(. (methodcall a b [1]) c)");
     }
 
     // ---- Structural sanity: does the parser accept a realistic
