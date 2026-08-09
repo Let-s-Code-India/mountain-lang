@@ -46,6 +46,10 @@ impl Parser {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
     }
 
+    fn peek_at(&self, offset: usize) -> &TokenKind {
+        &self.tokens[(self.pos + offset).min(self.tokens.len() - 1)].kind
+    }
+
     fn peek_kind(&self) -> &TokenKind {
         &self.peek().kind
     }
@@ -149,6 +153,35 @@ impl Parser {
         self.expect_ident()
     }
 
+    /// Consumes zero or more `::segment` path continuations after an
+    /// already-consumed first segment, stopping BEFORE a `::<...>`
+    /// turbofish (left for callers that care about it to handle
+    /// separately). Shared by type parsing and expression-path parsing
+    /// so a multi-segment path like `orderbook::OrderBook` (Document 24
+    /// §4) or `layers::Dense` (Document 24 §3) parses correctly in
+    /// both positions from one fix, rather than two separate ones —
+    /// this was traced to be the same root cause for both failures, not
+    /// a coincidence. Also the reason `channel::<i32>()` (Document 24
+    /// §5) now parses: previously the path-building loop unconditionally
+    /// tried to consume another word after every `::`, including when
+    /// the `::` was actually introducing generic args, so it choked on
+    /// the `<` instead of leaving it for the turbofish-handling code
+    /// that already existed right after the loop.
+    fn parse_further_path_segments(&mut self) -> ParseResult<Vec<String>> {
+        let mut extra = Vec::new();
+        loop {
+            if !self.check_op(Op::ColonColon) { break; }
+            let save = self.pos;
+            self.advance();
+            if self.check_op(Op::Lt) {
+                self.pos = save;
+                break;
+            }
+            extra.push(self.expect_word()?);
+        }
+        Ok(extra)
+    }
+
     // ---------- top level ----------
 
     pub fn parse_program(&mut self) -> Program {
@@ -186,7 +219,7 @@ impl Parser {
         let mut attrs = Vec::new();
         while self.check_op(Op::At) {
             self.advance();
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             let mut args = Vec::new();
             if self.eat_delim(Delim::LParen) {
                 if !self.check_delim(Delim::RParen) {
@@ -280,12 +313,12 @@ impl Parser {
 
     fn parse_target_kind(&mut self) -> ParseResult<TargetKind> {
         self.expect_op(Op::Hash)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         if name != "target" {
             return self.error("expected `target` after `#`");
         }
         self.expect_delim(Delim::LParen)?;
-        let word = self.expect_ident()?;
+        let word = self.expect_word()?;
         let kind = match word.as_str() {
             "native" => TargetKind::Native,
             "wasm" => TargetKind::Wasm,
@@ -318,12 +351,12 @@ impl Parser {
         loop {
             if self.check_op(Op::Gt) { break; }
             if self.eat_kw(Keyword::Const) {
-                let name = self.expect_ident()?;
+                let name = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
                 let ty = self.parse_type()?;
                 params.push(GenericParam::Const { name, ty });
             } else {
-                let name = self.expect_ident()?;
+                let name = self.expect_word()?;
                 let mut bounds = Vec::new();
                 if self.eat_delim(Delim::Colon) {
                     bounds.push(self.parse_trait_bound()?);
@@ -340,7 +373,7 @@ impl Parser {
     }
 
     fn parse_trait_bound(&mut self) -> ParseResult<TraitBound> {
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let args = self.parse_generic_args_opt()?;
         Ok(TraitBound { name, args })
     }
@@ -379,7 +412,7 @@ impl Parser {
         }
         let mut bounds = Vec::new();
         loop {
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             self.expect_delim(Delim::Colon)?;
             let mut tb = vec![self.parse_trait_bound()?];
             while self.eat_op(Op::Plus) {
@@ -397,7 +430,7 @@ impl Parser {
     fn parse_fn_decl(&mut self) -> ParseResult<FnDecl> {
         let is_async = self.eat_kw(Keyword::Async);
         self.expect_kw(Keyword::Fn)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let generics = self.parse_generic_params()?;
         self.expect_delim(Delim::LParen)?;
         let mut params = Vec::new();
@@ -430,7 +463,7 @@ impl Parser {
             // then a separate Dot for the third '.'; accept either
             // '...'-as-three-dots spelling by also consuming a trailing Dot.
             self.eat_op(Op::Dot);
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             self.expect_delim(Delim::Colon)?;
             let ty = self.parse_type()?;
             return Ok(Param { ownership: OwnershipMod::None, name, is_variadic: true, ty, default: None });
@@ -447,7 +480,7 @@ impl Parser {
             self.advance();
             "self".to_string()
         } else {
-            self.expect_ident()?
+            self.expect_word()?
         };
         if name == "self" {
             return Ok(Param { ownership, name, is_variadic: false, ty: Type::Unit, default: None });
@@ -462,7 +495,7 @@ impl Parser {
 
     fn parse_struct_decl(&mut self) -> ParseResult<StructDecl> {
         self.expect_kw(Keyword::Struct)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let generics = self.parse_generic_params()?;
         let body = if self.eat_delim(Delim::Semi) {
             StructBody::Unit
@@ -484,7 +517,7 @@ impl Parser {
             let mut fields = Vec::new();
             while !self.check_delim(Delim::RBrace) {
                 let visibility = self.parse_visibility()?;
-                let name = self.expect_ident()?;
+                let name = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
                 let ty = self.parse_type()?;
                 fields.push(FieldDecl { visibility, name, ty });
@@ -498,12 +531,12 @@ impl Parser {
 
     fn parse_enum_decl(&mut self) -> ParseResult<EnumDecl> {
         self.expect_kw(Keyword::Enum)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let generics = self.parse_generic_params()?;
         self.expect_delim(Delim::LBrace)?;
         let mut variants = Vec::new();
         while !self.check_delim(Delim::RBrace) {
-            let vname = self.expect_ident()?;
+            let vname = self.expect_word()?;
             let mut data = Vec::new();
             if self.eat_delim(Delim::LParen) {
                 if !self.check_delim(Delim::RParen) {
@@ -524,13 +557,13 @@ impl Parser {
 
     fn parse_trait_decl(&mut self) -> ParseResult<TraitDecl> {
         self.expect_kw(Keyword::Trait)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let generics = self.parse_generic_params()?;
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
             if self.eat_kw(Keyword::Type) {
-                let n = self.expect_ident()?;
+                let n = self.expect_word()?;
                 self.expect_delim(Delim::Semi)?;
                 items.push(TraitItem::AssocType(n));
             } else {
@@ -542,7 +575,7 @@ impl Parser {
     }
 
     fn parse_type_ref(&mut self) -> ParseResult<TypeRef> {
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let args = self.parse_generic_args_opt()?;
         Ok(TypeRef { name, args })
     }
@@ -562,7 +595,7 @@ impl Parser {
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
             if self.eat_kw(Keyword::Type) {
-                let n = self.expect_ident()?;
+                let n = self.expect_word()?;
                 self.expect_op(Op::Eq)?;
                 let ty = self.parse_type()?;
                 self.expect_delim(Delim::Semi)?;
@@ -577,7 +610,7 @@ impl Parser {
 
     fn parse_mod_decl(&mut self) -> ParseResult<ModDecl> {
         self.expect_kw(Keyword::Mod)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) && !self.at_end() {
@@ -619,7 +652,7 @@ impl Parser {
 
     fn parse_const_decl(&mut self) -> ParseResult<ConstDecl> {
         self.expect_kw(Keyword::Const)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::Colon)?;
         let ty = self.parse_type()?;
         self.expect_op(Op::Eq)?;
@@ -630,7 +663,7 @@ impl Parser {
 
     fn parse_static_decl(&mut self) -> ParseResult<StaticDecl> {
         self.expect_kw(Keyword::Static)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::Colon)?;
         let ty = self.parse_type()?;
         self.expect_op(Op::Eq)?;
@@ -641,7 +674,7 @@ impl Parser {
 
     fn parse_type_alias(&mut self) -> ParseResult<TypeAliasDecl> {
         self.expect_kw(Keyword::Type)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         let generics = self.parse_generic_params()?;
         self.expect_op(Op::Eq)?;
         let ty = self.parse_type()?;
@@ -653,11 +686,11 @@ impl Parser {
 
     fn parse_table_decl(&mut self) -> ParseResult<TableDecl> {
         self.expect_kw(Keyword::Table)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut fields = Vec::new();
         while !self.check_delim(Delim::RBrace) {
-            let fname = self.expect_ident()?;
+            let fname = self.expect_word()?;
             self.expect_delim(Delim::Colon)?;
             let ty = self.parse_type()?;
             let mut constraints = Vec::new();
@@ -697,11 +730,11 @@ impl Parser {
 
     fn parse_index_decl(&mut self) -> ParseResult<IndexDecl> {
         self.expect_kw(Keyword::Index)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_kw(Keyword::On)?;
-        let table = self.expect_ident()?;
+        let table = self.expect_word()?;
         self.expect_delim(Delim::LParen)?;
-        let column = self.expect_ident()?;
+        let column = self.expect_word()?;
         self.expect_delim(Delim::RParen)?;
         let using_hash = if self.check_ident() {
             // `using hash` / `using btree` — "using" also isn't a
@@ -709,7 +742,7 @@ impl Parser {
             if let TokenKind::Ident(w) = self.peek_kind().clone() {
                 if w == "using" {
                     self.advance();
-                    let mode = self.expect_ident()?;
+                    let mode = self.expect_word()?;
                     mode == "hash"
                 } else { false }
             } else { false }
@@ -720,7 +753,7 @@ impl Parser {
 
     fn parse_schema_decl(&mut self) -> ParseResult<SchemaDecl> {
         self.expect_kw(Keyword::Schema)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut versions = Vec::new();
         while self.check_ident() {
@@ -747,7 +780,7 @@ impl Parser {
 
     fn parse_server_decl(&mut self) -> ParseResult<ServerDecl> {
         self.expect_kw(Keyword::Server)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
@@ -756,7 +789,7 @@ impl Parser {
                 self.expect_delim(Delim::Semi)?;
                 items.push(ServerItem::Listen(args));
             } else if self.eat_kw(Keyword::On) {
-                let name = self.expect_ident()?;
+                let name = self.expect_word()?;
                 self.expect_delim(Delim::LParen)?;
                 let mut params = Vec::new();
                 if !self.check_delim(Delim::RParen) {
@@ -781,12 +814,12 @@ impl Parser {
 
     fn parse_actor_decl(&mut self) -> ParseResult<ActorDecl> {
         self.expect_kw(Keyword::Actor)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
             if self.eat_kw(Keyword::State) {
-                let sname = self.expect_ident()?;
+                let sname = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
                 let ty = self.parse_type()?;
                 self.expect_op(Op::Eq)?;
@@ -794,7 +827,7 @@ impl Parser {
                 self.expect_delim(Delim::Semi)?;
                 items.push(ActorItem::State(StateDecl { name: sname, ty, value }));
             } else if self.eat_kw(Keyword::On) {
-                let name = self.expect_ident()?;
+                let name = self.expect_word()?;
                 self.expect_delim(Delim::LParen)?;
                 let mut params = Vec::new();
                 if !self.check_delim(Delim::RParen) {
@@ -818,12 +851,12 @@ impl Parser {
     // ---------- UI ----------
 
     fn parse_ui_body(&mut self) -> ParseResult<UiDecl> {
-        let name = self.expect_ident()?;
+        let name = self.expect_word()?;
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
             if self.eat_kw(Keyword::State) {
-                let sname = self.expect_ident()?;
+                let sname = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
                 let ty = self.parse_type()?;
                 self.expect_op(Op::Eq)?;
@@ -831,7 +864,7 @@ impl Parser {
                 self.expect_delim(Delim::Semi)?;
                 items.push(UiItem::State(StateDecl { name: sname, ty, value }));
             } else if self.eat_kw(Keyword::Prop) {
-                let pname = self.expect_ident()?;
+                let pname = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
                 let ty = self.parse_type()?;
                 self.expect_delim(Delim::Semi)?;
@@ -901,7 +934,7 @@ impl Parser {
             return Ok(Type::Ref { lifetime, mutable, inner: Box::new(inner) });
         }
         if self.eat_kw(Keyword::Dyn) {
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             let args = self.parse_generic_args_opt()?;
             return Ok(Type::Dyn(name, args));
         }
@@ -936,13 +969,19 @@ impl Parser {
         }
         // plain name -- either a primitive (recognized by text, per the
         // Phase 1 design decision that primitives lex as identifiers)
-        // or a user-defined named type, optionally generic.
-        let name = if self.check_kw(Keyword::SelfType) {
+        // or a user-defined named type, optionally generic. May be a
+        // multi-segment path (`orderbook::OrderBook`, `layers::Dense`)
+        // -- see `parse_further_path_segments`'s doc comment for why
+        // this was previously missing entirely.
+        let mut name = if self.check_kw(Keyword::SelfType) {
             self.advance();
             "Self".to_string()
         } else {
-            self.expect_ident()?
+            self.expect_word()?
         };
+        for seg in self.parse_further_path_segments()? {
+            name = format!("{}::{}", name, seg);
+        }
         if is_primitive_type_name(&name) {
             return Ok(Type::Primitive(name));
         }
@@ -970,7 +1009,7 @@ impl Parser {
             return Ok(Pattern::Wildcard);
         }
         if self.eat_kw(Keyword::Mut) {
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             return Ok(Pattern::Mut(name));
         }
         if self.check_delim(Delim::LParen) {
@@ -992,7 +1031,7 @@ impl Parser {
             let mut rest = None;
             while !self.check_delim(Delim::RBracket) {
                 if self.eat_op(Op::DotDot) {
-                    let bind = if self.check_ident() { Some(self.expect_ident()?) } else { None };
+                    let bind = if self.check_ident() { Some(self.expect_word()?) } else { None };
                     rest = Some(bind);
                     break;
                 }
@@ -1015,9 +1054,8 @@ impl Parser {
         // identifiers. Without this, the most basic `Some(x) => ...` /
         // `None => ...` pattern would fail to parse at all.
         let mut name = self.expect_word()?;
-        while self.eat_op(Op::ColonColon) {
-            let part = self.expect_word()?;
-            name = format!("{}::{}", name, part);
+        for seg in self.parse_further_path_segments()? {
+            name = format!("{}::{}", name, seg);
         }
         if self.eat_delim(Delim::LParen) {
             let mut pats = Vec::new();
@@ -1258,7 +1296,7 @@ impl Parser {
         self.expect_delim(Delim::LBrace)?;
         let mut props = Vec::new();
         while !self.check_delim(Delim::RBrace) {
-            let name = self.expect_ident()?;
+            let name = self.expect_word()?;
             self.expect_delim(Delim::Colon)?;
             let value = self.parse_expr(0)?;
             props.push((name, value));
@@ -1405,10 +1443,7 @@ impl Parser {
                 self.expect_word()?
             };
             let mut path = vec![name.clone()];
-            while self.check_op(Op::ColonColon) {
-                self.advance();
-                path.push(self.expect_word()?);
-            }
+            path.extend(self.parse_further_path_segments()?);
             let base = if path.len() > 1 {
                 Expr::Path(path)
             } else {
@@ -1430,11 +1465,45 @@ impl Parser {
                 }
             }
             if self.check_delim(Delim::LBrace) && self.struct_lit_allowed {
-                return self.parse_struct_lit_tail(base);
+                if self.looks_like_struct_lit_fields() {
+                    return self.parse_struct_lit_tail(base);
+                }
+                return self.parse_component_children_tail(base);
             }
             return Ok(base);
         }
         self.error(format!("expected expression, found {:?}", self.peek_kind()))
+    }
+
+    /// Disambiguates `Name { ... }` between a struct literal (`Name {
+    /// field: expr, ... }`) and a UI children-list call (`Name { child,
+    /// child, ... }`, Document 18's `Column { Text("Left"), Text(...) }`
+    /// pattern). `self.peek()` is the `{` itself (not yet consumed) when
+    /// this is called. Struct literals always start with `word :`
+    /// (field label then colon, per Document 23's `struct_literal`
+    /// grammar, which requires at least one `IDENT ":" expr` before any
+    /// optional trailing spread); anything else — including an empty
+    /// `{}` — is treated as a children list.
+    fn looks_like_struct_lit_fields(&self) -> bool {
+        let first_is_word = matches!(self.peek_at(1), TokenKind::Ident(_) | TokenKind::Keyword(_));
+        let second_is_colon = matches!(self.peek_at(2), TokenKind::Delim(Delim::Colon));
+        first_is_word && second_is_colon
+    }
+
+    fn parse_component_children_tail(&mut self, base: Expr) -> ParseResult<Expr> {
+        let name = match &base {
+            Expr::Ident(s) => s.clone(),
+            Expr::Path(p) => p.join("::"),
+            _ => return self.error("component-children name must be a plain identifier or path"),
+        };
+        self.expect_delim(Delim::LBrace)?;
+        let mut children = Vec::new();
+        while !self.check_delim(Delim::RBrace) {
+            children.push(self.parse_expr(0)?);
+            if !self.eat_delim(Delim::Comma) { break; }
+        }
+        self.expect_delim(Delim::RBrace)?;
+        Ok(Expr::ComponentChildren { name, children })
     }
 
     fn parse_struct_lit_tail(&mut self, base: Expr) -> ParseResult<Expr> {
@@ -1554,7 +1623,7 @@ impl Parser {
             self.expect_op(Op::Pipe)?;
             if !self.check_op(Op::Pipe) {
                 loop {
-                    let name = self.expect_ident()?;
+                    let name = self.expect_word()?;
                     let ty = if self.eat_delim(Delim::Colon) { Some(self.parse_type()?) } else { None };
                     params.push((name, ty));
                     if !self.eat_delim(Delim::Comma) { break; }
@@ -1598,14 +1667,14 @@ impl Parser {
 
     fn parse_query_expr(&mut self) -> ParseResult<QueryExpr> {
         self.expect_kw(Keyword::Query)?;
-        let table = self.expect_ident()?;
+        let table = self.expect_word()?;
         let mut clauses = Vec::new();
         loop {
             if self.eat_kw(Keyword::Where) {
                 clauses.push(QueryClause::Where(Box::new(self.parse_expr(0)?)));
             } else if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "orderBy") {
                 self.advance();
-                let col = self.expect_ident()?;
+                let col = self.expect_word()?;
                 clauses.push(QueryClause::OrderBy(col));
             } else if self.eat_kw(Keyword::Insert) {
                 clauses.push(QueryClause::Insert(Box::new(self.parse_expr(0)?)));
@@ -1613,7 +1682,7 @@ impl Parser {
                 self.expect_delim(Delim::LBrace)?;
                 let mut fields = Vec::new();
                 while !self.check_delim(Delim::RBrace) {
-                    let fname = self.expect_ident()?;
+                    let fname = self.expect_word()?;
                     self.expect_delim(Delim::Colon)?;
                     let fval = self.parse_expr(0)?;
                     fields.push((fname, fval));
@@ -1633,7 +1702,7 @@ impl Parser {
                 clauses.push(QueryClause::Count);
             } else if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "join") {
                 self.advance();
-                let jt = self.expect_ident()?;
+                let jt = self.expect_word()?;
                 self.expect_kw(Keyword::On)?;
                 let on = self.parse_expr(0)?;
                 clauses.push(QueryClause::Join { table: jt, on: Box::new(on) });
@@ -1649,7 +1718,7 @@ impl Parser {
         let try_block = self.parse_block()?;
         self.expect_kw(Keyword::Catch)?;
         self.expect_delim(Delim::LParen)?;
-        let catch_var = self.expect_ident()?;
+        let catch_var = self.expect_word()?;
         self.expect_delim(Delim::RParen)?;
         let catch_block = self.parse_block()?;
         Ok(Expr::TryCatch { try_block, catch_var, catch_block })

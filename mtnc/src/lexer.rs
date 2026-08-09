@@ -11,15 +11,24 @@
 use crate::diagnostics::Diagnostic;
 use crate::token::{Delim, Keyword, Op, Span, Token, TokenKind};
 
-pub struct Lexer<'a> {
-    src: &'a [u8],
-    /// We lex over raw bytes for ASCII structural characters (operators,
-    /// delimiters, digits) but decode identifiers/strings via UTF-8-aware
-    /// char boundaries, matching Document 2 §1's "UTF-8 only" mandate.
-    /// For Phase 1 scope we accept full UTF-8 in identifiers/strings and
-    /// restrict structural tokens to ASCII, which covers every construct
-    /// in Documents 2-4; broader Unicode-identifier normalization rules
-    /// are not specified anywhere in Docs 1-25, so none are invented here.
+pub struct Lexer {
+    /// We decode identifiers/strings/all structural tokens via
+    /// UTF-8-aware char boundaries, matching Document 2 §1's "UTF-8
+    /// only" mandate. For Phase 1/2 scope we accept full UTF-8 in
+    /// identifiers/strings and restrict structural tokens to ASCII,
+    /// which covers every construct in Documents 2-4; broader
+    /// Unicode-identifier normalization rules are not specified
+    /// anywhere in Docs 1-25, so none are invented here.
+    ///
+    /// (Earlier draft note, resolved: this struct originally also held
+    /// a raw `&[u8]` byte-slice field alongside `chars`, intended for a
+    /// byte-level fast path over ASCII structural characters that was
+    /// never actually implemented — every scan in this file goes
+    /// through `chars`. Confirmed via grep that the byte-slice field
+    /// was never read anywhere, only written once in `new()`, so it was
+    /// genuinely dead code, not a sign of some other part of the lexer
+    /// wrongly relying on a different field — removed outright, which
+    /// also removed the struct's now-unnecessary lifetime parameter.)
     chars: Vec<char>,
     i: usize,
     line: u32,
@@ -28,10 +37,9 @@ pub struct Lexer<'a> {
     pub errors: Vec<Diagnostic>,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(src: &'a str) -> Self {
+impl Lexer {
+    pub fn new(src: &str) -> Self {
         Lexer {
-            src: src.as_bytes(),
             chars: src.chars().collect(),
             i: 0,
             line: 1,

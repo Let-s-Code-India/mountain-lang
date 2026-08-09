@@ -153,6 +153,116 @@ and isn't a problem by itself — it's only a problem when both the type
 and the wrapping enum's variants are glob-imported into one scope at
 once, which no longer happens anywhere in the crate.
 
+### CI Run — 56/57 core tests pass, 1 failure in `parser::tests::call_then_field`
+`to_sexpr` (the test-only s-expression printer) had no match arm for
+`Expr::MethodCall`, falling through to a `{:?}` Debug-dump catch-all —
+confirmed by reading the function directly rather than assuming. But the
+test's *expected* value was also wrong, not just the printer: it was
+carried over from the Python precedence-prototype, which never modeled
+method calls as a distinct node (it only needed to validate precedence/
+associativity) and always decomposed `.b(1)` into generic field-access-
+then-call. The real parser is more faithful to Document 23's actual
+grammar (`.IDENT` combined with an optional `(args)` is *one* postfix
+production) and correctly builds a single `MethodCall{receiver, name,
+args}` node. Fixed both: added the missing printer arm, and corrected
+the test's expected string to `"(. (methodcall a b [1]) c)"` — what the
+AST is actually supposed to produce, not what the simplified prototype
+happened to produce. Verified no other unit test secretly exercised a
+method-call pattern through `to_sexpr` (grepped all 24
+`to_sexpr(&parse_expr_str(...))` call sites) before considering this closed.
+
+### CI Run — 56/57 core tests pass; 5/6 `parser_doc24` tests failed (new coverage finding real gaps, not a regression)
+Core lexer/manifest/parser suite (57 unit + 6 original integration = 63)
+fully green — confirms the grammar/precedence engine itself is solid.
+The 6 new `parser_doc24` tests (deliberately more demanding, real-world
+Document 24 examples) surfaced 5 concrete gaps, one of which turned out
+to be two failures sharing one root cause, and one of which turned out
+to be a **different** root cause than either of us initially guessed
+from the error text alone — each traced against the actual embedded
+test source and the actual current parser code before fixing, not
+assumed:
+
+1. **`layout { gap: 8, align: Align::Center }` (Doc24 §2, confirmed at
+   line 13 of the embedded source)** — `align` is a Document 3 keyword
+   (Category K, `#[align(N)]`), and `parse_brace_prop_list` still called
+   `expect_ident()`. Rather than patch this one site, did the systematic
+   sweep the report asked for: grepped every remaining
+   `self.expect_ident()` call site in `parser.rs`, mapped each to its
+   enclosing function, and — since `expect_word()` is a strict superset
+   of `expect_ident()` (accepts everything the old call did, plus
+   keyword-as-word) — replaced essentially all of them in one pass
+   rather than triaging case-by-case, closing this class of bug for good
+   instead of leaving another one for Phase 3 to find by accident.
+2. **`use std::ai::{tensor, layers, ...};` — initially suspected, but
+   traced and ruled out.** Re-checked the actual current
+   `parse_use_decl` code directly: the grouped-import `{ ... }` handling
+   was already implemented correctly. The CI line number (5) actually
+   pointed at `layer1: layers::Dense,` — a struct field with a
+   **multi-segment type path**, which `parse_type()` had never
+   supported at all (it only ever consumed one identifier/word, then
+   immediately returned). This is the *same* root cause as the Document
+   24 §4 `orderbook::OrderBook` failure — fixed once, via a shared
+   `parse_further_path_segments()` helper used by both `parse_type` and
+   the expression-path builder in `parse_primary` (and applied to
+   pattern-path parsing too, for consistency, even though no current
+   example strictly requires it there).
+3. **`channel::<i32>()` (Doc24 §5)** — the same shared-helper fix
+   resolved this as a side effect: the old path-building loop
+   unconditionally tried to consume another word after every `::`,
+   including when the `::` was actually introducing turbofish generic
+   args, so it choked on `<` instead of leaving it for the
+   already-existing turbofish-handling code right after the loop.
+4. **`spawn { ... }` as a statement / `on submitOrder(...)` inside
+   `actor` — both turned out to be cascading symptoms, not separate
+   bugs.** `parse_primary` already had a dedicated `spawn` branch, and
+   `parse_actor_decl` already had a dedicated `on`-handler branch — both
+   confirmed by reading the actual code before assuming a fix was
+   needed. The real failures were the `orderbook::OrderBook` type-path
+   gap (item 2 above) causing a parse error mid-actor-body, which
+   triggered item-level error recovery (`synchronize_item`) to skip
+   forward and misinterpret whatever token it landed on next as a fresh
+   top-level item. Fixing item 2 resolves both of these without any
+   separate change.
+5. **`Text(product.name)` inside `Column { ... }` (Doc24 §6, confirmed
+   at line 28) and the same pattern throughout Doc24 §2** — a real,
+   previously-undiscovered gap: `Name { child, child, ... }` (Document
+   18's UI children-list call pattern) is syntactically ambiguous with a
+   struct literal (`Name { field: expr, ... }`) at the token level, and
+   the parser always assumed struct-literal. Added `Expr::ComponentChildren`
+   and a lookahead helper (`looks_like_struct_lit_fields`, checking
+   whether the first token after `{` looks like `word :`) to disambiguate,
+   consistent with Document 23's own `struct_literal` grammar requiring
+   at least one `IDENT ":" expr` before anything else — so a children
+   list (which never starts that way) is correctly distinguished.
+
+All fixes re-verified with the same discipline as every prior round:
+delimiter-balance check, the AST field/variant cross-reference script,
+and a fresh glob-import audit — all clean, and each fix was hand-traced
+step-by-step against the actual reported failing construct (not just
+"should work now") before packaging. Cannot run `cargo test` directly in
+this sandbox (same standing constraint), so this hand-tracing plus the
+scripted checks remain the verification method until the next real CI run.
+
+### Housekeeping fixed this round
+- **`.github/workflows/ci.yml`**: bumped `actions/checkout@v4` →
+  `actions/checkout@v7`. Verified the actual current latest via web
+  search rather than trusting the suggested `v5` — `v7.0.1` (July 2026)
+  is genuinely the latest as of this writing; `v5` would have been a
+  regression, not even an update.
+- **`warning: field 'src' is never read` (present in every CI run since
+  Phase 1, never addressed)**: checked which of the two explanations was
+  actually true rather than suppressing it. Grepped every reference to
+  `self.src` in `lexer.rs` — it was set once in `new()` and never read
+  anywhere; all real scanning goes through the separate `chars: Vec<char>`
+  field. This confirms it was genuinely dead code (a leftover from an
+  early design intention to do byte-level fast-path scanning over ASCII
+  structural characters that was never actually implemented), **not** a
+  sign that some other part of the lexer was silently relying on the
+  wrong field. Removed the field outright, which also removed the
+  struct's now-unnecessary lifetime parameter (`Lexer<'a>` → `Lexer`) —
+  confirmed via grep that the only other reference (`Lexer::new(src)` in
+  the `tokenize()` free function) is lifetime-elided and needed no change.
+
 ### Design decisions made (flagged, not silently assumed)
 1. **Primitive type names (`i32`, `f64`, `bool`, `String`, etc.) are
    lexed as plain identifiers, not keywords.** Documents 2/3 only list
@@ -364,6 +474,17 @@ gap) rather than a silent reinterpretation:
    AST yet since Phase 2's AST is untyped by design (Document 17 §3);
    this is a pure syntax-acceptance fix, revisit when generics need real
    representation (Phase 5).
+7. **`Expr::ComponentChildren`** — `Name { child, child, ... }` (Document
+   18's `Column { Text("Left"), Text("Right") }` pattern) has no
+   production anywhere in Document 23 (same situation as `Styled`/
+   `Layout` — a missing production, not a differing snippet), and is
+   syntactically ambiguous with a struct literal at the token level.
+   Disambiguated by lookahead: Document 23's own `struct_literal`
+   grammar requires the content to start with `IDENT ":" expr`, so
+   checking whether the first token after `{` looks like `word :`
+   reliably distinguishes the two. Found while re-verifying Document 24
+   §2/§6 after the `align`/`layout` fix let parsing reach further into
+   those examples. Needs explicit sign-off, like the others above.
 
 ### Known open gap — NOT resolved, explicit ask
 **Document 24 §3's `tensor<f32>[784]` type syntax does not parse**, and
@@ -377,7 +498,9 @@ which is structurally different. `tests/parser_doc24.rs`'s
 everything else in Example 3 (struct/impl, named args, closures over
 tuples, `gradient(..., respectTo: ...)`, `for epoch in 0..10`) is
 asserted to parse cleanly, and the tensor-shape fragment is asserted to
-still fail, with a comment pointing back here. **This needs your
+still fail, with a comment pointing back here. This isolation is now
+confirmed accurate (see below — it was previously masked by an earlier
+bug that failed before ever reaching this construct). **This needs your
 guidance** — options as I see them: (a) treat `tensor<f32>[784]` as
 sugar for a `Named("tensor", [f32; expr])`-shaped const-generic array
 type, (b) treat the trailing `[N]` as a distinct postfix "shape"
@@ -390,17 +513,23 @@ which one is intended and bake it into the parser unilaterally.
 > precedence table (Doc 4 §10) verified via the exact test cases in
 > Doc 4 §11"
 
-- Document 4 §11's exact cases + full §10 table (26 cases): ✅ passing
-  (Python-verified, then ported and re-verified by direct comparison).
-- Document 24 examples 1, 2, 4, 5, 6: ✅ parse cleanly (asserted in
-  `tests/parser_doc24.rs`, pending real `cargo test` confirmation).
-- Document 24 example 3: ⚠️ parses except for the flagged tensor-shape
-  gap above — **not fully met**, blocked on your input.
+- Document 4 §11's exact cases + full §10 table (26 cases): ✅ passing,
+  confirmed by real CI (all 20 precedence unit tests green, including the
+  one regression found and fixed — see the CI-run notes above).
+- Document 24 examples 1, 2, 4, 5, 6: all 5 gaps found by the second CI
+  run traced and fixed (see CI-run section above) — expected to now
+  parse cleanly, **pending the next real `cargo test` confirmation**;
+  not claiming this as independently verified until that comes back.
+- Document 24 example 3: expected to now correctly isolate *only* the
+  flagged tensor-shape gap (the earlier `layers::Dense` multi-segment
+  path failure that was masking this is fixed) — still blocked on your
+  guidance for that one specific construct.
 - **Not yet independently confirmed by a real `cargo test` run.** ⏳
 
 ### `.github/workflows/ci.yml`
-No changes needed — `cargo test --verbose` already picks up the new
-`tests/parser_doc24.rs` file and the new unit tests in `parser.rs`
+`actions/checkout@v4` → `actions/checkout@v7` (see Housekeeping above).
+Otherwise no changes needed — `cargo test --verbose` already picks up
+the new `tests/parser_doc24.rs` file and the new unit tests in `parser.rs`
 automatically; the workflow itself doesn't need to know about individual
 test files.
 

@@ -583,6 +583,14 @@ pub enum Expr {
     /// for the `layout { props } { children }` postfix modifier
     /// (Document 18 §7.1). Needs explicit sign-off — see report.
     Layout { expr: Box<Expr>, props: Vec<(String, Expr)>, children: Vec<Expr> },
+    /// FLAGGED DEVIATION FROM DOCUMENT 23 — `Name { child1, child2, ... }`
+    /// (Document 18's `Column { Text("Left"), Text("Right") }` pattern,
+    /// used constantly in Document 24 §2/§6). Syntactically ambiguous
+    /// with a struct literal (`Name { field: expr, ... }`) at the token
+    /// level; disambiguated by lookahead in the parser (does the first
+    /// item look like `word :`, i.e. a field label). Not in Document 23
+    /// at all — same situation as `Styled`/`Layout`. Needs sign-off.
+    ComponentChildren { name: String, children: Vec<Expr> },
 }
 
 // ---------- Database query expression (Document 20 / Doc23 §11) ----------
