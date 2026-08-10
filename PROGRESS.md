@@ -243,6 +243,48 @@ step-by-step against the actual reported failing construct (not just
 this sandbox (same standing constraint), so this hand-tracing plus the
 scripted checks remain the verification method until the next real CI run.
 
+### CI Run — down to 2/6 `parser_doc24` failures (4 now passing: examples 1, 4, 5, 6)
+Both remaining failures traced against the actual embedded test source
+and actual current parser code before fixing:
+
+1. **`on: click => addTask()` (Document 24 §2, line 17)** — confirmed:
+   Document 18 §5 defines `on: <eventName> => <expression or closure>`
+   as syntax scoped to the `on:` argument-value position specifically,
+   not a general expression production (`click` is a literal event-name
+   marker, not a variable/pattern; Document 23's core grammar only uses
+   `=>` in `match_arm` and `closure_expr`, both different shapes). Checked
+   `ast.rs` for an existing fit before adding anything new — `OnHandler`
+   (used by `server`/`actor`: `on IDENT(params) { block }`) is a
+   declaration-shaped construct with a name and parameter list, not an
+   argument value, so it doesn't fit. Added `Expr::EventHandler{event,
+   body}`, special-cased narrowly in `parse_arg` (only when the argument
+   label is literally `"on"`, detected the value via a 2-token lookahead
+   for `word =>` so it can't interfere with any other argument shape).
+2. **`|(input, _)| model.forward(input)` (Document 24 §3, line 25, col
+   42 — confirmed exact)** — confirmed: `closure_expr`'s grammar (Doc23
+   §6) only ever allowed a bare `IDENT` per parameter, unlike `fn`
+   params/`let`/`match`, which all already use the general `pattern`
+   production (§7). This is a real EBNF gap, not just a parser
+   oversight — flagged in `PROGRESS.md`'s deviations list per the
+   instruction to note it formally like the tensor-shape one. Widened
+   `ClosureExpr.params` from `Vec<(String, Option<Type>)>` to
+   `Vec<(Pattern, Option<Type>)>` and switched the parser to call the
+   **same** pattern-parsing function used everywhere else, not a second
+   one — with one catch found and fixed before it became a silent bug:
+   `parse_pattern()` (not `parse_pattern_single()`) also checks for a
+   trailing `|` to build an or-pattern, which would misfire on the
+   closure's own closing `|` delimiter (`|(input, _)| body` — right
+   after the tuple pattern, the very next token *is* a bare `|`, but
+   it's the parameter list's closer). Used `parse_pattern_single()` at
+   this call site specifically to avoid that collision, while still
+   sharing the same underlying single-pattern parser as every other use
+   site.
+
+Re-verified with the same standing checks (delimiter balance, AST
+field/variant cross-reference script, glob-import audit — all clean)
+plus hand-tracing both fixes token-by-token against the exact failing
+constructs. Still no real `cargo test` available in this sandbox.
+
 ### Housekeeping fixed this round
 - **`.github/workflows/ci.yml`**: bumped `actions/checkout@v4` →
   `actions/checkout@v7`. Verified the actual current latest via web
@@ -485,6 +527,17 @@ gap) rather than a silent reinterpretation:
    reliably distinguishes the two. Found while re-verifying Document 24
    §2/§6 after the `align`/`layout` fix let parsing reach further into
    those examples. Needs explicit sign-off, like the others above.
+8. **`Expr::EventHandler`** — Document 18 §5's `on: <eventName> =>
+   <expression or closure>`, scoped to the `on:` argument label. Not a
+   general expression production anywhere in Document 23. See CI-run
+   notes above for why `OnHandler` doesn't fit this shape.
+9. **`ClosureExpr.params: Vec<(Pattern, Option<Type>)>`** (was
+   `Vec<(String, Option<Type>)>`) — Document 23 §6's `closure_expr`
+   grammar only allows a bare `IDENT` per parameter, unlike `fn`
+   params/`let`/`match`, which already use the general `pattern`
+   production (§7). Document 24 §3's `|(input, _)| ...` needs
+   tuple-destructuring closure parameters. A genuine EBNF
+   clarification worth formal note, not just a parser patch.
 
 ### Known open gap — NOT resolved, explicit ask
 **Document 24 §3's `tensor<f32>[784]` type syntax does not parse**, and

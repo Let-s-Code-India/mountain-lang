@@ -1326,13 +1326,35 @@ impl Parser {
             if let Ok(name) = self.expect_word() {
                 if self.check_delim(Delim::Colon) {
                     self.advance();
-                    let value = self.parse_expr(0)?;
+                    let value = if name == "on" {
+                        self.parse_event_handler_or_expr()?
+                    } else {
+                        self.parse_expr(0)?
+                    };
                     return Ok(Arg { name: Some(name), value });
                 }
             }
             self.pos = save;
         }
         Ok(Arg { name: None, value: self.parse_expr(0)? })
+    }
+
+    /// Document 18 §5: `on: <eventName> => <expression or closure>`.
+    /// Narrowly scoped to the `on:` argument label (not general
+    /// expression grammar) — detected by a 2-token lookahead (`word`
+    /// immediately followed by `=>`) so it doesn't interfere with an
+    /// ordinary expression ever being passed as an `on:` value in some
+    /// other form.
+    fn parse_event_handler_or_expr(&mut self) -> ParseResult<Expr> {
+        let looks_like_event_arrow = matches!(self.peek_kind(), TokenKind::Ident(_) | TokenKind::Keyword(_))
+            && matches!(self.peek_at(1), TokenKind::Op(Op::FatArrow));
+        if looks_like_event_arrow {
+            let event = self.expect_word()?;
+            self.expect_op(Op::FatArrow)?;
+            let body = self.parse_expr(0)?;
+            return Ok(Expr::EventHandler { event, body: Box::new(body) });
+        }
+        self.parse_expr(0)
     }
 
     fn parse_primary(&mut self) -> ParseResult<Expr> {
@@ -1623,9 +1645,22 @@ impl Parser {
             self.expect_op(Op::Pipe)?;
             if !self.check_op(Op::Pipe) {
                 loop {
-                    let name = self.expect_word()?;
+                    // parse_pattern_single, NOT parse_pattern: the latter
+                    // also checks for a trailing '|' to build an
+                    // or-pattern (`Pattern::Or`), which would misfire on
+                    // the closure's own closing '|' delimiter here (e.g.
+                    // `|(input, _)| body` -- after parsing `(input, _)`,
+                    // the very next token IS a bare '|', but it's the
+                    // parameter list's closer, not an or-pattern
+                    // separator). Or-patterns aren't shown anywhere in
+                    // closure-parameter position in the spec, and would
+                    // be structurally ambiguous with the closing pipe
+                    // regardless, so this scopes to single patterns only
+                    // while still reusing the same underlying parser
+                    // used by fn params/let/match.
+                    let pattern = self.parse_pattern_single()?;
                     let ty = if self.eat_delim(Delim::Colon) { Some(self.parse_type()?) } else { None };
-                    params.push((name, ty));
+                    params.push((pattern, ty));
                     if !self.eat_delim(Delim::Comma) { break; }
                 }
             }

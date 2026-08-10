@@ -506,7 +506,18 @@ pub enum LoopExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClosureExpr {
     pub is_move: bool,
-    pub params: Vec<(String, Option<Type>)>,
+    /// FLAGGED DEVIATION FROM DOCUMENT 23 — `closure_expr`'s grammar
+    /// (§6) only allows `IDENT (":" type)?` per parameter, unlike
+    /// function parameters, `let` bindings, and `match` arms, which all
+    /// use the general `pattern` production (§7). Document 24 §3 uses
+    /// tuple-destructuring closure parameters (`|(input, _)| ...`),
+    /// which only fits the grammar if closures accept the same
+    /// `pattern` production everywhere else does. This is a genuine
+    /// EBNF gap/clarification, not a differing snippet — widened here
+    /// to `Pattern` (reusing the same pattern parser as `fn`/`let`/
+    /// `match`, not a second one) rather than inventing a
+    /// closure-specific destructuring syntax. Needs explicit sign-off.
+    pub params: Vec<(Pattern, Option<Type>)>,
     pub return_type: Option<Type>,
     pub body: ClosureBody,
 }
@@ -591,6 +602,20 @@ pub enum Expr {
     /// item look like `word :`, i.e. a field label). Not in Document 23
     /// at all — same situation as `Styled`/`Layout`. Needs sign-off.
     ComponentChildren { name: String, children: Vec<Expr> },
+    /// Document 18 §5: `on: <eventName> => <expression or closure>`
+    /// (e.g. `Button("Add", on: click => addTask())`). Not a general
+    /// expression production — Document 18 §5 explicitly scopes this
+    /// syntax to the `on:` argument-value position specifically; `click`
+    /// here is a literal event-name marker, not a variable or pattern,
+    /// and there's no general `IDENT "=>" expr` production anywhere in
+    /// Document 23's core expression grammar (only `match_arm` and
+    /// `closure_expr` use `=>`, both with different left-hand shapes).
+    /// Special-cased in `parse_arg` for the `on:` label only, not
+    /// wired into general expression parsing. `OnHandler` (used by
+    /// `server`/`actor` blocks: `on IDENT(params) { block }`) doesn't
+    /// fit — that's a declaration-shaped construct with a name and
+    /// parameter list, not an argument value.
+    EventHandler { event: String, body: Box<Expr> },
 }
 
 // ---------- Database query expression (Document 20 / Doc23 §11) ----------
