@@ -362,7 +362,11 @@ constructs. Still no real `cargo test` available in this sandbox.
 
 ## Phase 2 — Parser
 
-**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+**Status: 🟢 Complete — confirmed via actual downloaded CI log**
+
+Final CI run confirmed from the raw log file (not just the Actions UI
+summary badge): 57 lib tests + 6 integration tests + 6 `parser_doc24`
+tests, all passing, 0 failures, 0 ignored, across the full run.
 
 ### Scope (per Document 25 §2.3)
 Hand-written recursive-descent parser with Pratt parsing for expressions,
@@ -588,7 +592,148 @@ test files.
 
 ---
 
-## Phases 3–25
+## Phase 3 — Core Type System
+
+**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+
+### Scope (per Document 25 §2.3)
+Primitive types (Document 5 §2), the full 6-rule type-inference engine
+(Document 5 §4), and the data-shape half of `struct`/`enum` (Document 7)
+— fields/variants only, not traits/impl/generics (Phase 4/5).
+
+### What was built
+- `src/types.rs` — `Ty` (resolved-type representation), `resolve_type`
+  (syntactic `ast::Type` → semantic `Ty`), the struct/enum data-shape
+  registry, and `TypeChecker` (a bidirectional, expected-type-propagating
+  checker implementing Document 5 §4's 6 rules).
+- `tests/types_doc5.rs` — 26 tests: all 4 of Document 5 §7's official
+  cases (each with a positive counterpart), rule-by-rule coverage for
+  rules 1/2/3/5/6 individually, and struct/enum data-shape tests
+  (missing/unknown/wrong-type fields, spread, field access, unit/data
+  enum variants, wrong arg counts).
+- **Closed a real Phase 2 gap found while implementing this phase**:
+  `unsafe { }` block parsing didn't exist at all (needed for Document 5
+  §7's null/unsafe interaction) — confirmed via `grep -n "Unsafe"
+  src/parser.rs src/ast.rs` returning nothing before adding it. Added
+  `Expr::Unsafe(Box<Block>)` and its parser support.
+
+### Design decision (flagged, not silently assumed)
+**Bidirectional checker, not a full HM unifier.** Document 17 §4.2
+describes semantic analysis as "constraint-based (Hindley-Milner-style)".
+This implementation instead does expected-type propagation directly
+(infer when nothing is expected, check against an expectation when one
+exists) — Document 5's 6 rules are themselves described operationally,
+not as a mandate for a specific algorithm, and full HM-style unification
+over type *variables* only becomes necessary once real generics exist to
+unify over (Phase 5, not this phase). Revisit if this proves
+insufficient once Phase 5 needs to infer through actual generic
+functions. Flagged for sign-off like every other deviation this phase.
+
+### A real bug found and fixed during this phase's own verification (not just claimed)
+Traced `let x: [i32] = [1.5];`-shaped cases by hand and found `check_expr`
+only used `expected` as a *soft hint* to guide inference for some
+expression kinds (`Array`, `Tuple`) but never verified the *final*
+result actually matched it — so a float literal in a slot annotated
+`[i32]` would have silently produced `Array(F64)` with zero errors.
+Fixed generally, not per-branch: split `check_expr` into a thin public
+wrapper (does one uniform final `check_compatible` against `expected`)
+and `check_expr_inner` (the actual per-kind logic), so every expression
+kind gets the check automatically, including future kinds. This
+surfaced a second issue immediately: `Expr::Ident` had its own internal
+`check_compatible` call, which would now double-fire alongside the new
+wrapper's — removed the now-redundant internal call. Same for `Literal`
+generally: `check_literal` already fully handles expected-compatibility
+itself (numeric literals adopt/default per rules 2/3; `null` reports its
+own specific, clearer message) — the blanket wrapper check is
+deliberately skipped for `Expr::Literal` so the same mismatch isn't
+reported twice with a less specific message the second time.
+
+### Systematic verification performed (same discipline as Phases 1–2)
+- Delimiter-balance check on every new/touched file — clean.
+- AST enum-variant cross-reference script (every `ast::Enum::Variant`
+  referenced in `types.rs` checked against actual `ast.rs` declarations,
+  not by eye) — clean.
+- Broad field/method-access sanity sweep (every `.identifier` access in
+  `types.rs` checked against declared `ast.rs` struct fields plus known
+  stdlib methods) — two unmatched hits, both traced and confirmed false
+  positives (one inside a doc comment, one being `Vec<String>::join`
+  which was just missing from the checker's known-methods list).
+- Glob-import audit: `use crate::ast::*` (top-level) and `use
+  BinaryOp::*` (inside `check_binary`) — the same two patterns already
+  proven safe in Phase 2 (zero prelude collisions for `BinaryOp`,
+  pattern-position-only usage); no new glob-import risk introduced.
+- Checked `Ty`'s own variant names against the Rust prelude before
+  calling this done: `Ty::Fn` does collide with the prelude `Fn` trait
+  by name, same as Phase 1's `Keyword::Fn` did — but `Ty` is never
+  glob-imported anywhere in the crate (`grep -n "use Ty::"` returns
+  nothing), so this is inert, not a live risk. `Option`/`Result`/`String`
+  were deliberately named `OptionTy`/`ResultTy`/`StringTy` from the
+  start specifically to avoid this class of collision proactively,
+  rather than fixing it reactively after a CI failure this time.
+- Proactively checked for a *self-introduced* dead-code situation before
+  it could become a repeat of the Phase 1 `Lexer.src` warning: the
+  `enums: HashMap<...>` registry was written during registration but
+  never read anywhere in the checker — confirmed via `grep -n
+  "self\.enums"`. Unlike `Lexer.src`, this data genuinely belongs in
+  Phase 3's stated scope (enum data-shapes), so the correct fix was to
+  actually use it, not delete it — implemented real enum-variant-
+  construction checking (`EnumName::Variant` and `EnumName::Variant(args)`)
+  against the registry, which is also directly useful Document 7
+  coverage, not just a warning-silencer.
+
+### Known simplifications (flagged, not silently claimed as complete)
+- **`null`-in-`unsafe` is not fully implemented** — the checker rejects
+  `null` against any non-`Ty::Null` expected type *unconditionally*,
+  regardless of whether it's lexically inside an `unsafe { }` block.
+  This correctly enforces exactly what Document 5 §7 tests ("`null` is
+  not usable where `Option<T>`/`T` is expected in safe code" — every
+  example anywhere in Documents 1–24 is safe code), but is stricter than
+  the full spec intent, which does mean to permit `null` inside
+  `unsafe`. Threading an "am I inside unsafe" flag through `check_expr`
+  is straightforward but wasn't added this phase.
+- **Destructuring patterns in `let`/`match` don't distribute field types
+  yet** — `let (a, b) = pair;` or `Some(x) => ...` don't bind `a`/`b`/`x`
+  into the environment with their real per-field types (only
+  `Pattern::Ident`/`Pattern::Mut` at the top level of a `let` are
+  handled). This is a safe failure mode (using such a binding later
+  reports "undefined variable", not a wrong type silently accepted), not
+  a silent gap — but it does mean pattern-heavy code isn't fully
+  type-checked yet.
+- **Struct-literal `..spread` expressions aren't themselves type-checked**
+  — `check_struct_lit` only checks whether a spread is *present* (to
+  relax the missing-field requirement), never actually visits the spread
+  expression to verify it's the right struct type.
+- **Type errors carry item-level context, not precise spans** — `ast::Expr`
+  doesn't carry `Span` yet (only `ast::Item` does, from Phase 2), so
+  diagnostics report which function/item an error occurred in, not an
+  exact line/column. Precise per-expression diagnostics are Document
+  22/Phase 23's job, not this phase's exit criteria.
+- **One minor diagnostic-noise case, not a correctness bug**: an
+  ambiguous empty-array `let` binding that's later passed to a function
+  expecting a concrete array type produces two errors (the original
+  ambiguity error, plus a cascading mismatch against the function's
+  parameter type) rather than one. Traced by hand and confirmed this
+  never causes a false accept/reject — just an extra, related message.
+
+### Exit criteria (Document 25 §2.3) — self-assessment
+> "All 4 inference-rule test cases from Doc 5 §7 pass; ambiguous-type
+> cases correctly produce 'annotation required' diagnostics, not guesses"
+
+- All 4 of Document 5 §7's official cases: implemented and tested, each
+  with a positive counterpart proving the checker isn't just rejecting
+  everything. **Pending real `cargo test` confirmation.**
+- Ambiguous empty-array literal: produces a real, specific diagnostic
+  (`"cannot infer type of empty array literal []..."`), not a silent
+  default — tested both for the exact Document 5 §7 phrasing and a
+  second, differently-shaped call site to confirm it's a general rule,
+  not a pattern-matched special case.
+- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+
+### `.github/workflows/ci.yml`
+No changes needed — picks up `tests/types_doc5.rs` and the new `types.rs`
+unit coverage automatically.
+
+## Phases 4–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
