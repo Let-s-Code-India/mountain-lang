@@ -1411,6 +1411,10 @@ impl Parser {
             let is_move = self.eat_kw(Keyword::Move);
             return Ok(Expr::Closure(Box::new(self.parse_closure_expr(is_move)?)));
         }
+        if self.check_kw(Keyword::Unsafe) {
+            self.advance();
+            return Ok(Expr::Unsafe(Box::new(self.parse_block()?)));
+        }
         if self.check_delim(Delim::LBrace) {
             return Ok(Expr::Block(Box::new(self.parse_block()?)));
         }
@@ -1767,7 +1771,7 @@ enum StmtOrTail {
 
 fn is_block_like(e: &Expr) -> bool {
     matches!(e, Expr::If(_) | Expr::Match(_) | Expr::Loop(_) | Expr::Block(_)
-        | Expr::Spawn { .. } | Expr::Select(_) | Expr::TryCatch { .. })
+        | Expr::Spawn { .. } | Expr::Select(_) | Expr::TryCatch { .. } | Expr::Unsafe(_))
 }
 
 fn is_primitive_type_name(s: &str) -> bool {

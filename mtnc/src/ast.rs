@@ -616,6 +616,12 @@ pub enum Expr {
     /// fit — that's a declaration-shaped construct with a name and
     /// parameter list, not an argument value.
     EventHandler { event: String, body: Box<Expr> },
+    /// `unsafe { ... }` (Document 3 Category C, Document 6 SS7, Document
+    /// 13 SS5). Needed for Phase 3's null/unsafe interaction (Document 5
+    /// SS2.6: `null` is only usable in unsafe/FFI-typed contexts) — this
+    /// was a real gap in Phase 2 (no unsafe-block parsing existed at
+    /// all), closed here since Phase 3's exit criteria needs it.
+    Unsafe(Box<Block>),
 }
 
 // ---------- Database query expression (Document 20 / Doc23 §11) ----------
