@@ -54,6 +54,11 @@ pub enum Ty {
     /// A user-declared struct or enum, by name. Phase 3 has no generics
     /// yet (Phase 5), so this carries no type arguments.
     Named(String),
+    /// `dyn Trait` (Document 7 §4.5) — statically known only to
+    /// implement `Trait`, resolved via vtable at runtime. Method
+    /// resolution against this type looks up the *trait's* declared
+    /// signature, not any concrete `impl`'s.
+    DynTrait(String),
     OptionTy(Box<Ty>),
     ResultTy(Box<Ty>, Box<Ty>),
     Fn(Vec<Ty>, Box<Ty>),
@@ -78,6 +83,7 @@ impl std::fmt::Display for Ty {
             Ty::Tuple(ts) => write!(f, "({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Ref(m, t) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Ty::Named(n) => write!(f, "{}", n),
+            Ty::DynTrait(n) => write!(f, "dyn {}", n),
             Ty::OptionTy(t) => write!(f, "Option<{}>", t),
             Ty::ResultTy(o, e) => write!(f, "Result<{}, {}>", o, e),
             Ty::Fn(ps, r) => write!(f, "fn({}) -> {}", ps.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "), r),
@@ -118,7 +124,7 @@ pub fn resolve_type(t: &Type) -> Ty {
         Type::Array(inner, _size) => Ty::Array(Box::new(resolve_type(inner))),
         Type::Tuple(ts) => Ty::Tuple(ts.iter().map(resolve_type).collect()),
         Type::Ref { mutable, inner, .. } => Ty::Ref(*mutable, Box::new(resolve_type(inner))),
-        Type::Dyn(n, _) => Ty::Named(n.clone()),
+        Type::Dyn(n, _) => Ty::DynTrait(n.clone()),
         Type::Fn(ps, r) => Ty::Fn(ps.iter().map(resolve_type).collect(), Box::new(resolve_type(r))),
         Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type(inner))),
         Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type(o)), Box::new(resolve_type(e))),
@@ -159,6 +165,33 @@ pub struct EnumShape {
     pub variants: Vec<(String, Vec<Ty>)>,
 }
 
+/// A method signature (params excluding `self`, return type). Used for
+/// both trait-declared methods and concrete `impl`-provided methods.
+#[derive(Debug, Clone)]
+pub struct FnSig {
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    /// `true` if this is a trait method with a default body (Document 7
+    /// §4.3) — such methods are *not* required to be re-implemented by
+    /// an `impl`. Always `true` (irrelevant) for `ImplRecord` methods,
+    /// which always have a body by construction.
+    pub has_default_body: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitShape {
+    pub methods: HashMap<String, FnSig>,
+}
+
+/// One `impl` block's provided methods for a given target type. `Vec`
+/// (not a single record) because a type can have both an inherent impl
+/// and multiple trait impls, all contributing callable methods.
+#[derive(Debug, Clone)]
+pub struct ImplRecord {
+    pub trait_name: Option<String>,
+    pub methods: HashMap<String, FnSig>,
+}
+
 pub struct TypeChecker {
     structs: HashMap<String, StructShape>,
     enums: HashMap<String, EnumShape>,
@@ -168,6 +201,8 @@ pub struct TypeChecker {
     /// function calls, e.g. `fn setAge(age: u8) {...} setAge(25);`
     /// (Document 5 §4's own example) correctly infers `25: u8`.
     functions: HashMap<String, (Vec<Ty>, Ty)>,
+    traits: HashMap<String, TraitShape>,
+    impls_by_type: HashMap<String, Vec<ImplRecord>>,
     pub errors: Vec<TypeError>,
 }
 
@@ -199,19 +234,30 @@ impl TypeChecker {
             structs: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
+            traits: HashMap::new(),
+            impls_by_type: HashMap::new(),
             errors: Vec::new(),
         }
     }
 
     pub fn check_program(&mut self, program: &Program) {
-        // Pass 1: register all struct/enum data shapes and fn
+        // Pass 1: register all struct/enum/trait data shapes and fn
         // signatures first, so forward references (a function defined
         // before a struct it uses, or mutual struct references) resolve
         // regardless of declaration order.
         for item in &program.items {
             self.register_item(item);
         }
-        // Pass 2: type-check every function body.
+        // Pass 2: register and validate every `impl` block -- run only
+        // after pass 1 so a trait declared textually *after* its impl
+        // still resolves correctly, and so the orphan-rule / required-
+        // method-completeness checks have the full struct/enum/trait
+        // picture available regardless of declaration order.
+        for item in &program.items {
+            self.register_impls(item);
+        }
+        // Pass 3: type-check every function body (can now resolve
+        // method calls via `impls_by_type`/`traits`).
         for item in &program.items {
             self.check_item(item);
         }
@@ -247,6 +293,20 @@ impl TypeChecker {
                 let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
                 self.functions.insert(f.name.clone(), (params, ret));
             }
+            ItemKind::Trait(t) => {
+                let methods = t.items.iter().filter_map(|ti| match ti {
+                    TraitItem::Fn(f) => {
+                        let params = f.params.iter()
+                            .filter(|p| p.name != "self")
+                            .map(|p| resolve_type(&p.ty))
+                            .collect();
+                        let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+                        Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some() }))
+                    }
+                    TraitItem::AssocType(_) => None,
+                }).collect();
+                self.traits.insert(t.name.clone(), TraitShape { methods });
+            }
             ItemKind::Mod(m) => {
                 for inner in &m.items {
                     self.register_item(inner);
@@ -256,9 +316,90 @@ impl TypeChecker {
         }
     }
 
+    /// Pass 2: register every `impl` block's methods into
+    /// `impls_by_type`, and validate the two things Document 25 §2.3's
+    /// exit criteria requires for this phase: the orphan-rule check
+    /// (Document 7 §5) and required-trait-method completeness
+    /// (Document 7 §4.2/§4.3 — every non-default trait method must be
+    /// provided).
+    fn register_impls(&mut self, item: &Item) {
+        if let ItemKind::Impl(impl_decl) = &item.kind {
+            let target_name = impl_decl.target.name.clone();
+            let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
+
+            let methods: HashMap<String, FnSig> = impl_decl.items.iter().filter_map(|ii| match ii {
+                ImplItem::Fn(f) => {
+                    let params = f.params.iter()
+                        .filter(|p| p.name != "self")
+                        .map(|p| resolve_type(&p.ty))
+                        .collect();
+                    let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+                    Some((f.name.clone(), FnSig { params, ret, has_default_body: true }))
+                }
+                ImplItem::AssocType(..) => None,
+            }).collect();
+
+            if let Some(tn) = &trait_name {
+                // Document 7 §5's orphan rule, grounded via Document 15
+                // §3.2's `use`/`import` distinction: Phase 4 doesn't have
+                // the real module/package system yet (Document 15 is
+                // Phase 14), so "defined in the current package" is
+                // approximated here as "declared locally in this
+                // Program" (a `trait`/`struct`/`enum` item actually
+                // present) -- anything not locally declared is treated
+                // as foreign, consistent with how `import` (cross-
+                // package) vs `use` (same-package) already distinguish
+                // these in the parsed AST. Flagged for sign-off, same as
+                // every other spec-grounded extension in prior phases.
+                let trait_is_local = self.traits.contains_key(tn);
+                let type_is_local = self.structs.contains_key(&target_name) || self.enums.contains_key(&target_name);
+                if !trait_is_local && !type_is_local {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "orphan rule violation: `impl {} for {}` is not allowed -- neither the trait nor the type is defined in the current package (Document 7 §5)",
+                            tn, target_name
+                        ),
+                        context: format!("impl {} for {}", tn, target_name),
+                    });
+                }
+
+                // Required-method completeness -- only checkable when
+                // the trait itself is locally declared (a foreign
+                // trait's full method list isn't known to this checker).
+                if let Some(shape) = self.traits.get(tn).cloned() {
+                    for (mname, sig) in &shape.methods {
+                        if !sig.has_default_body && !methods.contains_key(mname) {
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "`impl {} for {}` is missing required method `{}` (Document 7 §4.2/§4.3)",
+                                    tn, target_name, mname
+                                ),
+                                context: format!("impl {} for {}", tn, target_name),
+                            });
+                        }
+                    }
+                }
+            }
+
+            self.impls_by_type.entry(target_name).or_default().push(ImplRecord { trait_name, methods });
+        } else if let ItemKind::Mod(m) = &item.kind {
+            for inner in &m.items {
+                self.register_impls(inner);
+            }
+        }
+    }
+
     fn check_item(&mut self, item: &Item) {
         match &item.kind {
-            ItemKind::Fn(f) => self.check_fn(f),
+            ItemKind::Fn(f) => self.check_fn(f, None),
+            ItemKind::Impl(impl_decl) => {
+                let self_ty = Ty::Named(impl_decl.target.name.clone());
+                for ii in &impl_decl.items {
+                    if let ImplItem::Fn(f) = ii {
+                        self.check_fn(f, Some(&self_ty));
+                    }
+                }
+            }
             ItemKind::Mod(m) => {
                 for inner in &m.items {
                     self.check_item(inner);
@@ -268,11 +409,16 @@ impl TypeChecker {
         }
     }
 
-    fn check_fn(&mut self, f: &FnDecl) {
+    fn check_fn(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
         let Some(body) = &f.body else { return };
         let mut env = Env::new();
         for p in &f.params {
-            if p.name == "self" { continue; }
+            if p.name == "self" {
+                if let Some(t) = self_ty {
+                    env.insert("self".to_string(), t.clone());
+                }
+                continue;
+            }
             env.insert(p.name.clone(), resolve_type(&p.ty));
         }
         let expected_ret = f.return_type.as_ref().map(resolve_type);
@@ -375,15 +521,29 @@ impl TypeChecker {
     /// through.
     fn check_expr(&mut self, expr: &Expr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
         let actual = self.check_expr_inner(expr, expected, env, ctx);
-        // Literals are excluded from this blanket check: `check_literal`
-        // already fully handles expected-compatibility internally for
-        // every literal kind (numeric literals adopt/default per rules
-        // 2/3, so `actual` already equals `expected` whenever that's
-        // possible; `null` explicitly reports its own specific,
-        // clearer error when incompatible). Running the generic check
-        // again here would double-report the same mismatch a second
-        // time with a less specific message, not add real coverage.
-        if !matches!(expr, Expr::Literal(_)) {
+        // Only numeric literals and `null` are excluded from this
+        // blanket check -- `check_literal`'s `Int`/`IntHex`/`IntOct`/
+        // `IntBin`/`Float` arms already adopt-or-default against
+        // `expected` per rules 2/3 (so `actual` already equals
+        // `expected` whenever that's even possible), and `Null` reports
+        // its own specific, clearer error when incompatible. Running the
+        // generic check again for those would double-report the same
+        // mismatch a second time with a less specific message.
+        //
+        // `Str`/`RawStr`/`Char`/`Bool` were WRONGLY included in this
+        // exclusion in an earlier version of this fix (blanket-excluding
+        // all of `Expr::Literal(_)`) -- `check_literal`'s arms for those
+        // never compare against `expected` at all, they just return a
+        // fixed type unconditionally. That meant `let x: bool = "hi";`
+        // or a `dyn`-dispatched call passing `true` where `f64` was
+        // expected would have silently type-checked. Caught by hand-
+        // tracing this phase's own dyn-dispatch arg-type test before
+        // trusting it, not by a later CI failure.
+        let self_checking_literal = matches!(expr, Expr::Literal(
+            Literal::Int(_) | Literal::IntHex(_) | Literal::IntOct(_)
+            | Literal::IntBin(_) | Literal::Float(_) | Literal::Null
+        ));
+        if !self_checking_literal {
             self.check_compatible(&actual, expected, ctx);
         }
         actual
@@ -618,16 +778,55 @@ impl TypeChecker {
                 expected.cloned().unwrap_or(Ty::Unit)
             }
 
-            Expr::MethodCall { receiver, args, .. } => {
-                self.check_expr(receiver, None, env, ctx);
-                for arg in args {
-                    self.check_expr(&arg.value, None, env, ctx);
+            Expr::MethodCall { receiver, name, args } => {
+                let recv_ty = self.check_expr(receiver, None, env, ctx);
+                let sig = self.resolve_method(&recv_ty, name);
+                match sig {
+                    Some(sig) => {
+                        for (i, arg) in args.iter().enumerate() {
+                            self.check_expr(&arg.value, sig.params.get(i), env, ctx);
+                        }
+                        if args.len() != sig.params.len() {
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "method `{}` on `{}` expects {} argument(s), found {}",
+                                    name, recv_ty, sig.params.len(), args.len()
+                                ),
+                                context: ctx.into(),
+                            });
+                        }
+                        sig.ret
+                    }
+                    None => {
+                        for arg in args {
+                            self.check_expr(&arg.value, None, env, ctx);
+                        }
+                        // Only report "no such method" when the receiver
+                        // is a type this checker actually has full
+                        // knowledge of (a locally-declared struct/enum,
+                        // or a dyn-Trait whose trait is locally
+                        // declared) -- for anything else (foreign types,
+                        // primitives, stdlib collections with no
+                        // registered methods yet) Phase 4 doesn't have
+                        // enough information to say the method doesn't
+                        // exist, so it stays silent rather than
+                        // fabricating a false error, consistent with
+                        // Phase 3's existing field-access behavior for
+                        // unknown base types.
+                        let known_base = match &recv_ty {
+                            Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n),
+                            Ty::DynTrait(n) => self.traits.contains_key(n),
+                            _ => false,
+                        };
+                        if known_base {
+                            self.errors.push(TypeError {
+                                message: format!("no method named `{}` found for type `{}`", name, recv_ty),
+                                context: ctx.into(),
+                            });
+                        }
+                        expected.cloned().unwrap_or(Ty::Unit)
+                    }
                 }
-                // Method resolution needs trait/impl information (Phase 4),
-                // not available yet -- returns the expected type if given
-                // (optimistic pass-through) rather than fabricating a
-                // wrong concrete type.
-                expected.cloned().unwrap_or(Ty::Unit)
             }
 
             Expr::Borrow { expr: inner, mutable } => {
@@ -905,6 +1104,45 @@ impl TypeChecker {
             }
         }
         Ty::Named(name.to_string())
+    }
+
+    /// Resolves a method call against a receiver's static type. Two
+    /// dispatch modes, per Document 7 §4.4/§4.5 and this phase's exit
+    /// criteria:
+    /// - **Static dispatch** (`Ty::Named`): search every `impl` block
+    ///   registered for that concrete type (inherent *and* trait impls
+    ///   both contribute) for a matching method name. This is what
+    ///   "static/monomorphized, zero-cost" dispatch means at the
+    ///   type-checking level — the exact concrete implementation is
+    ///   known here, at compile time, not deferred to a vtable.
+    /// - **Dynamic dispatch** (`Ty::DynTrait`): resolve against the
+    ///   *trait's own* declared signature instead of any concrete
+    ///   `impl` — correct, because with `dyn Trait` the concrete
+    ///   implementing type isn't known until runtime (Document 7 §4.5:
+    ///   "resolved via vtable lookup at runtime"); statically, all that
+    ///   can be verified is that the trait itself declares a method with
+    ///   this name and signature.
+    fn resolve_method(&self, recv_ty: &Ty, name: &str) -> Option<FnSig> {
+        match recv_ty {
+            Ty::Named(type_name) => {
+                let impls = self.impls_by_type.get(type_name)?;
+                // Inherent methods (`impl Type { ... }`, no trait) take
+                // precedence over trait-provided methods of the same
+                // name -- the usual method-resolution order. This is
+                // also what makes `ImplRecord::trait_name` an actually-
+                // consumed piece of information rather than write-only
+                // (caught proactively via `grep -n "\.trait_name\b"`
+                // returning nothing before this fix, same discipline as
+                // Phase 3's `self.enums` catch).
+                impls.iter().find(|r| r.trait_name.is_none())
+                    .and_then(|r| r.methods.get(name).cloned())
+                    .or_else(|| impls.iter().find_map(|r| r.methods.get(name).cloned()))
+            }
+            Ty::DynTrait(trait_name) => {
+                self.traits.get(trait_name)?.methods.get(name).cloned()
+            }
+            _ => None,
+        }
     }
 
     fn field_type(&mut self, base: &Ty, field: &str, ctx: &str) -> Ty {
