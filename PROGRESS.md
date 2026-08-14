@@ -733,7 +733,150 @@ reported twice with a less specific message the second time.
 No changes needed — picks up `tests/types_doc5.rs` and the new `types.rs`
 unit coverage automatically.
 
-## Phases 4–25
+## Phase 4 — Traits & `impl`
+
+**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+
+### Scope (per Document 25 §2.3)
+Full trait declarations (Document 7 §4) including default method bodies,
+`impl Trait for Type` resolution, the orphan-rule coherence check
+(Document 7 §5), and both dispatch modes: static/monomorphized (default)
+and `dyn`-based dynamic dispatch (Document 7 §4.5).
+
+### What was built
+- `src/types.rs` additions: `Ty::DynTrait` (was previously
+  indistinguishable from `Ty::Named` — `resolve_type` mapped `Type::Dyn`
+  to `Ty::Named` in Phase 3, which would have made static and dynamic
+  dispatch unable to be told apart; fixed as part of this phase), `FnSig`
+  (method signatures), `TraitShape` (trait method registry, tracking
+  which methods have default bodies), `ImplRecord` (one impl block's
+  provided methods, with an optional trait name), and a new
+  `resolve_method` doing real two-mode dispatch resolution.
+- `tests/traits_impls.rs` — 17 tests: orphan rule (violation + two
+  "allowed" cases, one per which side is local, + confirmation the rule
+  doesn't apply to inherent impls), required-vs-default method
+  completeness (both directions), static dispatch (inherent + trait-
+  provided, correct args, wrong arg type, undefined method, inherent-
+  over-trait precedence), and `dyn` dispatch (resolves via trait
+  signature, undefined method, wrong arg type, and a side-by-side test
+  confirming static and dyn dispatch are genuinely distinguished, not
+  accidentally sharing one resolution path).
+- Extended `check_fn`/`check_item` to bind `self` to the enclosing
+  impl's target type when checking a method body, so `self.field` and
+  `self.method()` resolve correctly inside `impl` blocks (Phase 3 only
+  ever checked free functions, where `self` never appeared).
+
+### Design decision (flagged, not silently assumed)
+**Orphan-rule "package" approximation.** Document 7 §5's orphan rule is
+about cross-*package* coherence, but the real module/package system
+(Document 15) isn't built until Phase 14 — this phase's `Program` is
+effectively one file with no package boundary of its own. Grounded the
+approximation in Document 15 §3.2's own documented `use` (same-package)
+vs `import` (cross-package) distinction: a trait or type is treated as
+"local" if it's actually declared (`trait`/`struct`/`enum` item) in the
+checked `Program`, and "foreign" otherwise — regardless of whether an
+explicit `import` statement is present, since Phase 4 doesn't yet
+validate `import` targets either. This correctly rejects the two-
+foreign-things case Document 7 §8 describes and correctly allows both
+"trait local" and "type local" cases, but is necessarily a
+simplification until Phase 14's real package system exists to check
+against directly. Flagged for sign-off, same as every deviation before it.
+
+### A real bug found and fixed during this phase's own verification (not just claimed)
+Hand-tracing the `dyn_dispatch_wrong_arg_type_rejected` test (`shape.scale(true)`
+where `scale` expects `f64`) before trusting it surfaced a real gap left
+over from Phase 3's own fix: the blanket exclusion of `Expr::Literal`
+from `check_expr`'s final compatibility check was too broad. It was
+written reasoning that "`check_literal` already handles
+expected-compatibility internally" — true for `Int`/`Float` (which
+adopt/default per rules 2/3) and `Null` (which reports its own specific
+error), but **false** for `Str`/`RawStr`/`Char`/`Bool` literals, whose
+arms in `check_literal` never compare against `expected` at all — they
+just return a fixed type unconditionally. That meant `let x: bool =
+"hi";`, or (as this phase's own test would have shown) passing `true`
+where a trait method declares an `f64` parameter, would have silently
+type-checked with zero errors. Narrowed the exclusion to exactly the
+literal kinds that actually self-check (`Int`/`IntHex`/`IntOct`/`IntBin`/
+`Float`/`Null`), restoring the blanket check for `Str`/`RawStr`/`Char`/
+`Bool`. Confirmed no existing Phase 3 test relied on the old (incorrect)
+permissive behavior before finalizing this fix.
+
+### Systematic verification performed (same discipline as Phases 1–3)
+- Delimiter-balance check on every touched file — clean, re-run twice
+  more after subsequent edits.
+- AST enum-variant cross-reference script, re-run three times across
+  this phase's edits — clean each time, including after the literal-
+  exclusion fix.
+- Direct field-name verification for every struct-*variant* of `Expr`
+  destructured in `types.rs` (`MethodCall`, `StructLit`, `Call`, `Field`,
+  `Index`, `Assign`, `Cast`, `Range`, `Borrow`, `Unary`, `Binary`) against
+  the actual `ast.rs` declarations — done explicitly this phase because
+  the automated struct-field checker only covers standalone `pub
+  struct`s, not enum struct-variants like `Expr::MethodCall { .. }`,
+  which it silently can't see. All 11 confirmed correct by direct grep,
+  not by trusting the automated script's (incomplete, in this respect)
+  "clean" result alone.
+- Glob-import audit: no new glob imports this phase; the two present
+  (`use crate::ast::*`, `use BinaryOp::*`) are the same ones already
+  proven safe in Phase 2/3.
+- Proactively checked for a second self-introduced dead-field situation
+  before it could become a warning (following the Phase 3 precedent):
+  `ImplRecord::trait_name` was written during registration but never
+  read anywhere — confirmed via `grep -n "\.trait_name\b"` returning
+  nothing. Unlike a case where the data has no real use, this one had an
+  obvious, correct, in-scope semantic role (inherent methods should take
+  precedence over trait methods of the same name during resolution) —
+  implemented that rule, which both fixes the dead-field issue *and* adds
+  real, tested method-resolution-order coverage
+  (`inherent_method_takes_precedence_over_trait_method_of_same_name`).
+
+### Known simplifications (flagged, not silently claimed as complete)
+- **Method-signature matching for completeness checking is name-only,
+  not full type-checking** — `register_impls`'s required-method check
+  verifies every non-default trait method *name* is provided, but
+  doesn't verify the *implementing* method's parameter/return types
+  actually match the trait's declared signature (e.g., an `impl` could
+  provide `fn name(borrow self) -> i32` where the trait declares `-> String`
+  and this wouldn't be caught as a signature mismatch, only as "the
+  method exists"). Document 7's examples don't show a signature-mismatch
+  test case to ground stricter checking against, and full structural
+  signature comparison interacts with `Self`-typed parameters in a way
+  that's cleaner to handle once Phase 5's generics work exists (`Self`
+  in a trait signature can't resolve to a concrete `Ty` without knowing
+  the implementing type, which the checker does know by the time it
+  reaches an `impl` block, but treating it fully generally is more
+  Phase-5-shaped work).
+- **Associated types (`TraitItem::AssocType`, `ImplItem::AssocType`,
+  Document 8 §5) are parsed but not semantically checked** — Document
+  25 §2.3 scopes associated types to Phase 5 alongside the rest of
+  generics, not this phase.
+- **No detection of duplicate/conflicting impls** (e.g. two separate
+  `impl Describable for Widget` blocks both providing `describe` via the
+  *same* trait, which should probably be a coherence error) — only the
+  orphan rule itself is checked this phase, not general impl-coherence
+  beyond it.
+
+### Exit criteria (Document 25 §2.3) — self-assessment
+> "Orphan-rule violation test (Doc 7 §8) correctly rejected; trait
+> method resolution correct for both static and `dyn` dispatch cases"
+
+- Orphan-rule violation: rejected, with a dedicated diagnostic message
+  (`"orphan rule violation: ..."`), plus two positive counterparts
+  (trait-local, type-local) and one confirming inherent impls aren't
+  subject to the rule at all. **Pending real `cargo test` confirmation.**
+- Static dispatch: resolves through concrete `impl` blocks (inherent and
+  trait-provided), checks argument types, rejects undefined methods,
+  and correctly orders inherent-over-trait precedence.
+- `dyn` dispatch: resolves through the trait's own declared signature
+  (not any concrete impl), checks argument types, rejects undefined
+  methods, and is confirmed (via a side-by-side test) to genuinely use a
+  different resolution path than static dispatch, not the same one.
+- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+
+### `.github/workflows/ci.yml`
+No changes needed — picks up `tests/traits_impls.rs` automatically.
+
+## Phases 5–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
