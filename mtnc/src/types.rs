@@ -51,9 +51,25 @@ pub enum Ty {
     Array(Box<Ty>),
     Tuple(Vec<Ty>),
     Ref(bool, Box<Ty>),
-    /// A user-declared struct or enum, by name. Phase 3 has no generics
-    /// yet (Phase 5), so this carries no type arguments.
+    /// A user-declared struct or enum with no generic parameters, by
+    /// name. Phase 3 had no generics at all; as of Phase 5, a
+    /// zero-generic-parameter struct/enum still resolves to this
+    /// variant (simplest, most common case), while one with generic
+    /// parameters resolves to `Ty::Generic` once concrete/const
+    /// arguments are supplied.
     Named(String),
+    /// A generic struct/enum instantiated with concrete type and/or
+    /// const arguments (Document 8), e.g. `Matrix<f64, 2, 3>` resolves
+    /// to `Generic("Matrix", [Type(F64), Const(2), Const(3)])`.
+    Generic(String, Vec<GenericArg>),
+    /// An unresolved reference to one of the *enclosing* declaration's
+    /// own generic type parameters (e.g. `T` inside `struct Pair<A,
+    /// B> { first: A, second: B }`'s field types, before any concrete
+    /// instantiation is known). Only appears transiently during
+    /// generic-declaration registration/substitution; never the final
+    /// type of a checked expression in ordinary (non-generic-body)
+    /// code.
+    TypeParam(String),
     /// `dyn Trait` (Document 7 §4.5) — statically known only to
     /// implement `Trait`, resolved via vtable at runtime. Method
     /// resolution against this type looks up the *trait's* declared
@@ -66,6 +82,27 @@ pub enum Ty {
     /// a valid value inside `unsafe { }` blocks; everywhere else,
     /// wanting "value or absence" must use `OptionTy`.
     Null,
+}
+
+/// One generic argument at an instantiation site: either a concrete
+/// type (`Matrix<f64, ...>`'s `f64`) or a resolved const value
+/// (`Matrix<..., 2, 3>`'s `2`/`3`, Document 8 §8). Phase 5 only
+/// supports integer-literal const-generic arguments — Document 8 §8's
+/// own examples (`Matrix<f64,2,3>`, array sizes) never show anything
+/// else in this position, so nothing broader is invented.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenericArg {
+    Type(Ty),
+    Const(i64),
+}
+
+impl std::fmt::Display for GenericArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GenericArg::Type(t) => write!(f, "{}", t),
+            GenericArg::Const(n) => write!(f, "{}", n),
+        }
+    }
 }
 
 impl std::fmt::Display for Ty {
@@ -83,6 +120,8 @@ impl std::fmt::Display for Ty {
             Ty::Tuple(ts) => write!(f, "({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Ref(m, t) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Ty::Named(n) => write!(f, "{}", n),
+            Ty::Generic(n, args) => write!(f, "{}<{}>", n, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::TypeParam(n) => write!(f, "{}", n),
             Ty::DynTrait(n) => write!(f, "dyn {}", n),
             Ty::OptionTy(t) => write!(f, "Option<{}>", t),
             Ty::ResultTy(o, e) => write!(f, "Result<{}, {}>", o, e),
@@ -130,7 +169,96 @@ pub fn resolve_type(t: &Type) -> Ty {
         Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type(o)), Box::new(resolve_type(e))),
         Type::Unit => Ty::Unit,
         Type::Never => Ty::Never,
-        Type::ConstArg(_) => Ty::Unit, // not a real type position; Phase 5 concern
+        Type::ConstArg(_) => Ty::Unit, // not a real type position; see const_int_value below for the Phase 5 handling
+    }
+}
+
+/// Extracts an integer value from a const-generic argument expression
+/// (Document 8 §8's `Matrix<f64, 2, 3>` — the `2`/`3`). Phase 5 only
+/// supports a bare integer literal here (optionally negative, though no
+/// spec example shows a negative dimension) — Document 8's own examples
+/// never show anything more complex (no const-generic arithmetic
+/// expressions like `N + 1`), so nothing broader is invented.
+fn const_int_value(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Int(s)) => s.replace('_', "").parse::<i64>().ok(),
+        Expr::Unary { op: UnaryOp::Neg, expr: inner } => {
+            const_int_value(inner).map(|n| -n)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces `Ty::TypeParam(n)` with the concrete type supplied for `n`
+/// in `subst` (used when checking a generic struct literal's fields
+/// against a known concrete instantiation, e.g. `Pair<i32, String>`'s
+/// `first` field should be checked as `i32`, not the abstract
+/// `TypeParam("A")` stored in the struct's registered shape).
+fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Array(inner) => Ty::Array(Box::new(substitute_type_params(inner, subst))),
+        Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute_type_params(t, subst)).collect()),
+        Ty::Ref(m, inner) => Ty::Ref(*m, Box::new(substitute_type_params(inner, subst))),
+        Ty::OptionTy(inner) => Ty::OptionTy(Box::new(substitute_type_params(inner, subst))),
+        Ty::ResultTy(o, e) => Ty::ResultTy(
+            Box::new(substitute_type_params(o, subst)),
+            Box::new(substitute_type_params(e, subst)),
+        ),
+        Ty::Fn(ps, r) => Ty::Fn(
+            ps.iter().map(|t| substitute_type_params(t, subst)).collect(),
+            Box::new(substitute_type_params(r, subst)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Structural unification for generic-parameter inference (Document 8
+/// §2's own example: `fn largest<T>(list: [T]) -> T`, called as
+/// `largest(nums)` where `nums: [i32]`, must infer `T = i32`). Walks
+/// `param_ty` (which may contain `Ty::TypeParam` placeholders, from a
+/// generic function's registered signature) against `arg_ty` (the
+/// actual, concrete argument type), binding each `TypeParam` name to
+/// whatever concrete type structurally occupies that position. Only
+/// handles the structural shapes Document 8's own examples actually
+/// use (a bare type parameter, one level of `[T]`/`&T`/tuple nesting) —
+/// deeper or more exotic unification isn't attempted; an unresolved
+/// type parameter is simply left unbound rather than reported as an
+/// error (a known, flagged scope simplification).
+fn unify_infer(param_ty: &Ty, arg_ty: &Ty, out: &mut HashMap<String, Ty>) {
+    match (param_ty, arg_ty) {
+        (Ty::TypeParam(n), t) => {
+            out.entry(n.clone()).or_insert_with(|| t.clone());
+        }
+        (Ty::Array(p), Ty::Array(a)) => unify_infer(p, a, out),
+        (Ty::Ref(_, p), Ty::Ref(_, a)) => unify_infer(p, a, out),
+        (Ty::Tuple(ps), Ty::Tuple(as_)) if ps.len() == as_.len() => {
+            for (p, a) in ps.iter().zip(as_.iter()) {
+                unify_infer(p, a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonical registry-lookup key for a `Ty` — the same key `impls_by_type`
+/// is keyed by (an `impl`'s `target.name`, which for a primitive like
+/// `impl Comparable for i32` is literally the text `"i32"`, since
+/// primitive type names lex as plain identifiers, not keywords — Phase
+/// 1's design decision). Used by `satisfies_bound` so a trait bound can
+/// be checked against a monomorphized primitive type just as well as a
+/// user-declared struct/enum.
+fn ty_lookup_name(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Named(n) | Ty::Generic(n, _) => Some(n.clone()),
+        Ty::I8 => Some("i8".into()), Ty::I16 => Some("i16".into()), Ty::I32 => Some("i32".into()),
+        Ty::I64 => Some("i64".into()), Ty::I128 => Some("i128".into()), Ty::Isize => Some("isize".into()),
+        Ty::U8 => Some("u8".into()), Ty::U16 => Some("u16".into()), Ty::U32 => Some("u32".into()),
+        Ty::U64 => Some("u64".into()), Ty::U128 => Some("u128".into()), Ty::Usize => Some("usize".into()),
+        Ty::F32 => Some("f32".into()), Ty::F64 => Some("f64".into()),
+        Ty::Bool => Some("bool".into()), Ty::Char => Some("char".into()),
+        Ty::StringTy => Some("String".into()), Ty::Str => Some("str".into()),
+        _ => None,
     }
 }
 
@@ -158,11 +286,44 @@ pub struct StructShape {
     /// `true` for `struct Foo(A, B);` tuple structs — fields are
     /// positionally named "0", "1", ... internally.
     pub is_tuple: bool,
+    /// This struct's own generic parameters, in declaration order
+    /// (Document 8 §1/§8) — empty for a non-generic struct. Field types
+    /// referencing one of these by name are stored as `Ty::TypeParam`,
+    /// not `Ty::Named` (see `mark_type_params`).
+    pub generics: Vec<GenericParam>,
+}
+
+/// Recursively replaces `Ty::Named(n)` with `Ty::TypeParam(n)` wherever
+/// `n` matches one of the enclosing declaration's own generic
+/// parameter names — so a generic struct's field types (e.g. `struct
+/// Pair<A, B> { first: A, second: B }`) correctly distinguish "this
+/// field's type is the generic parameter A" from "this field's type is
+/// a concrete struct that happens to be named A". Applied once, right
+/// after a generic struct/enum's fields are resolved via the ordinary
+/// (context-free) `resolve_type`.
+fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
+    match ty {
+        Ty::Named(n) if param_names.contains(&n) => Ty::TypeParam(n),
+        Ty::Array(inner) => Ty::Array(Box::new(mark_type_params(*inner, param_names))),
+        Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|t| mark_type_params(t, param_names)).collect()),
+        Ty::Ref(m, inner) => Ty::Ref(m, Box::new(mark_type_params(*inner, param_names))),
+        Ty::OptionTy(inner) => Ty::OptionTy(Box::new(mark_type_params(*inner, param_names))),
+        Ty::ResultTy(o, e) => Ty::ResultTy(
+            Box::new(mark_type_params(*o, param_names)),
+            Box::new(mark_type_params(*e, param_names)),
+        ),
+        Ty::Fn(ps, r) => Ty::Fn(
+            ps.into_iter().map(|t| mark_type_params(t, param_names)).collect(),
+            Box::new(mark_type_params(*r, param_names)),
+        ),
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EnumShape {
     pub variants: Vec<(String, Vec<Ty>)>,
+    pub generics: Vec<GenericParam>,
 }
 
 /// A method signature (params excluding `self`, return type). Used for
@@ -200,10 +361,28 @@ pub struct TypeChecker {
     /// Document 5 rule 3 (contextual inference) to work through real
     /// function calls, e.g. `fn setAge(age: u8) {...} setAge(25);`
     /// (Document 5 §4's own example) correctly infers `25: u8`.
-    functions: HashMap<String, (Vec<Ty>, Ty)>,
+    /// Extended in Phase 5 to also carry generic parameters and
+    /// where-clause bounds (Document 8 §2/§3), so a call to a generic
+    /// function can infer its type parameters from argument types and
+    /// verify the declared bounds are actually satisfied.
+    functions: HashMap<String, FunctionShape>,
     traits: HashMap<String, TraitShape>,
     impls_by_type: HashMap<String, Vec<ImplRecord>>,
     pub errors: Vec<TypeError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionShape {
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    pub generics: Vec<GenericParam>,
+    /// Flattened from `ast::WhereClause`: type-param name -> the list of
+    /// trait names it must satisfy (Document 8 §3's `T: A + B` becomes
+    /// `["A", "B"]`). Trait-bound generic *arguments* (e.g. a bound
+    /// written `T: Container<i32>`) aren't tracked — Document 8's own
+    /// examples (`T: Comparable`, `T: Serializable + Comparable + Clone`)
+    /// never show a parameterized bound, so nothing broader is invented.
+    pub bounds: Vec<(String, Vec<String>)>,
 }
 
 /// Local variable environment: a stack of scopes (blocks introduce a
@@ -240,6 +419,86 @@ impl TypeChecker {
         }
     }
 
+    /// Context-aware type resolution for positions where a user writes
+    /// an explicit type annotation on an *expression* (a `let` binding,
+    /// a cast target) — as opposed to the plain, context-free
+    /// `resolve_type` free function used for struct/fn *declaration*
+    /// registration. This is where Document 8 §8's `Matrix<f64, 2, 3>`
+    /// actually needs full validation: arg count against the struct's
+    /// declared generic parameters, and arg *kind* (a type argument
+    /// where a type parameter is declared, a const value where a const
+    /// parameter is declared).
+    ///
+    /// Scoped deliberately narrow rather than replacing `resolve_type`
+    /// everywhere: struct/enum FIELD types and function PARAMETER type
+    /// *registration* still use the plain function (so e.g. `fn
+    /// foo(m: Matrix<f64,2,3>)`'s parameter type is registered as
+    /// `Ty::Named("Matrix")`, args discarded, not validated) — flagged
+    /// as a known scope boundary in PROGRESS.md rather than silently
+    /// pretending full coverage, given the concrete exit-criteria
+    /// example (Document 8 §9) is phrased as a direct expression, which
+    /// this covers.
+    fn resolve_type_full(&mut self, t: &Type, ctx: &str) -> Ty {
+        if let Type::Named(name, args) = t {
+            if !args.is_empty() {
+                let generics = self.structs.get(name).map(|s| s.generics.clone())
+                    .or_else(|| self.enums.get(name).map(|e| e.generics.clone()));
+                if let Some(generics) = generics {
+                    if args.len() != generics.len() {
+                        self.errors.push(TypeError {
+                            message: format!(
+                                "`{}` expects {} generic argument(s), found {}",
+                                name, generics.len(), args.len()
+                            ),
+                            context: ctx.into(),
+                        });
+                        return Ty::Named(name.clone());
+                    }
+                    let mut resolved = Vec::new();
+                    let mut kind_error = false;
+                    for (param, arg) in generics.iter().zip(args.iter()) {
+                        match (param, arg) {
+                            (GenericParam::Type { .. }, Type::ConstArg(_)) => {
+                                self.errors.push(TypeError {
+                                    message: format!("`{}`: expected a type argument, found a const value", name),
+                                    context: ctx.into(),
+                                });
+                                kind_error = true;
+                            }
+                            (GenericParam::Type { .. }, ty) => {
+                                resolved.push(GenericArg::Type(self.resolve_type_full(ty, ctx)));
+                            }
+                            (GenericParam::Const { .. }, Type::ConstArg(expr)) => {
+                                match const_int_value(expr) {
+                                    Some(n) => resolved.push(GenericArg::Const(n)),
+                                    None => {
+                                        self.errors.push(TypeError {
+                                            message: format!("`{}`: const-generic argument must be an integer literal", name),
+                                            context: ctx.into(),
+                                        });
+                                        kind_error = true;
+                                    }
+                                }
+                            }
+                            (GenericParam::Const { .. }, _) => {
+                                self.errors.push(TypeError {
+                                    message: format!("`{}`: expected a const value argument, found a type", name),
+                                    context: ctx.into(),
+                                });
+                                kind_error = true;
+                            }
+                        }
+                    }
+                    if kind_error {
+                        return Ty::Named(name.clone());
+                    }
+                    return Ty::Generic(name.clone(), resolved);
+                }
+            }
+        }
+        resolve_type(t)
+    }
+
     pub fn check_program(&mut self, program: &Program) {
         // Pass 1: register all struct/enum/trait data shapes and fn
         // signatures first, so forward references (a function defined
@@ -266,32 +525,52 @@ impl TypeChecker {
     fn register_item(&mut self, item: &Item) {
         match &item.kind {
             ItemKind::Struct(s) => {
+                let generics = s.generics.0.clone();
+                let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
+                    GenericParam::Type { name, .. } => Some(name.clone()),
+                    GenericParam::Const { .. } => None,
+                }).collect();
                 let (fields, is_tuple) = match &s.body {
                     StructBody::Named(fs) => (
-                        fs.iter().map(|f| (f.name.clone(), resolve_type(&f.ty))).collect(),
+                        fs.iter().map(|f| (f.name.clone(), mark_type_params(resolve_type(&f.ty), &type_param_names))).collect(),
                         false,
                     ),
                     StructBody::Tuple(ts) => (
-                        ts.iter().enumerate().map(|(i, t)| (i.to_string(), resolve_type(t))).collect(),
+                        ts.iter().enumerate().map(|(i, t)| (i.to_string(), mark_type_params(resolve_type(t), &type_param_names))).collect(),
                         true,
                     ),
                     StructBody::Unit => (Vec::new(), false),
                 };
-                self.structs.insert(s.name.clone(), StructShape { fields, is_tuple });
+                self.structs.insert(s.name.clone(), StructShape { fields, is_tuple, generics });
             }
             ItemKind::Enum(e) => {
+                let generics = e.generics.0.clone();
+                let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
+                    GenericParam::Type { name, .. } => Some(name.clone()),
+                    GenericParam::Const { .. } => None,
+                }).collect();
                 let variants = e.variants.iter()
-                    .map(|v| (v.name.clone(), v.data.iter().map(resolve_type).collect()))
+                    .map(|v| (v.name.clone(), v.data.iter().map(|t| mark_type_params(resolve_type(t), &type_param_names)).collect()))
                     .collect();
-                self.enums.insert(e.name.clone(), EnumShape { variants });
+                self.enums.insert(e.name.clone(), EnumShape { variants, generics });
             }
             ItemKind::Fn(f) => {
+                let generics = f.generics.0.clone();
+                let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
+                    GenericParam::Type { name, .. } => Some(name.clone()),
+                    GenericParam::Const { .. } => None,
+                }).collect();
                 let params = f.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| resolve_type(&p.ty))
+                    .map(|p| mark_type_params(resolve_type(&p.ty), &type_param_names))
                     .collect();
-                let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
-                self.functions.insert(f.name.clone(), (params, ret));
+                let ret = f.return_type.as_ref()
+                    .map(|t| mark_type_params(resolve_type(t), &type_param_names))
+                    .unwrap_or(Ty::Unit);
+                let bounds = f.where_clause.0.iter()
+                    .map(|wb| (wb.name.clone(), wb.bounds.iter().map(|tb| tb.name.clone()).collect()))
+                    .collect();
+                self.functions.insert(f.name.clone(), FunctionShape { params, ret, generics, bounds });
             }
             ItemKind::Trait(t) => {
                 let methods = t.items.iter().filter_map(|ti| match ti {
@@ -442,7 +721,7 @@ impl TypeChecker {
     fn check_stmt(&mut self, stmt: &Stmt, env: &mut Env, ctx: &str) {
         match stmt {
             Stmt::Let { pattern, ty, value, .. } => {
-                let expected = ty.as_ref().map(resolve_type);
+                let expected = ty.as_ref().map(|t| self.resolve_type_full(t, ctx));
                 let inferred = match value {
                     Some(v) => Some(self.check_expr(v, expected.as_ref(), env, ctx)),
                     None => None,
@@ -648,7 +927,7 @@ impl TypeChecker {
                 Ty::Tuple(tys)
             }
 
-            Expr::StructLit { name, fields, spread } => self.check_struct_lit(name, fields, spread.is_some(), env, ctx),
+            Expr::StructLit { name, fields, spread } => self.check_struct_lit(name, fields, spread.is_some(), expected, env, ctx),
 
             Expr::If(if_expr) => self.check_if(if_expr, expected, env, ctx),
 
@@ -700,7 +979,7 @@ impl TypeChecker {
                 // only that `as` itself always type-checks to its
                 // target type regardless of the source expression's type.
                 self.check_expr(inner, None, env, ctx);
-                resolve_type(ty)
+                self.resolve_type_full(ty, ctx)
             }
 
             Expr::Range { lo, hi, .. } => {
@@ -733,12 +1012,54 @@ impl TypeChecker {
 
             Expr::Call { callee, args } => {
                 if let Expr::Ident(name) = callee.as_ref() {
-                    if let Some((params, ret)) = self.functions.get(name).cloned() {
-                        for (i, arg) in args.iter().enumerate() {
-                            let exp = params.get(i);
-                            self.check_expr(&arg.value, exp, env, ctx);
+                    if let Some(shape) = self.functions.get(name).cloned() {
+                        if shape.generics.is_empty() {
+                            for (i, arg) in args.iter().enumerate() {
+                                let exp = shape.params.get(i);
+                                self.check_expr(&arg.value, exp, env, ctx);
+                            }
+                            return shape.ret;
                         }
-                        return ret;
+                        // Generic function call (Document 8 §2): infer
+                        // each type parameter from the actual argument
+                        // types via structural unification against the
+                        // (TypeParam-marked) declared parameter types,
+                        // then verify every `where`-clause bound
+                        // (§3's `T: A + B`) against the *concrete*
+                        // inferred type using Phase 4's impl registry.
+                        // Substituting a concrete `Ty` here (never a
+                        // `Ty::DynTrait`) is what makes this resolve
+                        // through static/monomorphized dispatch, not
+                        // the `dyn` vtable machinery Phase 4 built for
+                        // the unrelated `dyn Trait` case — this phase's
+                        // "zero dyn dispatch for generic-only code"
+                        // exit criterion holds by construction, not by
+                        // a separate runtime check (there is no runtime
+                        // yet); see PROGRESS.md's verification section
+                        // for the concrete test that confirms it.
+                        let arg_tys: Vec<Ty> = args.iter()
+                            .map(|a| self.check_expr(&a.value, None, env, ctx))
+                            .collect();
+                        let mut subst: HashMap<String, Ty> = HashMap::new();
+                        for (p, a) in shape.params.iter().zip(arg_tys.iter()) {
+                            unify_infer(p, a, &mut subst);
+                        }
+                        for (param_name, trait_names) in &shape.bounds {
+                            if let Some(concrete) = subst.get(param_name) {
+                                for tn in trait_names {
+                                    if !self.satisfies_bound(concrete, tn) {
+                                        self.errors.push(TypeError {
+                                            message: format!(
+                                                "type `{}` does not satisfy bound `{}` required for generic parameter `{}` of `{}` (Document 8 §2/§3)",
+                                                concrete, tn, param_name, name
+                                            ),
+                                            context: ctx.into(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        return substitute_type_params(&shape.ret, &subst);
                     }
                 }
                 if let Expr::Path(path) = callee.as_ref() {
@@ -815,6 +1136,7 @@ impl TypeChecker {
                         // unknown base types.
                         let known_base = match &recv_ty {
                             Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n),
+                            Ty::Generic(n, _) => self.structs.contains_key(n) || self.enums.contains_key(n),
                             Ty::DynTrait(n) => self.traits.contains_key(n),
                             _ => false,
                         };
@@ -938,10 +1260,40 @@ impl TypeChecker {
 
     fn check_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, env: &mut Env, ctx: &str) -> Ty {
         let lt = self.check_expr(lhs, None, env, ctx);
-        let rt = self.check_expr(rhs, Some(&lt), env, ctx);
+        // For most arithmetic, passing `Some(&lt)` as rhs's expected
+        // type lets a literal rhs (`x + 5`) adopt lt's type (rule 3).
+        // But for generic-struct operands, a differently-shaped-but-
+        // still-compatible rhs (`Matrix<f64,3,5>` against a
+        // `Matrix<f64,2,3>` lhs, Document 8 §9's own valid case) is
+        // exactly what needs to be *accepted* here -- passing `Some(&lt)`
+        // would make the outer `check_expr` wrapper's blanket
+        // compatibility check reject it before this function's own
+        // dimension-aware logic below ever runs. So: only use `lt` as
+        // an rhs hint when it isn't a generic-struct type.
+        let rhs_hint = if matches!(lt, Ty::Generic(..)) { None } else { Some(&lt) };
+        let rt = self.check_expr(rhs, rhs_hint, env, ctx);
         use BinaryOp::*;
         match op {
-            Add | Sub | Mul | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr => {
+            Mul => {
+                // Document 8 §8/§9: const-generic matrix multiplication
+                // dimension check, when both operands are the same
+                // generic struct. See `check_matrix_multiply`'s doc
+                // comment for the scope/grounding of this special case.
+                if let (Ty::Generic(ln, largs), Ty::Generic(rn, rargs)) = (&lt, &rt) {
+                    if ln == rn {
+                        let (ln, largs, rargs) = (ln.clone(), largs.clone(), rargs.clone());
+                        return self.check_matrix_multiply(&ln, &largs, &rargs, ctx);
+                    }
+                }
+                if lt != rt {
+                    self.errors.push(TypeError {
+                        message: format!("`Mul`: mismatched types `{}` and `{}` (Document 5 §6: no implicit coercion, use `as`)", lt, rt),
+                        context: ctx.into(),
+                    });
+                }
+                lt
+            }
+            Add | Sub | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr => {
                 if lt != rt {
                     self.errors.push(TypeError {
                         message: format!("`{:?}`: mismatched types `{}` and `{}` (Document 5 §6: no implicit coercion, use `as`)", op, lt, rt),
@@ -975,6 +1327,70 @@ impl TypeChecker {
                 }
             }
         }
+    }
+
+    /// Document 8 §8/§9's const-generic matrix-multiplication dimension
+    /// check: `Matrix<f64,2,3> * Matrix<f64,4,5>` must be rejected
+    /// (3≠4), while `Matrix<f64,2,3> * Matrix<f64,3,5>` must be
+    /// accepted and produce `Matrix<f64,2,5>`.
+    ///
+    /// FLAGGED, SCOPED INTERPRETATION: Mountain's spec doesn't define
+    /// any general operator-overloading mechanism anywhere in Documents
+    /// 1–24 (no trait-based `Mul` dispatch is described), so this is
+    /// implemented as a direct, special-cased rule for `*` between two
+    /// instances of the *same* generic struct carrying exactly two
+    /// const-generic arguments — matching Document 8 §8's own
+    /// `Matrix<T, const ROWS: usize, const COLS: usize>` declaration
+    /// shape exactly, with the two const positions read positionally
+    /// (first = rows-analog, second = cols-analog) per that
+    /// declaration's literal parameter order. This is grounded directly
+    /// in Document 8's own concrete struct declaration and §9's
+    /// verification trace, not invented from nothing — but it is a
+    /// narrow, name-and-shape-triggered rule, not a general arithmetic-
+    /// on-generics mechanism. Needs explicit sign-off, same as every
+    /// other flagged deviation.
+    fn check_matrix_multiply(&mut self, name: &str, largs: &[GenericArg], rargs: &[GenericArg], ctx: &str) -> Ty {
+        let const_values = |args: &[GenericArg]| -> Vec<i64> {
+            args.iter().filter_map(|a| match a { GenericArg::Const(n) => Some(*n), _ => None }).collect()
+        };
+        let lconsts = const_values(largs);
+        let rconsts = const_values(rargs);
+        if lconsts.len() == 2 && rconsts.len() == 2 {
+            let (l_rows, l_cols) = (lconsts[0], lconsts[1]);
+            let (r_rows, r_cols) = (rconsts[0], rconsts[1]);
+            if l_cols != r_rows {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "cannot multiply `{}` with column count {} by `{}` with row count {}: dimension mismatch (Document 8 §9)",
+                        name, l_cols, name, r_rows
+                    ),
+                    context: ctx.into(),
+                });
+                return Ty::Generic(name.to_string(), largs.to_vec());
+            }
+            // Result shape is (l_rows, r_cols); rewrite the two const
+            // positions in a copy of `largs` (which also carries the
+            // element type argument in whichever position it declared),
+            // preserving every non-const argument's position untouched.
+            let mut result_args = largs.to_vec();
+            let mut const_idx = 0;
+            for a in result_args.iter_mut() {
+                if let GenericArg::Const(n) = a {
+                    *n = if const_idx == 0 { l_rows } else { r_cols };
+                    const_idx += 1;
+                }
+            }
+            return Ty::Generic(name.to_string(), result_args);
+        }
+        // Same struct name, but not this 2-const-param shape -- fall
+        // back to ordinary strict equality of the full argument list.
+        if largs != rargs {
+            self.errors.push(TypeError {
+                message: format!("`*`: mismatched generic arguments for `{}`", name),
+                context: ctx.into(),
+            });
+        }
+        Ty::Generic(name.to_string(), largs.to_vec())
     }
 
     fn check_compatible(&mut self, actual: &Ty, expected: Option<&Ty>, ctx: &str) {
@@ -1069,7 +1485,7 @@ impl TypeChecker {
         common.unwrap_or(Ty::Unit)
     }
 
-    fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], has_spread: bool, env: &mut Env, ctx: &str) -> Ty {
+    fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], has_spread: bool, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
         let Some(shape) = self.structs.get(name).cloned() else {
             self.errors.push(TypeError {
                 message: format!("undefined struct `{}`", name),
@@ -1077,7 +1493,37 @@ impl TypeChecker {
             });
             return Ty::Named(name.to_string());
         };
-        let declared: HashMap<&str, &Ty> = shape.fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+
+        // Document 5 rule 1 (explicit annotation wins), applied to
+        // generic struct literals: if `expected` names this same
+        // generic struct with concrete args (e.g. `let p: Pair<i32,
+        // String> = Pair { first: 1, second: "x" };`), substitute those
+        // concrete types for the struct's own `TypeParam` placeholders
+        // before checking each field, and use `expected`'s args as the
+        // literal's own resolved type. Without a matching annotation,
+        // Phase 5 doesn't infer generic args from field values alone
+        // (that would need real unification across every field) —
+        // falls back to `Ty::Named(name)`, a known, flagged
+        // simplification rather than a silent wrong answer.
+        let (subst, result_ty) = if !shape.generics.is_empty() {
+            match expected {
+                Some(Ty::Generic(en, eargs)) if en == name && eargs.len() == shape.generics.len() => {
+                    let subst: HashMap<String, Ty> = shape.generics.iter().zip(eargs.iter())
+                        .filter_map(|(param, arg)| match (param, arg) {
+                            (GenericParam::Type { name, .. }, GenericArg::Type(t)) => Some((name.clone(), t.clone())),
+                            _ => None,
+                        }).collect();
+                    (subst, Ty::Generic(name.to_string(), eargs.clone()))
+                }
+                _ => (HashMap::new(), Ty::Named(name.to_string())),
+            }
+        } else {
+            (HashMap::new(), Ty::Named(name.to_string()))
+        };
+
+        let declared: HashMap<String, Ty> = shape.fields.iter()
+            .map(|(n, t)| (n.clone(), substitute_type_params(t, &subst)))
+            .collect();
         let mut provided = std::collections::HashSet::new();
         for (fname, fval) in fields {
             provided.insert(fname.as_str());
@@ -1103,7 +1549,7 @@ impl TypeChecker {
                 }
             }
         }
-        Ty::Named(name.to_string())
+        result_ty
     }
 
     /// Resolves a method call against a receiver's static type. Two
@@ -1122,9 +1568,24 @@ impl TypeChecker {
     ///   "resolved via vtable lookup at runtime"); statically, all that
     ///   can be verified is that the trait itself declares a method with
     ///   this name and signature.
+    /// Checks whether a concrete type satisfies a named trait bound
+    /// (Document 8 §2/§3), by looking up whether any registered `impl`
+    /// of that trait exists for the type's canonical name — the same
+    /// registry (`impls_by_type`) Phase 4 built, reused here rather
+    /// than duplicated. Works for both user-declared structs/enums and
+    /// primitives (`impl Comparable for i32` registers under the key
+    /// `"i32"`, matching how `parse_type_ref` already lexes primitive
+    /// type names as plain identifiers — see Phase 1's design note).
+    fn satisfies_bound(&self, ty: &Ty, trait_name: &str) -> bool {
+        let Some(key) = ty_lookup_name(ty) else { return false };
+        self.impls_by_type.get(&key)
+            .map(|impls| impls.iter().any(|r| r.trait_name.as_deref() == Some(trait_name)))
+            .unwrap_or(false)
+    }
+
     fn resolve_method(&self, recv_ty: &Ty, name: &str) -> Option<FnSig> {
         match recv_ty {
-            Ty::Named(type_name) => {
+            Ty::Named(type_name) | Ty::Generic(type_name, _) => {
                 let impls = self.impls_by_type.get(type_name)?;
                 // Inherent methods (`impl Type { ... }`, no trait) take
                 // precedence over trait-provided methods of the same
@@ -1160,10 +1621,28 @@ impl TypeChecker {
                 return Ty::Unit;
             }
         }
+        if let Ty::Generic(n, args) = base {
+            if let Some(shape) = self.structs.get(n).cloned() {
+                let subst: HashMap<String, Ty> = shape.generics.iter().zip(args.iter())
+                    .filter_map(|(param, arg)| match (param, arg) {
+                        (GenericParam::Type { name, .. }, GenericArg::Type(t)) => Some((name.clone(), t.clone())),
+                        _ => None,
+                    }).collect();
+                for (fname, fty) in &shape.fields {
+                    if fname == field {
+                        return substitute_type_params(fty, &subst);
+                    }
+                }
+                self.errors.push(TypeError {
+                    message: format!("struct `{}` has no field `{}`", n, field),
+                    context: ctx.into(),
+                });
+                return Ty::Unit;
+            }
+        }
         // Base type not a known struct (could be a module path result,
-        // an unresolved generic, etc. -- full resolution is Phase 4/5
-        // territory) -- don't fabricate an error for cases outside this
-        // phase's scope.
+        // a foreign/unregistered generic, etc.) -- don't fabricate an
+        // error for cases outside this phase's scope.
         Ty::Unit
     }
 }
