@@ -735,7 +735,21 @@ unit coverage automatically.
 
 ## Phase 4 — Traits & `impl`
 
-**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+**Status: 🟢 Complete — confirmed via actual downloaded CI log**
+
+Final CI run confirmed from the raw log: 110 tests total across all
+targets (57 lib + 6 integration + 6 `parser_doc24` + 15 `traits_impls`
++ 26 `types_doc5`), 0 failures, 0 warnings in the build step.
+
+**Correction on the record**: my Phase 4 handoff report claimed "17 new
+tests in `tests/traits_impls.rs`" — the actual, counted figure is 15
+(`grep -c "#\[test\]" tests/traits_impls.rs` → 15), matching the real CI
+log's "running 15 tests" for that target. All 15 genuinely passed, so
+this was a reporting-accuracy issue, not a coverage/correctness one —
+but the number itself was wrong, from recollection rather than an actual
+count at the time of reporting. Going forward, every test-count (or
+other numeric) claim in this file and in chat reports is taken from a
+fresh `grep -c` (or equivalent) at the moment of reporting, not memory.
 
 ### Scope (per Document 25 §2.3)
 Full trait declarations (Document 7 §4) including default method bodies,
@@ -876,7 +890,209 @@ permissive behavior before finalizing this fix.
 ### `.github/workflows/ci.yml`
 No changes needed — picks up `tests/traits_impls.rs` automatically.
 
-## Phases 5–25
+## Phase 5 — Generics
+
+**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+
+### Scope (per Document 25 §2.3)
+Monomorphization engine, `where`-clause trait bounds (single and
+multiple via `+`), associated types (Document 8 §5), and const generics
+including the tensor-shape-suffix grammar formalized in Document 23
+during Phase 2.
+
+### Genuine tooling event this phase — flagged per standing instruction 6
+Mid-phase, this sandbox's home directory was wiped (not something I
+did — the container reset, `/home/claude` came back empty). Lost a small
+amount of just-started, unpackaged work (the initial `Ty::Generic`/
+`Ty::TypeParam`/`GenericArg` additions and `StructShape`/`EnumShape`
+generics fields). Recovered by unzipping the last *presented*,
+confirmed-good deliverable (`mountain-phase4.zip`, still present in
+`/mnt/user-data/outputs/`) and redoing the lost edits from there — this
+is exactly why every phase's deliverable gets fully packaged and handed
+off rather than left only in-sandbox. No completed/confirmed work was
+lost, only a few minutes of the current phase's own in-progress edits.
+
+### What was built
+- `Ty::Generic(String, Vec<GenericArg>)` — instantiated generic types
+  (`Matrix<f64,2,3>`), `Ty::TypeParam(String)` — unresolved references
+  to an enclosing declaration's own generic parameter (e.g. `A`/`B`
+  inside `struct Pair<A,B>`'s field types, before instantiation),
+  `GenericArg::{Type,Const}` — a single generic argument.
+- `StructShape`/`EnumShape` extended with their own `generics: Vec<GenericParam>`;
+  field/variant types now pass through `mark_type_params` at
+  registration so a generic struct's own type parameters are correctly
+  distinguished from references to other concrete structs of the same name.
+- `FunctionShape` (replacing Phase 3/4's flat `(Vec<Ty>, Ty)` tuple):
+  adds `generics` and flattened `where`-clause `bounds`.
+- `TypeChecker::resolve_type_full` — context-aware type resolution for
+  *expression*-position type annotations (`let`/cast targets), where
+  Document 8 §8's `Matrix<f64,2,3>` needs real arg-count and arg-*kind*
+  validation against the struct's declared generic parameters. Plain
+  `resolve_type` (unchanged, context-free) still handles declaration-time
+  struct-field/fn-param registration — see the scope note below.
+- `unify_infer` — structural type-parameter inference for generic
+  function calls (Document 8 §2's `largest(nums)` inferring `T = i32`
+  from `nums: [i32]` against the declared `list: [T]`).
+- `satisfies_bound`/`ty_lookup_name` — where-clause bound checking
+  against Phase 4's existing `impls_by_type` registry (no duplicate
+  registry built).
+- `check_matrix_multiply` — Document 8 §8/§9's dimension check (see the
+  flagged design decision below).
+- `substitute_type_params` — resolves a generic struct's field types (or
+  a generic function's return type) against a concrete instantiation's
+  arguments; used by struct-literal checking, field access, and generic
+  call return-type resolution.
+- `tests/generics.rs` — 12 tests: the core exit-criteria Matrix
+  dimension-mismatch case plus its accepted counterpart (with the
+  *result shape* verified correct, not just "no error"), a wrong-
+  result-shape-annotation negative case, generic-argument count/kind
+  mismatches, generic struct field type-checking (including field
+  access through substitution), single and multiple (`+`) where-clause
+  bounds (both satisfied and unsatisfied), and the static-vs-`dyn`
+  resolution proof.
+
+### Design decisions (flagged, not silently assumed)
+
+**Matrix multiplication is a narrow, name-and-shape-triggered special
+case, not a general operator-overloading mechanism.** Mountain's spec
+doesn't define trait-based operator overloading anywhere in Documents
+1–24 — Document 8 §9 is a *traced verification example*, not a runnable
+syntax specification for how `*` dispatches. `check_matrix_multiply`
+fires specifically for `*` between two instances of the *same* generic
+struct carrying exactly two const-generic arguments (matching Document 8
+§8's own `Matrix<T, const ROWS, const COLS>` shape exactly), reading the
+two const positions positionally (first = rows-analog, second =
+cols-analog) per that declaration's literal parameter order. Grounded
+directly in Document 8's own concrete example, not invented from
+nothing — but a real scope decision, flagged for sign-off.
+
+**Bidirectional/unification hybrid, not full generalized inference.**
+Consistent with Phase 3's earlier flagged choice (bidirectional checker,
+not full HM), generic-parameter inference here (`unify_infer`) is a
+targeted structural walk handling exactly the shapes Document 8's own
+examples use (bare type param, one level of array/ref/tuple nesting) —
+not a general constraint-solving unifier. An unresolved type parameter
+is left unbound rather than reported as an ambiguity error; none of
+Document 8's examples hit this case, so it isn't exercised, but it's a
+real, flagged gap versus a fully general implementation.
+
+**`resolve_type_full` is scoped to expression-annotation sites, not
+everywhere.** Function *parameter* type registration (`fn foo(m:
+Matrix<f64,2,3>)`) and struct *field* type registration still use the
+plain, context-free `resolve_type` (unchanged from Phase 3), meaning a
+generic-struct-typed function parameter's arguments aren't validated for
+count/kind at registration time — only `let`-binding and cast-target
+annotations get full validation. Chosen because Document 8 §9's concrete
+exit-criteria example is phrased as a direct expression
+(`Matrix<f64,2,3> * Matrix<f64,4,5>`), which the `let`-binding path
+covers completely; extending full validation to every type-annotation
+position everywhere was judged to be more scope than the time budget for
+this phase could verify carefully. Flagged as a real, known boundary,
+not silently claimed as complete coverage.
+
+### A real bug found and fixed during this phase's own verification (not just claimed)
+Before writing the Matrix tests, traced the existing `check_binary`
+structure and found it would have passed `Some(&lt)` as the rhs's
+expected type unconditionally — which works fine for ordinary numeric
+literal-adoption (`x + 5`), but for two *different* `Ty::Generic`
+operands (`Matrix<f64,2,3> * Matrix<f64,3,5>`, a **valid** multiplication
+per Document 8 §9), this would have made the *outer* `check_expr`
+wrapper's blanket compatibility check reject the rhs as a plain type
+mismatch — before `check_binary`'s own dimension-aware logic ever ran.
+That would have made the checker reject every *valid* differently-shaped
+matrix multiplication, not just the genuinely invalid ones. Fixed by
+only using `lt` as an rhs hint when `lt` isn't a generic-struct type,
+letting `check_matrix_multiply`'s own logic — not blind equality — decide
+compatibility for that case. Caught by hand-tracing before writing any
+test that could have hidden it by coincidence.
+
+### Second real gap found via the standing dead-field sweep
+Extended the write-then-grep-`.field`-occurrences sweep (the Phase 3/4
+precedent) to every `pub struct` declared in `types.rs` itself this
+time, not just the newly-added ones — and found `StructShape.is_tuple`
+has **zero** read occurrences anywhere, and has had none since Phase 3
+(this is a pre-existing gap that slipped past this exact check in both
+prior phases). Traced *why*: tuple-struct positional field access
+(`origin.0`, Document 7 §2.4) would require the parser to accept a
+numeric-literal token immediately after `.` in postfix position — but
+the lexer tokenizes `0` after a dot as an `Int` token, not an
+identifier, and `parser.rs`'s postfix-dot handling calls `expect_word()`
+(identifier-or-keyword only), which would reject it. So tuple-struct
+field access doesn't parse at all yet, which is why `is_tuple` has never
+had a consumer. This is a Phase-2-shaped parser gap, not something to
+patch mid-Phase-5 without risking an under-verified rushed change — left
+unfixed, `is_tuple` left in place (removing it would lose the data
+future work needs once the parser gap is closed), and flagged explicitly
+here rather than silently carried forward unmentioned a third time.
+
+### Systematic verification performed (same discipline as Phases 1–4)
+- Delimiter-balance check after every edit batch — clean throughout.
+- AST enum-variant cross-reference script, re-run after all edits — clean.
+- **Manual struct-variant field verification** (the Phase 4 lesson,
+  applied without relying on the script this time): every
+  `GenericParam::Type{..}`/`GenericParam::Const{..}` destructuring in
+  `types.rs` checked directly against `ast.rs`'s confirmed real
+  declaration (`Type{name,bounds}`, `Const{name,ty}`) via grep, not the
+  automated script (which still can't see enum struct-variants).
+- Glob-import audit: no new glob imports this phase; the two present
+  are the same ones already proven safe in Phases 2–4.
+- **Comprehensive dead-field sweep across every `pub struct` in
+  `types.rs`** (not just the phase's new additions) — this is what
+  caught `StructShape.is_tuple` above, and confirmed every other field
+  (all of `FunctionShape`, `StructShape.generics`, `EnumShape.generics`,
+  etc.) has real, verified read-sites.
+- Hand-traced the full Matrix dimension-check pipeline token-by-token
+  for both the rejected case (2×3 · 4×5) and the accepted case (2×3 ·
+  3×5, confirming the *result type* is genuinely `Matrix<f64,2,5>`, not
+  just "no error raised") against the actual current code before
+  trusting either test.
+
+### Known simplifications (flagged, not silently claimed as complete)
+- **Associated types are registered structurally but not semantically
+  checked.** `TraitItem::AssocType`/`ImplItem::AssocType` parse and
+  don't cause errors, but there's no completeness check (a trait
+  declaring `type Item;` doesn't require an implementing `impl` to
+  provide `type Item = ...;`) and no `Self::Item`-style resolution.
+  Document 8 §5's own example (`Container`/`Stack<i32>`) is the concrete
+  grounding for what a fuller implementation would need to cover; not
+  attempted this phase given the scope already covered.
+- **Generic function *bodies* aren't meaningfully re-checked per call
+  site** — `check_fn` binds a generic function's own parameters via
+  plain `resolve_type` (giving `Ty::Named("T")` for a type parameter
+  named `T`, not `Ty::TypeParam("T")`), so expressions inside a generic
+  function's body that reference its own type parameters don't resolve
+  meaningfully during body-checking. This is a safe failure mode (no
+  method/field lookup on a type parameter produces a false accept — it
+  just silently doesn't validate, since `known_base` correctly reports
+  `false` for an unrecognized bare name like `"T"`), not a source of
+  incorrect acceptance — real monomorphized-body verification per
+  concrete instantiation is closer to Phase 10 (actual codegen) territory.
+- **`is_tuple` gap** — see the dedicated section above.
+- **Const-generic values are integer literals only** (`const_int_value`)
+  — no const-generic arithmetic expressions (`N + 1`), matching every
+  example in Documents 1–24, none of which show anything more complex.
+
+### Exit criteria (Document 25 §2.3) — self-assessment
+> "`Matrix<f64,2,3> * Matrix<f64,4,5>` dimension mismatch correctly
+> caught as a compile-time error, not a runtime error; monomorphized
+> output verified to contain zero `dyn`-style dispatch for generic-only code"
+
+- Matrix dimension mismatch: rejected with a dimension-specific
+  diagnostic; the valid, differently-shaped counterpart is correctly
+  *accepted* with the *correct* result shape verified by a dedicated
+  negative test (wrong-shape annotation on an otherwise-valid
+  multiplication is rejected). **Pending real `cargo test` confirmation.**
+- Zero-`dyn`-dispatch: demonstrated via `satisfies_bound`/`ty_lookup_name`
+  having no code path that could succeed for `Ty::DynTrait` — a generic
+  call's bound-check only passes when the substitution produced a
+  concrete, registry-lookupable type, which is direct, checkable
+  evidence the substitution never used the `dyn` machinery Phase 4 built.
+- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+
+### `.github/workflows/ci.yml`
+No changes needed — picks up `tests/generics.rs` automatically.
+
+## Phases 6–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
