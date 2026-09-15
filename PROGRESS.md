@@ -1165,7 +1165,233 @@ purely additive for a previously-unparseable construct, and the
 `types.rs` fixes are no-ops whenever no `Self` reference is actually
 present, which is true for all nine).
 
-## Phases 6–25
+## Phase 6 — Borrow Checker
+**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (this environment has no `cargo`/`rustc` — same constraint every phase has hit; see "How to verify" below)
+
+Per Document 25 §3 Rule 4 this is the single most foundational phase in
+the roadmap, so it got the most conservative possible treatment: read
+Document 6 in full plus Document 17 §4.4's Polonius/CFG guidance before
+writing any code, then built `src/borrow.rs` as a **standalone pass**
+(new `BorrowChecker`, run after — and independent of — `types.rs`'s
+`TypeChecker`, touching zero existing Phase 1–5 code except two
+one-line additions: `pub mod borrow;` in `lib.rs`, nothing else). This
+was a deliberate risk-reduction choice: the already-verified Phase 3–5
+`types.rs` internals are not exposed or modified, so there is no way
+for Phase 6 to have regressed anything that was previously green.
+
+### What it checks (Document 6)
+1. **Move semantics** (§2, §4.1): `let b = a;` and by-value
+   call-argument moves (`consume(alice)`), with use-after-move
+   correctly rejected.
+2. **Copy-type transitivity** (§4.2): a struct is Copy only if marked
+   `@copy` (see "Flagged decision" below) AND every field is itself
+   Copy, computed via fixed-point iteration so nested `@copy` structs
+   compose correctly and a `@copy` struct with a `String` field is
+   correctly rejected back down to non-Copy.
+3. **The aliasing rule** (§3.1): any number of active shared borrows,
+   or exactly one active mutable borrow, never both — checked
+   symmetrically (mut-while-shared, shared-while-mut, mut-while-mut).
+4. **Non-lexical borrow liveness** (§3.2) — see "The §3.1/§3.2 tension"
+   below; this was the trickiest part of the whole phase.
+5. **Escaping references** (§5.1): a `let` binding initialized from a
+   call to a function whose signature both takes and returns
+   reference-shaped values is tracked as borrowing from every
+   `borrow`-argument passed at that call site; using it after any one
+   of those sources has gone out of scope is rejected.
+
+### The §3.1/§3.2 tension — a real interpretive decision, flagged for sign-off
+Document 6 §3.1's own example creates `ref1`/`ref2` (immutable borrows
+of `counter`) and states the following `borrow mut counter` (`ref3`)
+must be **rejected** — but `ref1`/`ref2` are never read again anywhere
+in that example. Taken completely literally, real-world NLL (and real
+rustc) would actually **accept** this, since an unread borrow has a
+zero-length live range and is dead before `ref3` is ever created — this
+is the canonical example used to explain NLL. That would contradict
+Document 6's own stated outcome. §3.2 then shows the opposite pull:
+`ref1` *is* read once (`print(ref1)`), and that read — occurring before
+`ref2`'s mutable borrow, in the *same* block — must make the code
+**accepted**, i.e. borrows really do end at last-use, not block-end.
+
+Resolution implemented (see `borrow.rs`'s module doc, "NLL
+approximation" — full reasoning there): **a borrow is live from
+creation until its last actual textual read within its enclosing
+block; if it has no later read at all, it is conservatively treated as
+live through the end of the block** (rather than dead immediately).
+This is the only rule that reproduces *both* of Document 6's own
+stated outcomes exactly — verified by two dedicated tests
+(`doc6_s3_1_mutable_while_immutable_active_rejected` and
+`doc6_s3_2_nll_borrow_ends_at_last_use`) plus a third sanity check
+(`doc6_s3_2_nll_still_rejects_if_conflicting_borrow_precedes_last_use`,
+confirming a still-needed-later borrow correctly still blocks). It is
+conservative relative to true NLL (may reject some code real Rust would
+accept — e.g. a borrow that's *truly, permanently* unused) but never
+accepts a genuine aliasing violation, which is the direction that
+matters for soundness. **This is a real interpretive call on a genuine
+tension between two of the document's own examples, not an arbitrary
+implementation detail — flagged explicitly for your sign-off**, same as
+prior phases' grounded-but-not-explicitly-spelled-out decisions.
+
+### Flagged decision: `@copy` struct-marking syntax
+Documents 3/6 define what the `copy` keyword *means* but never show a
+concrete syntax for marking a *struct* as Copy (only primitives are
+shown as inherently Copy). Grounded in the existing, already-parsing
+`@attribute` mechanism (Document 23 §14's `attribute ::= "@" IDENT
+(...)?"`, which already prefixes any item generically) rather than
+inventing new syntax or touching the parser at all — `@copy` on a
+`struct` just works today with zero parser changes, verified by reading
+`parse_attrs`/`parse_item` directly. **Flagged for explicit sign-off**,
+same category as Phase 2's own flagged EBNF-gap decisions.
+
+### Known, explicitly-documented scope limits (not silently shipped)
+All spelled out in `borrow.rs`'s module doc in full, summarized here:
+- **Same-block-only NLL scan.** The last-use search only looks at the
+  *directly enclosing* block's own statements (recursing into
+  sub-expressions, but not treating a read inside a nested
+  block/closure/branch as shortening the *outer* block's liveness
+  computation). Safe direction (under-counts liveness → more
+  conservative, never less), just less precise than a full CFG walk.
+- **Branches (`if`/`match`/loop) are checked independently, not
+  merged.** A real violation *within* one branch is still caught, but
+  a branch's moves/borrows don't propagate to sibling branches or to
+  code after the construct (e.g. an unconditional move inside one `if`
+  arm, followed by unconditional reuse after the `if`, is NOT flagged).
+  None of Document 6 §8's five required cases involve branching, so
+  this doesn't affect the exit criteria, but it's a real gap beyond
+  them.
+- **Move-checking is precise only for the exact shapes Document 6 §2/§4
+  show**: bare `let b = a;` and by-value call arguments. A binding
+  initialized from any other expression this pass can't syntactically
+  classify (a function call's return value, a method call, a
+  binary/cast expression) is left move-*unchecked* rather than guessed
+  at — mirrors an existing, already-established precedent in
+  `types.rs` itself (`MethodCall`'s unknown-method case explicitly
+  "stays silent rather than fabricating a false error"). Concretely:
+  `let a = makeString(); let b = a; print(a);` is NOT caught unless
+  `makeString`'s return type is independently obvious to this pass. A
+  non-Copy variable used twice as different *field values* inside one
+  struct literal (`Line { a: p1, b: p1 }`) is similarly not flagged as
+  a double-move. Building full move-checking would mean duplicating (or
+  exposing) `types.rs`'s real inference engine — deliberately not done,
+  to avoid a second, potentially-divergent type system and to avoid
+  touching the verified Phase 3–5 code at all.
+- **Closures**: capture-mode inference is explicitly Phase 7 territory
+  (already flagged as such in `types.rs`'s own Phase 3/5 comments, and
+  Document 25 lists it under Phase 7). This pass still walks into
+  closure bodies to catch use-of-already-moved-outer-variable, but does
+  not push a fresh scope for closure parameters — a closure parameter
+  that happens to shadow an outer (moved) binding's name could
+  currently produce a false positive. Not exercised by any test written
+  this phase; flagged for Phase 7 to resolve properly alongside real
+  capture-mode analysis.
+- **Destructuring `let` patterns** (tuple/array/tuple-struct) aren't
+  tracked at all — same, already-established gap `types.rs` itself
+  documents for the identical case (a safe failure mode: no false
+  errors, just no protection for those bindings yet).
+
+### Self-verification performed (no compiler available)
+Given zero `cargo`/`rustc` access, verification was done entirely by
+hand, at two levels:
+1. **Every AST shape used was checked against the actual current
+   `ast.rs`**, not assumed from memory or from Document 23 — every
+   `Box<T>` vs. plain `T` distinction across all ~36 `Expr` variants,
+   `Stmt`'s 8 variants, `IfExpr`/`MatchExpr`/`MatchArm`/`LoopExpr`/
+   `ClosureExpr`/`ElseBranch`/`ClosureBody` was individually grepped
+   and cross-checked (e.g. `Stmt::Return(Option<Expr>)` is *unboxed*
+   while `Expr::Return(Option<Box<Expr>>)` is boxed — confirmed both
+   handled correctly in their respective call sites).
+2. **A real, caught bug found this way, before any test was written**:
+   the first draft ran the generic recursive expression-checker over a
+   `let ref1 = borrow counter;` initializer, which hit the
+   general-purpose `Expr::Borrow` handling (meant only as a fallback
+   for borrows in call-argument/other positions) and registered `ref1`
+   as an immediately-*expiring temporary* borrow instead of a real,
+   named, persistently-tracked one — silently making Document 6 §3.1's
+   required-rejection case incorrectly pass. Root-caused (not
+   patched at the symptom) by introducing one shared `declare_binding`
+   helper used by *both* `Stmt::Let` and `Expr::Assign` (the two call
+   sites with the same underlying shape), rather than a local patch to
+   one of them.
+3. **A Rust-borrow-checker risk in `borrow.rs`'s own code**, found by
+   inspection rather than compilation: `register_borrow` originally
+   held a `&mut PlaceBorrows` (from `.entry().or_default()`) across
+   calls to `self.err(...)` (which needs `&mut self`). Modern NLL very
+   likely accepts this (each conflicting branch returns immediately
+   after), but since this can't be compile-tested here, it was
+   restructured to read everything needed into owned locals *before*
+   any `self.err(...)` call — unambiguously correct under any borrow
+   checker, not a bet on NLL nuance. Same treatment applied to
+   `check_fn`'s construction of the per-function `FnChecker` (which
+   reborrows `self`): explicitly scoped with a `{ }` block so the
+   reborrow is lexically dropped before `self.errors.extend(...)` is
+   called, rather than relying on field-level NLL liveness across
+   `FnChecker`'s `checker` and `errors` fields.
+4. **Every one of the 17 tests in `tests/borrow_checks.rs` was hand-
+   traced statement-by-statement against the actual algorithm** (not
+   just "should work" reasoning) — including full state traces of
+   `place_borrows`/scope stacks through both the accepted and rejected
+   variants of the §3.1, §3.2, and §5.1 cases. All 17 traced to the
+   expected `assert_ok`/`assert_rejected` outcome.
+5. Dead-code sweep: removed a `ParamRefInfo`/`FnRefShape.params` field
+   that was constructed but never read (would have been a compiler
+   warning, breaking the project's 0-warnings standard) once it became
+   clear the escaping-reference heuristic only needs the callee's
+   return-type shape, not its declared parameter shapes.
+6. Brace/paren balance double-checked via script (both 0 delta) as a
+   final gross-error sanity check.
+
+### Document 6 §8's five required verification cases — mapped to tests
+| §8 case | Test(s) in `tests/borrow_checks.rs` |
+|---|---|
+| §3.1 aliasing rule (rejected) | `doc6_s3_1_mutable_while_immutable_active_rejected` + 2 supporting (`two_shared_borrows_alone_are_fine`, `two_mutable_borrows_rejected`) |
+| §3.2 NLL (accepted) | `doc6_s3_2_nll_borrow_ends_at_last_use` + 1 supporting sanity check |
+| §5.1 lifetimes/escaping ref (rejected) | `doc6_s5_1_escaping_reference_used_after_source_scope_ends_rejected` |
+| §5.1 in-scope use (accepted) | `doc6_s5_1_escaping_reference_used_while_source_still_in_scope_ok` |
+| §4.2 Copy-struct transitivity | `doc6_s4_2_copy_struct_with_string_field_does_not_bypass_move` + 2 supporting (all-Copy-fields case, nested-Copy-of-Copy case) |
+| §6 Rc/Arc never silently substituted | `doc6_s6_no_silent_rc_substitution_ordinary_move_still_rejected` |
+
+Plus 5 supporting tests for the underlying move/borrow mechanics those
+five cases depend on (§2's basic move, §4.1's call-argument move, §3's
+temporary-borrow-as-argument, primitive Copy types) — **17 tests
+total**, all hand-traced to their expected result. Real pass/fail
+counts are what CI reports, not what's written here (per standing
+instruction #2) — see "How to verify" below.
+
+### `.github/workflows/ci.yml`
+No changes needed — picks up `tests/borrow_checks.rs` automatically
+(same pattern as every prior phase).
+
+### How to verify (this environment has no cargo/rustc/network)
+Push this commit and check the Actions log for `mountain-lang` at the
+usual workflow. Expect: `cargo build --verbose` clean (0 warnings —
+watch specifically for any `unused` warning in `borrow.rs`, since that
+would mean one of the dead-code sweeps above missed something), then
+`cargo test --verbose` should show all pre-existing Phase 1–5 test
+files unchanged (regression check) plus a new `borrow_checks` test
+binary reporting **17/17 passed** if this hand-trace was correct. If
+any of the 17 fail, the most likely culprits per the above are the
+§3.1/§3.2 NLL-approximation rule (the trickiest logic in the file) or
+an AST field-shape mismatch this hand-verification missed despite the
+grep-based cross-checks.
+
+### Exit criteria (Document 25 §2.3) — self-assessment
+> "Every rejected-code example in Document 6 §8 is correctly rejected;
+> every accepted example is correctly accepted (including the NLL
+> example — borrows ending at last-use, not block-end)."
+
+- All five §8 cases implemented and hand-traced to the correct outcome
+  in both directions where the doc shows both. **Not yet independently
+  confirmed by a real `cargo test` run.** ⏳
+- Two decisions genuinely required interpretive judgment beyond what's
+  explicitly spelled out in the document (the §3.1/§3.2 NLL tension,
+  and the `@copy` struct-marking syntax) — both resolved with reasoning
+  grounded directly in the document's own text and existing project
+  precedent, both **explicitly flagged above for your sign-off** rather
+  than silently decided.
+- Known scope limits (branch-merging, closure capture interaction,
+  move-checking breadth) are real and stated plainly, not hidden —
+  none of them affect the five required cases.
+
+## Phases 7–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
