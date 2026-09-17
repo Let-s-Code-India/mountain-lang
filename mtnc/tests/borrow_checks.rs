@@ -40,22 +40,54 @@ fn assert_rejected(src: &str) {
 // Document 6 §8, case 1 (§3.1): the aliasing rule.
 // "ref1/ref2/ref3 mutable-borrow-while-immutable-active example ->
 // correctly rejected."
+//
+// Document 6 §3.1 was itself corrected after Phase 6's first review:
+// the original example had ref1/ref2 created but never read again
+// anywhere, which (under genuine strict NLL, which is what §3.2 and
+// Document 25's exit criteria both require) would actually be
+// ACCEPTED by real NLL semantics -- an unread borrow has a
+// zero-length live range. The doc's example now has `print(ref1)`
+// before ref3 and `print(ref2)` after it, making both borrows
+// genuinely live at ref3's creation point. This test mirrors the
+// corrected example exactly.
 // ============================================================
 
 #[test]
 fn doc6_s3_1_mutable_while_immutable_active_rejected() {
-    // Literal §3.1 example: ref1/ref2 are created and never read again
-    // anywhere -- per this pass's documented NLL approximation (see
-    // borrow.rs module doc), an unused borrow is conservatively still
-    // "live", so the following `borrow mut` must be rejected exactly
-    // as Document 6 states.
+    // Corrected §3.1 example: ref1 is read right before ref3 (still
+    // live), and ref2 is read AFTER ref3 -- `compute_last_use` finds
+    // that later read via a full forward scan of the block done once
+    // at ref2's declaration, so ref2 is correctly still considered
+    // live at ref3's creation point too, even though its only read is
+    // textually after ref3.
     assert_rejected(
         r#"
         fn main() {
             let mut counter = 0;
             let ref1 = borrow counter;
             let ref2 = borrow counter;
+            print(ref1);
             let ref3 = borrow mut counter;
+            print(ref2);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn doc6_s3_1_unread_borrow_does_not_block_later_mutable_borrow() {
+    // The direct converse of the case above, confirming genuine
+    // strict-NLL semantics rather than the old conservative
+    // "unread-lives-to-block-end" fallback this pass used before
+    // Document 6 §3.1 was corrected: a borrow that is truly never read
+    // again anywhere must NOT block a later conflicting borrow. Real
+    // rustc accepts exactly this shape.
+    assert_ok(
+        r#"
+        fn main() {
+            let mut counter = 0;
+            let ref1 = borrow counter;
+            let ref2 = borrow mut counter;
         }
         "#,
     );
@@ -63,9 +95,10 @@ fn doc6_s3_1_mutable_while_immutable_active_rejected() {
 
 #[test]
 fn doc6_s3_1_two_shared_borrows_alone_are_fine() {
-    // Same shape minus the conflicting mutable borrow -- two shared
-    // borrows of the same place at once are explicitly allowed by
-    // §3.1 ("multiple immutable borrows allowed").
+    // Two shared borrows of the same place at once are explicitly
+    // allowed by §3.1 ("multiple immutable borrows allowed") --
+    // unaffected by read/unread status either way, since two shared
+    // borrows never conflict with each other regardless.
     assert_ok(
         r#"
         fn main() {
@@ -80,13 +113,20 @@ fn doc6_s3_1_two_shared_borrows_alone_are_fine() {
 #[test]
 fn doc6_s3_1_two_mutable_borrows_rejected() {
     // The other half of "exactly one mutable borrow" -- two active
-    // mutable borrows of the same place must also be rejected.
+    // mutable borrows of the same place must also be rejected. `ref1`
+    // is read (via `print(ref1)`) AFTER `ref2`'s creation, so its live
+    // range genuinely extends across `ref2`'s creation point --
+    // exactly the same "later read still counts" shape as the
+    // corrected §3.1 example above (needed under strict NLL: without
+    // that later read, `ref1` would be truly unused and real NLL would
+    // accept two sequential, never-reused mutable borrows too).
     assert_rejected(
         r#"
         fn main() {
             let mut counter = 0;
             let ref1 = borrow mut counter;
             let ref2 = borrow mut counter;
+            print(ref1);
         }
         "#,
     );
