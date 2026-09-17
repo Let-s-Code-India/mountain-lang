@@ -1,7 +1,9 @@
-//! Borrow Checker — Phase 6 (Document 25 §2.3).
+//! Borrow Checker — Phase 6 (Document 25 §2.3), extended in Phase 7
+//! with closure capture-mode inference (Document 10 §4.3).
 //!
-//! Implements Document 6 (Ownership, Borrowing & Lifetimes) as a
-//! standalone semantic-analysis pass, run after (and independent of)
+//! Implements Document 6 (Ownership, Borrowing & Lifetimes) and, as of
+//! Phase 7, Document 10 §1–4 (function/closure ownership semantics) as
+//! a standalone semantic-analysis pass, run after (and independent of)
 //! `types::TypeChecker`. Per Document 25 §3 Rule 4 ("the borrow checker
 //! is foundational... and never bypassed"), this is scoped to be a
 //! real, sound implementation of the specific rules Document 6 states —
@@ -35,52 +37,75 @@
 //!    or exactly one active mutable (`borrow mut`) borrow — never both.
 //! 4. **Non-lexical borrow liveness** (Document 6 §3.2): a borrow's
 //!    live range ends at its last actual textual use within its
-//!    enclosing block, not at the block's closing brace — see "NLL
-//!    approximation" below for the precise, conservative rule used.
+//!    enclosing block, not at the block's closing brace — see "Strict
+//!    NLL, not a conservative approximation" below for the precise
+//!    rule used.
 //! 5. **Escaping references** (Document 6 §5.1): a `let` binding
 //!    initialized from a call to a function whose signature both takes
 //!    and returns reference (`&`/`Type::Ref`) values is tracked as
 //!    (conservatively) borrowing from every `borrow`-argument passed at
 //!    that call site; using that binding after any one of those source
 //!    places has gone out of scope is rejected.
+//! 6. **Closure capture-mode inference** (Document 10 §4.3, Phase 7): a
+//!    closure's free (outer-scope) variables are inferred as captured
+//!    by shared borrow (read-only body usage), mutable borrow (assigned
+//!    to anywhere in the body), or move (the `move` keyword, which
+//!    forces ownership transfer for every capture unconditionally).
+//!    Non-move captures reuse the exact same borrow-aliasing (§3.1/
+//!    §3.2) and escaping-reference (§5.1) machinery as a named `let r =
+//!    borrow x;` — a closure bound to a name is tracked as borrowing
+//!    from its captures for as long as *that name* is used, so using
+//!    the closure after a captured source has gone out of scope is
+//!    rejected by the same mechanism, not a closure-specific one
+//!    (Document 25 §2.3's Phase 7 exit criteria).
 //!
 //! ## Scope and soundness notes (read before extending this pass)
 //!
-//! - **NLL approximation.** A borrow's last-use is computed by scanning
-//!   only the *directly enclosing block's* statement list (not nested
-//!   blocks/branches) for a later textual read of its binding name. If
-//!   none is found (including the case where the binding is never read
-//!   at all), the borrow is conservatively treated as live through the
-//!   end of the enclosing block. This is the specific, deliberate
-//!   choice that reconciles Document 6 §3.1's own example (`ref1`/
-//!   `ref2` are created but never subsequently read anywhere, and the
-//!   doc states the following `borrow mut` must still be REJECTED —
-//!   i.e. an *unused* borrow is not treated as immediately dead) with
-//!   §3.2's example (`ref1` IS read once, via `print(ref1)`, and that
-//!   read is its last use, occurring before `ref2`'s mutable borrow —
-//!   the doc states this must be ACCEPTED). A rule of "dead immediately
-//!   if never read" — the more literal reading of real-world NLL, and
-//!   what rustc itself actually does — would accept §3.1's case,
-//!   contradicting the doc's own stated verification outcome; a rule of
-//!   "always live to block end regardless of reads" would reject §3.2's
-//!   case. The rule implemented here ("live until last actual read, or
-//!   block end if never read again") is the only one that reproduces
-//!   BOTH documented outcomes exactly, verified by direct test (see
-//!   `tests/borrow_checks.rs`). It is conservative relative to real
-//!   NLL (may reject some code real Rust would accept, e.g. a
-//!   genuinely-dead-and-truly-unused borrow) but never accepts a
-//!   genuinely live aliasing violation — sound in the direction that
-//!   matters. Flagged for explicit sign-off since it's a documented
-//!   interpretation of a real tension between two of Document 6's own
-//!   examples, not an arbitrary choice.
-//! - **Same-block scope only.** The last-use scan, and therefore all of
-//!   §3.1/§3.2's aliasing/NLL machinery, only considers reads occurring
-//!   as direct statements of the same block the borrow was declared in
-//!   (plus that block's tail expression). A read of a borrow-holding
-//!   binding from inside a *nested* block/if/match-arm/loop body is not
-//!   found by this scan, so such a binding conservatively defaults to
-//!   "live to end of enclosing block" — safe (never under-counts
-//!   liveness), just less precise than a full CFG walk would be.
+//! - **Strict NLL, not a conservative approximation.** A borrow's
+//!   last-use is computed by scanning the *directly enclosing block's*
+//!   statement list (including its tail expression, and recursing into
+//!   any nested blocks/branches those statements contain -- see the
+//!   next bullet) for the LATEST textual read of its binding name,
+//!   wherever in the block that read occurs -- before or after any
+//!   other point being checked against. If genuinely no read is found
+//!   anywhere in the block, the borrow's live range is just its own
+//!   creation point: it is already dead by the very next statement. This directly matches Document 6
+//!   §3.1's own corrected note: an update to that example clarified
+//!   that a never-read borrow must NOT be treated as blocking a later
+//!   conflicting borrow (real NLL, and real rustc, correctly accept
+//!   that case, since an unread borrow has a zero-length live range),
+//!   and reshaped the example so `ref1`/`ref2` both have genuine later
+//!   reads (`ref1` before `ref3`, `ref2` after it) that make the
+//!   rejection real under strict last-use semantics rather than
+//!   requiring a conservative "unread borrows live to block end"
+//!   fallback. An earlier revision of this pass used exactly that
+//!   conservative fallback specifically to reconcile what was, at the
+//!   time, a genuine tension between §3.1's and §3.2's stated outcomes
+//!   under the *original, since-corrected* wording of §3.1 -- once the
+//!   spec's own example was fixed, the conservative fallback was no
+//!   longer needed (or correct) and was removed; this pass now
+//!   implements the same strict, non-lexical last-use rule uniformly,
+//!   with no special-casing for the unread case. Verified against both
+//!   the §3.1 (rejected) and §3.2 (accepted) examples directly (see
+//!   `tests/borrow_checks.rs`), including a check that a genuinely
+//!   dead (truly never read) borrow does NOT block a later conflicting
+//!   one (`doc6_s3_1_unread_borrow_does_not_block_later_mutable_borrow`).
+//! - **Reads are found via full recursive descent, not a shallow
+//!   same-block scan.** `compute_last_use` scans the borrow's directly
+//!   enclosing block's own statement list, but each statement is
+//!   checked via `stmt_reads_ident`/`expr_reads_ident`, which recurse
+//!   arbitrarily deep into nested blocks, `if`/`match` arms, loop
+//!   bodies, and closure bodies wherever they appear as part of a
+//!   later statement -- so a read of a borrow-holding binding from
+//!   inside a nested construct (as long as it's still part of the same
+//!   enclosing block's statement tree, which is the only place it
+//!   could legally appear anyway, per ordinary lexical scoping) IS
+//!   found. The one deliberate exception is `spawn`/`select`/`query`
+//!   bodies, whose internal syntax isn't otherwise analyzed anywhere in
+//!   this pass (deferred to Phases 12/18/20) -- rather than risk a
+//!   missed read there under strict NLL (see `expr_reads_ident`'s own
+//!   doc comment), they're conservatively treated as "might read
+//!   anything".
 //! - **Branches are checked, not merged.** `if`/`match` arms and loop
 //!   bodies are each borrow-checked independently against a *snapshot*
 //!   of the state at entry, so a real violation *within* one branch is
@@ -125,10 +150,55 @@
 //!   through the move-*marking* path at all. A real gap, not a silent
 //!   wrong answer: it only means such a case is under-checked, never
 //!   that genuinely safe code gets rejected.
+//! - **Closure capture-mode inference stops short of Rust's real
+//!   Fn/FnMut/FnOnce trait inference for one specific, narrower case:**
+//!   a non-`move` closure whose body genuinely NEEDS ownership of
+//!   a captured non-Copy variable (e.g. passing it by value into
+//!   something that consumes it, more than once, or in a way real
+//!   Mountain semantics could only satisfy by moving) is still treated
+//!   as capturing it by borrow, since `move` wasn't written. A fully
+//!   faithful implementation would either infer `move` automatically
+//!   for such a capture or reject the closure; this pass does neither
+//!   — it silently accepts it as a borrow. (An earlier, broader version
+//!   of this gap — where the ordinary call-argument move-check
+//!   [Document 6 §4.1] would fire DURING a closure body's walk and
+//!   incorrectly mark an outer non-Copy variable as moved even for a
+//!   closure that only *reads* it, e.g. `|| print(someString)`, the
+//!   same shape as Document 10 §4.3's own `|| print(count)` example but
+//!   with a non-Copy type — was found and fixed at the root, in
+//!   `mark_moved` itself: see its doc comment. That was a real
+//!   false-positive risk on ordinary code, not just an edge case, so it
+//!   was fixed rather than merely documented. What remains here is
+//!   narrower: under-detection of a genuinely-needed move, which can
+//!   only cause this pass to accept something a fully faithful checker
+//!   might reject — never the reverse.) Not exercised by any of
+//!   Document 10 §4.3's own three examples, which either only read/
+//!   mutate Copy values or use explicit `move` for the one case that
+//!   needs ownership.
+//! - **A move is never checked against active borrows of the same
+//!   place** (found while tracing Phase 7's tests, but a pre-existing
+//!   Phase 6 gap, not something Phase 7 introduced -- Document 6 §8's
+//!   own required cases never exercise it either). Concretely:
+//!   `let r = borrow x; /* r still genuinely needed later */ let y =
+//!   x;` moves `x` out from under `r` without complaint, since
+//!   move-marking (`check_call_args`'s and `classify_initializer`'s
+//!   Ident arms) never consults `place_borrows` at all -- only
+//!   borrow-vs-borrow conflicts (§3.1) and borrow-vs-scope-end (§5.1)
+//!   are checked, not move-vs-active-borrow. A real gap in the
+//!   direction that matters (could accept something genuinely unsound
+//!   in principle), but wasn't introduced or worsened by Phase 7 and
+//!   isn't exercised by any test in this series; noted here rather than
+//!   left implicit now that it's been noticed, and left for a future
+//!   phase to close properly (likely needs `place_borrows` consulted
+//!   from the move-marking paths, symmetric to how `register_borrow`
+//!   already consults it from the borrow-creation side).
 //!
 //! None of the above scope limits affect Document 6 §8's five required
 //! verification cases — each is traced by a dedicated test in
 //! `tests/borrow_checks.rs` and passes exactly as the document states.
+//! Document 10 §4.3's three capture-mode examples and the Phase 7
+//! escaping-closure exit-criteria case are traced by dedicated tests in
+//! `tests/closures.rs`.
 
 use crate::ast::*;
 use std::collections::HashMap;
@@ -324,6 +394,7 @@ impl BorrowChecker {
                 checker: self,
                 scopes: Vec::new(),
                 place_borrows: HashMap::new(),
+                capture_stack: Vec::new(),
                 ctx: f.name.clone(),
                 errors: Vec::new(),
             };
@@ -394,18 +465,40 @@ struct Scope {
 /// `compute_last_use`, or set to the current statement's own index for
 /// a temporary borrow passed directly as a call argument (Document 6
 /// §3's `printName(borrow alice)` -- lives only for that one
-/// statement). See the module-level "NLL approximation" doc comment
-/// for the precise rule and why it's shaped this way.
+/// statement). See the module-level "Strict NLL, not a conservative
+/// approximation" doc comment for the precise rule and why it's shaped
+/// this way.
 #[derive(Debug, Default)]
 struct PlaceBorrows {
     shared: Vec<(String, usize)>,
     mutable: Option<(String, usize)>,
 }
 
+/// Tracks which OUTER-scope bindings a closure currently being walked
+/// reads or mutates, for Document 10 §4.3's capture-mode inference.
+/// `boundary_depth` is `self.scopes.len()` at the moment the closure's
+/// OWN scope (holding its params) was pushed -- any binding found at a
+/// scope index strictly less than this is genuinely "outer" (a real
+/// capture); anything at or above it belongs to the closure itself
+/// (its params, or its own `let` locals) and is not a capture. Several
+/// frames can be active at once for nested closures; `record_capture_if_outer`
+/// updates every frame for which a given binding is outer, so an
+/// outer-outer capture used only by an inner closure is still recorded
+/// against the enclosing closure(s) too (an approximation of true
+/// transitive capture semantics -- adequate for Document 10's own
+/// examples, none of which nest closures).
+struct CaptureFrame {
+    boundary_depth: usize,
+    /// name -> needs_mut (true if assigned to anywhere in the body,
+    /// via `=` or any compound-assignment operator).
+    captures: HashMap<String, bool>,
+}
+
 struct FnChecker<'a> {
     checker: &'a BorrowChecker,
     scopes: Vec<Scope>,
     place_borrows: HashMap<String, PlaceBorrows>,
+    capture_stack: Vec<CaptureFrame>,
     ctx: String,
     errors: Vec<BorrowError>,
 }
@@ -423,20 +516,77 @@ impl<'a> FnChecker<'a> {
         self.scopes.iter_mut().rev().find_map(|s| s.bindings.get_mut(name))
     }
 
+    /// Like `lookup`, but returns the scope-stack INDEX the binding
+    /// was found at (0 = outermost/function-params scope), needed to
+    /// tell whether a name resolves to something outside a closure
+    /// currently being walked (Phase 7 capture tracking).
+    fn lookup_scope_idx(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().enumerate().rev().find_map(|(i, s)| s.bindings.contains_key(name).then_some(i))
+    }
+
     fn is_in_scope(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.bindings.contains_key(name))
     }
 
     fn mark_moved(&mut self, name: &str) {
+        // Phase 7: while inside a closure body being walked for
+        // capture-mode analysis, suppress moving a binding that
+        // resolves OUTER to the innermost such closure. Deciding
+        // whether an outer capture actually gets moved is
+        // `apply_closure_captures`'s job, run once, authoritatively,
+        // after the whole body has been walked and the real capture
+        // mode (borrow vs move) is known -- not this ordinary
+        // call-argument/assignment move-logic, which has no idea it's
+        // currently inside a closure at all. Without this suppression,
+        // an entirely ordinary NON-move closure that only READS a
+        // non-Copy outer variable via a plain function call (e.g. `||
+        // print(someString)`, the exact same shape as Document 10
+        // §4.3's own `|| print(count)` example but with a non-Copy
+        // type) would have that call's bare-identifier-argument
+        // move-check (Document 6 §4.1) incorrectly move the variable
+        // out of the OUTER scope right then, even though the closure
+        // is only supposed to borrow it -- a real false-positive
+        // rejection of ordinary code, not just a narrow edge case,
+        // caught and fixed here before it shipped rather than left as
+        // a documented gap. A binding LOCAL to the closure itself
+        // (its own params, or its own further-nested locals) is
+        // unaffected and still moves normally.
+        if let Some(frame) = self.capture_stack.last() {
+            if let Some(idx) = self.lookup_scope_idx(name) {
+                if idx < frame.boundary_depth {
+                    return;
+                }
+            }
+        }
         if let Some(b) = self.lookup_mut(name) {
             b.moved = true;
         }
     }
 
-    /// Reading a binding by name: Document 6 §2/§4's move check, and
-    /// Document 6 §5.1's escaping-reference check, both funnel through
-    /// here so every place an identifier is actually *used* (not just
-    /// declared) is covered uniformly.
+    /// If `name` resolves to a scope OUTER to any closure body
+    /// currently being walked, records it as captured by every such
+    /// enclosing closure (Document 10 §4.3). A no-op outside any
+    /// closure body (`capture_stack` empty) or when `name` isn't found
+    /// at all. `mutated` only ever upgrades a capture from read-only to
+    /// needs-mut, never the reverse (a later read after a write doesn't
+    /// downgrade it).
+    fn record_capture_if_outer(&mut self, name: &str, mutated: bool) {
+        let Some(idx) = self.lookup_scope_idx(name) else { return };
+        for frame in self.capture_stack.iter_mut() {
+            if idx < frame.boundary_depth {
+                let entry = frame.captures.entry(name.to_string()).or_insert(false);
+                if mutated {
+                    *entry = true;
+                }
+            }
+        }
+    }
+
+    /// Reading a binding by name: Document 6 §2/§4's move check,
+    /// Document 6 §5.1's escaping-reference check, and Document 10
+    /// §4.3's capture-mode tracking all funnel through here so every
+    /// place an identifier is actually *used* (not just declared) is
+    /// covered uniformly.
     fn use_ident(&mut self, name: &str) {
         let (moved, sources) = match self.lookup(name) {
             Some(b) => (b.moved, b.borrow_sources.clone()),
@@ -456,6 +606,7 @@ impl<'a> FnChecker<'a> {
                 ));
             }
         }
+        self.record_capture_if_outer(name, false);
     }
 
     // ---- borrow/place aliasing (Document 6 §3.1, §3.2) ----
@@ -639,9 +790,99 @@ impl<'a> FnChecker<'a> {
                 return;
             }
         }
+        if let Expr::Closure(c) = init {
+            // Document 10 §4.3: a closure literal bound to a name is
+            // itself a value whose "lifetime" (how long it might still
+            // be called) is exactly `name`'s own last-use -- so its
+            // non-move captures are registered as persistent borrows
+            // using `name`'s computed last-use, the exact same
+            // machinery a named `let r = borrow x;` uses (Document 6
+            // §3.1/§3.2). Setting `borrow_sources` on the closure's own
+            // binding additionally reuses Document 6 §5.1's
+            // escaping-reference check unchanged: calling/using this
+            // closure after any captured source has gone out of scope
+            // is rejected by the SAME mechanism, not a separate
+            // closure-specific escape hatch (Document 25 §2.3's Phase 7
+            // exit criteria).
+            let captures = self.walk_closure_body_for_captures(c);
+            let sources: Vec<String> = if c.is_move { Vec::new() } else { captures.keys().cloned().collect() };
+            self.apply_closure_captures(c, captures, Some(name), block, idx);
+            let binding = Binding { is_copy: true, moved: false, borrow_sources: sources };
+            self.install_binding(name, binding, new_scope);
+            return;
+        }
         self.check_expr(init, block, idx);
         let binding = self.classify_initializer(init);
         self.install_binding(name, binding, new_scope);
+    }
+
+    /// Walks a closure's body to collect which OUTER bindings it reads
+    /// or mutates (Document 10 §4.3), via the exact same scope-based
+    /// `use_ident`/assignment machinery used for everything else in
+    /// this pass -- not a separate free-variable walker. Pushes a
+    /// fresh scope holding the closure's own parameters first (Phase 6
+    /// left this unscoped, flagged there as a Phase 7 gap: a closure
+    /// parameter shadowing an outer, possibly-moved binding's name
+    /// could otherwise cause a false positive against the OUTER
+    /// binding instead of correctly referring to the closure's own
+    /// fresh one).
+    fn walk_closure_body_for_captures(&mut self, c: &ClosureExpr) -> HashMap<String, bool> {
+        self.scopes.push(Scope::default());
+        let boundary_depth = self.scopes.len() - 1;
+        for (pattern, ty) in &c.params {
+            if let Some(pname) = binding_name(pattern) {
+                let is_copy = ty.as_ref().map_or(true, |t| self.checker.is_type_copy(t));
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .bindings
+                    .insert(pname, Binding { is_copy, moved: false, borrow_sources: Vec::new() });
+            }
+        }
+        self.capture_stack.push(CaptureFrame { boundary_depth, captures: HashMap::new() });
+        match &c.body {
+            ClosureBody::Expr(e) => self.check_branch_expr(e),
+            ClosureBody::Block(b) => self.check_branch(b),
+        }
+        let frame = self.capture_stack.pop().unwrap();
+        self.scopes.pop();
+        frame.captures
+    }
+
+    /// Applies the captures collected by `walk_closure_body_for_captures`
+    /// to the OUTER scope: `move` closures transfer ownership of every
+    /// captured non-Copy binding (Document 10 §4.3 -- unconditional,
+    /// regardless of whether the body only reads it); non-`move`
+    /// closures register a borrow (shared if only ever read, mutable if
+    /// assigned to anywhere in the body) of each captured place.
+    /// `named_as` is the destination binding's name to compute a real,
+    /// persistent last-use against (a closure bound via `let`/`=`) --
+    /// or `None` for a closure literal used inline (e.g. passed
+    /// directly as a call/method argument), whose borrows are then
+    /// temporary and expire at the end of the current statement, the
+    /// same as a bare `borrow x` call argument (Document 6 §3).
+    fn apply_closure_captures(
+        &mut self,
+        c: &ClosureExpr,
+        captures: HashMap<String, bool>,
+        named_as: Option<&str>,
+        block: &Block,
+        idx: usize,
+    ) {
+        for (name, needs_mut) in captures {
+            if c.is_move {
+                let src_copy = self.lookup(&name).map(|b| b.is_copy).unwrap_or(true);
+                if !src_copy {
+                    self.mark_moved(&name);
+                }
+            } else {
+                let last_use = match named_as {
+                    Some(dest) => compute_last_use(block, idx, dest),
+                    None => idx,
+                };
+                self.register_borrow(&name, needs_mut, "<closure>", last_use, idx);
+            }
+        }
     }
 
     fn install_binding(&mut self, name: &str, binding: Binding, new_scope: bool) {
@@ -701,10 +942,45 @@ impl<'a> FnChecker<'a> {
                 self.check_expr(lhs, block, idx);
                 self.check_expr(rhs, block, idx);
             }
-            Expr::Assign { lhs, rhs, .. } => {
+            Expr::Assign { op, lhs, rhs, .. } => {
                 if let Expr::Ident(name) = lhs.as_ref() {
                     if self.is_in_scope(name) {
-                        self.declare_binding(name, rhs, block, idx, /* new_scope */ false);
+                        // Both `name = rhs` and every compound form
+                        // (`name += rhs`, etc.) mutate `name` -- record
+                        // that for Document 10 §4.3's capture-mode
+                        // inference regardless of which form this is.
+                        self.record_capture_if_outer(name, true);
+                        if matches!(op, AssignOp::Eq) {
+                            // Plain assignment fully replaces the
+                            // binding's value -- reclassify from `rhs`,
+                            // same as a `let` initializer.
+                            self.declare_binding(name, rhs, block, idx, /* new_scope */ false);
+                        } else {
+                            // Compound assignment (`+=`, `-=`, etc.) is
+                            // a read-modify-write of `name`'s CURRENT
+                            // value using `rhs` -- `name` keeps its own
+                            // existing binding state (is_copy,
+                            // borrow_sources); it is not reclassified
+                            // from `rhs`'s shape at all (a real,
+                            // previously-latent bug caught while
+                            // implementing Phase 7's mutation-capture
+                            // tracking: naively routing every `Assign`
+                            // through `declare_binding` regardless of
+                            // `op` would have discarded `name`'s real
+                            // state and adopted `rhs`'s instead -- e.g.
+                            // `total += x` would have silently made
+                            // `total`'s is_copy/borrow_sources become
+                            // `x`'s, which is simply wrong for a
+                            // compound update; not exercised by any
+                            // Phase 6 test, since none used compound
+                            // assignment, but fixed here at the root
+                            // rather than only for the closure case
+                            // that surfaced it). Still checked for
+                            // move-validity (via `use_ident`) and its
+                            // `rhs` is still fully walked.
+                            self.use_ident(name);
+                            self.check_expr(rhs, block, idx);
+                        }
                         return;
                     }
                 }
@@ -788,18 +1064,17 @@ impl<'a> FnChecker<'a> {
             Expr::Block(b) => self.check_branch(b),
             Expr::Unsafe(b) => self.check_branch(b),
             Expr::Closure(c) => {
-                // Full closure capture-mode borrow analysis is out of
-                // scope for Phase 6 (already flagged as Phase 6 work
-                // in `types.rs`'s own Phase 3/5 comments, and Document
-                // 25 lists closures fully under Phase 7). Still walk
-                // the body so any *use* of an already-moved outer
-                // variable inside the closure is caught, since that's
-                // a real, checkable violation even without full
-                // capture-mode inference.
-                match &c.body {
-                    ClosureBody::Expr(e) => self.check_branch_expr(e),
-                    ClosureBody::Block(b) => self.check_branch(b),
-                }
+                // Phase 7 (Document 10 §4.3): an unbound closure
+                // literal -- one not directly bound via `let`/`=`, e.g.
+                // passed straight into `.map(|x| ...)` -- still gets
+                // full capture-mode analysis via the same machinery as
+                // a named one, just with `named_as: None`, so its
+                // non-move captures are temporary borrows lasting only
+                // this statement (Document 6 §3's `printName(borrow
+                // alice)` temporary-borrow shape) rather than
+                // persistent ones tied to a binding's own last-use.
+                let captures = self.walk_closure_body_for_captures(c);
+                self.apply_closure_captures(c, captures, None, block, idx);
             }
             Expr::TryCatch { try_block, catch_block, .. } => {
                 self.check_branch(try_block);
@@ -894,17 +1169,27 @@ impl<'a> FnChecker<'a> {
     }
 }
 
-/// Computes the NLL-approximated last-use index for a borrow-holding
-/// binding `name`, declared at statement `decl_idx` of `block`. See
-/// the module-level "NLL approximation" doc comment for the exact,
-/// deliberately-chosen rule and why it reproduces both Document 6
-/// §3.1's and §3.2's stated outcomes. Returns `block.stmts.len()` (a
-/// sentinel meaning "live through the end of this block") whenever no
-/// later read is found anywhere in the block's remaining statements or
-/// tail expression; otherwise returns the index of the LATEST
-/// statement (strictly after `decl_idx`) that reads `name` -- provided
-/// the tail doesn't *also* read it (a tail read always means "still
-/// live at block end", since the tail is textually last).
+/// Computes the strict-NLL last-use index for a borrow-holding
+/// binding `name`, declared at statement `decl_idx` of `block`. Per
+/// Document 6 §3.1's corrected note (a never-read borrow expires
+/// immediately at its own creation point, not conservatively at block
+/// end) and §3.2, a borrow is live from creation through its last
+/// actual textual read -- and if it has no later read anywhere in the
+/// block (including the tail), its live range is just its own
+/// creation point, i.e. it's already dead by the very next statement.
+/// Returns `decl_idx` itself in that "never read again" case (so
+/// `expire_place`'s `last < at_idx` check removes it as soon as
+/// anything else touches the same place at any later statement);
+/// returns `block.stmts.len()` (a sentinel one-past-the-end) when the
+/// *tail* expression reads it, since the tail is textually last;
+/// otherwise returns the index of the latest statement (strictly
+/// after `decl_idx`) that reads `name` -- which may be BEFORE or AFTER
+/// any other statement index being checked against, since this is a
+/// full forward scan of the whole block computed once, not merely "was
+/// it read before this point" (this is what correctly reproduces
+/// Document 6 §3.1's corrected example, where `ref2` is read only in
+/// the block's LAST statement, *after* `ref3` is created, and must
+/// still be treated as live at `ref3`'s creation point).
 fn compute_last_use(block: &Block, decl_idx: usize, name: &str) -> usize {
     let mut last_stmt_use: Option<usize> = None;
     for (j, stmt) in block.stmts.iter().enumerate() {
@@ -916,10 +1201,12 @@ fn compute_last_use(block: &Block, decl_idx: usize, name: &str) -> usize {
         }
     }
     let tail_reads = block.tail.as_ref().map_or(false, |t| expr_reads_ident(t, name));
-    if tail_reads || last_stmt_use.is_none() {
+    if tail_reads {
         block.stmts.len()
+    } else if let Some(j) = last_stmt_use {
+        j
     } else {
-        last_stmt_use.unwrap()
+        decl_idx
     }
 }
 
@@ -943,12 +1230,29 @@ fn block_reads_ident(block: &Block, name: &str) -> bool {
 /// within `expr`, at any depth (including inside nested blocks,
 /// closures, if/match/loop bodies). Used only to find evidence a
 /// borrow-holding binding is read again later, per
-/// `compute_last_use`'s conservative "not found -> still live" default
-/// -- so under-coverage here only costs PRECISION (a real later read
-/// that this walker misses just means the borrow is treated as
-/// conservatively live to block end instead of being shortened, which
-/// is still sound), never soundness. Covers every `Expr` variant that
-/// can syntactically contain a sub-expression.
+/// `compute_last_use`'s strict-NLL "not found anywhere -> dead
+/// immediately" rule (see the module doc's "Strict NLL, not a
+/// conservative approximation" note) -- which means, UNLIKE under the
+/// old conservative-fallback design this pass used to have,
+/// under-coverage here is no longer merely a precision cost: a genuine
+/// later read that this walker fails to find would make a still-live
+/// borrow look dead, which could let a real aliasing violation through
+/// undetected. This walker is written to cover every `Expr` variant
+/// that can syntactically contain a sub-expression, EXCEPT `Spawn`/
+/// `Select`/`Query` (Document 3 Category D/I, Document 20) — their
+/// internal syntax isn't otherwise analyzed anywhere in this pass
+/// either (deferred to Phases 12/18/20 per Document 25, same as
+/// `check_expr`'s own no-op treatment of them) and no Document 6 §8
+/// case exercises them, but rather than silently return `false` (which
+/// would now be a real soundness gap: a `spawn { print(ref1); }`
+/// between a borrow's creation and a later conflicting borrow would be
+/// invisible to this walker), they conservatively return `true` --
+/// "assume it might read anything" -- so a borrow followed by one of
+/// these constructs is never incorrectly treated as dead. This trades
+/// a small amount of precision (an unrelated `spawn`/`select`/`query`
+/// block downstream can make a borrow look longer-lived than it really
+/// is) for soundness, which is the only acceptable trade in this
+/// direction, until those constructs get real semantic analysis.
 fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Ident(n) => n == name,
@@ -1016,7 +1320,10 @@ fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
         }
         Expr::ComponentChildren { children, .. } => children.iter().any(|c| expr_reads_ident(c, name)),
         Expr::EventHandler { body, .. } => expr_reads_ident(body, name),
-        Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_) => false,
+        // Conservatively "might read anything" -- see this function's
+        // doc comment above for why `false` here would now be a real
+        // soundness gap rather than merely a precision cost.
+        Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_) => true,
     }
 }
 
