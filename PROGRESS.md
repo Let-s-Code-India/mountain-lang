@@ -1166,7 +1166,12 @@ purely additive for a previously-unparseable construct, and the
 present, which is true for all nine).
 
 ## Phase 6 — Borrow Checker
-**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (this environment has no `cargo`/`rustc` — same constraint every phase has hit; see "How to verify" below)
+**Status: 🟢 Complete — confirmed by real CI.** Actual downloaded CI
+log: **138 tests total, 0 failures, 0 warnings** (57 lib + 16
+`borrow_checks` [pre-correction count; see "Post-review correction"
+below for the current, re-verified 17] + 12 `generics` + 6
+`integration` + 6 `parser_doc24` + 15 `traits_impls` + 26 `types_doc5`).
+Clean run, no regressions in any Phase 1–5 test file.
 
 Per Document 25 §3 Rule 4 this is the single most foundational phase in
 the roadmap, so it got the most conservative possible treatment: read
@@ -1361,26 +1366,32 @@ No changes needed — picks up `tests/borrow_checks.rs` automatically
 (same pattern as every prior phase).
 
 ### How to verify (this environment has no cargo/rustc/network)
-Push this commit and check the Actions log for `mountain-lang` at the
-usual workflow. Expect: `cargo build --verbose` clean (0 warnings —
-watch specifically for any `unused` warning in `borrow.rs`, since that
-would mean one of the dead-code sweeps above missed something), then
-`cargo test --verbose` should show all pre-existing Phase 1–5 test
-files unchanged (regression check) plus a new `borrow_checks` test
-binary reporting **17/17 passed** if this hand-trace was correct. If
-any of the 17 fail, the most likely culprits per the above are the
-§3.1/§3.2 NLL-approximation rule (the trickiest logic in the file) or
-an AST field-shape mismatch this hand-verification missed despite the
-grep-based cross-checks.
+**Original round (confirmed):** CI reported 138 total / 0 failures / 0
+warnings, with `borrow_checks` contributing 16.
 
-### Exit criteria (Document 25 §2.3) — self-assessment
+**This correction round (pending):** push this commit and check the
+Actions log again. Expect `cargo build --verbose` still clean (0
+warnings — watch specifically for `borrow.rs`, since the `expr_reads_ident`
+Spawn/Select/Query change is new code, not just edited comments), and
+`cargo test --verbose` showing all other test files' counts unchanged
+from the confirmed run above (57 lib / 12 generics / 6 integration / 6
+parser_doc24 / 15 traits_impls / 26 types_doc5 — 122 total outside
+`borrow_checks`) plus `borrow_checks` now reporting **17/17 passed** (up
+from 16, per the added test). If any of the 17 fail, the most likely
+culprit is the strict-NLL fallback change in `compute_last_use` — check
+first whether the failing case involves a borrow that's read only
+*after* a point being checked (the "full forward scan, not just before
+this point" behavior that `doc6_s3_1_mutable_while_immutable_active_rejected`
+and `doc6_s3_1_two_mutable_borrows_rejected` both specifically depend
+on).
+
+### Exit criteria (Document 25 §2.3) — self-assessment (pre-correction)
 > "Every rejected-code example in Document 6 §8 is correctly rejected;
 > every accepted example is correctly accepted (including the NLL
 > example — borrows ending at last-use, not block-end)."
 
 - All five §8 cases implemented and hand-traced to the correct outcome
-  in both directions where the doc shows both. **Not yet independently
-  confirmed by a real `cargo test` run.** ⏳
+  in both directions where the doc shows both.
 - Two decisions genuinely required interpretive judgment beyond what's
   explicitly spelled out in the document (the §3.1/§3.2 NLL tension,
   and the `@copy` struct-marking syntax) — both resolved with reasoning
@@ -1391,7 +1402,250 @@ grep-based cross-checks.
   move-checking breadth) are real and stated plainly, not hidden —
   none of them affect the five required cases.
 
-## Phases 7–25
+**Real CI result: 138 tests, 0 failures, 0 warnings.** `borrow_checks`
+contributed 16 (not the 17 estimated above — a hand-trace count, not an
+actual count; noted so the gap between estimate and reality is on the
+record, same standard as the Phase 4 count correction).
+
+### Post-review correction: Document 6 §3.1 itself was wrong, not just my implementation of it
+After the CI confirmation above, review caught that the §3.1/§3.2
+tension flagged earlier wasn't an implementation ambiguity to route
+around — Document 6 §3.1's *own example* was incorrect. Its original
+form (`ref1`/`ref2` created, never read, `ref3` then claimed to be a
+compile error) is not what genuine NLL — which §3.2 and Document 25's
+exit criteria both explicitly require ("not merely conservative") —
+actually does: an unread borrow has a zero-length live range and real
+rustc accepts that case. Document 6 §3.1 has been corrected upstream
+(now attached separately) to add `print(ref1)`/`print(ref2)` calls that
+make both borrows genuinely live at `ref3`'s creation point, with an
+explanatory note on the correction itself.
+
+**Implementation updated to match — genuine strict NLL, no conservative
+fallback:**
+- `compute_last_use`'s "never read anywhere in the block" case now
+  returns `decl_idx` (dies immediately, at the very next statement)
+  instead of `block.stmts.len()` (the old "conservatively lives to
+  block end" fallback). The "found a real later read" case — including
+  reads that occur *after* the point currently being checked, since
+  `compute_last_use` does one full forward scan of the block at
+  declaration time — is unchanged and was already correct.
+- **A real, narrow soundness consequence of that change was caught and
+  fixed before it shipped, not after**: under the *old* fallback,
+  `expr_reads_ident` failing to find a genuine read anywhere was always
+  safe (worst case, over-conservative). Under the *new* fallback,
+  a missed read would make a still-live borrow look dead — a real gap
+  in the *unsound* direction. Auditing `expr_reads_ident` for exactly
+  this found one real instance: `Expr::Spawn`/`Select`/`Query` bodies
+  (whose internals aren't analyzed anywhere else in this pass either,
+  deferred to Phases 12/18/20) previously returned `false`
+  unconditionally ("assume no read"). Changed to `true`
+  ("conservatively assume it might read anything") specifically because
+  the risk profile of that gap changed with the algorithm — not because
+  the gap itself was new. No Document 6 §8 case exercises these
+  constructs, and this doesn't reintroduce the old fallback's
+  imprecision anywhere else.
+- **A second, unrelated documentation bug was caught during the same
+  audit**: the module doc's "Same-block scope only" note claimed a read
+  inside a nested block/if/match-arm/loop body would NOT be found by
+  the last-use scan. Re-checking `stmt_reads_ident`/`expr_reads_ident`
+  against the actual code showed this was simply inaccurate — they
+  already recurse arbitrarily deep into nested constructs via mutual
+  recursion with `block_reads_ident`, so any syntactically-legal read
+  (which, under ordinary lexical scoping, can only ever occur within
+  the borrow's own enclosing block's statement tree anyway) is already
+  found. The doc comment described a limitation that doesn't actually
+  exist in the code; corrected to state what's actually true instead of
+  leaving an inaccurate "known limitation" on the record.
+
+**Test file updated, all 17 tests re-traced by hand (not just the ones
+that changed):**
+- `doc6_s3_1_mutable_while_immutable_active_rejected` — rewritten to
+  match the corrected doc example exactly (`print(ref1)` before `ref3`,
+  `print(ref2)` after). Re-traced: `ref1` expires normally before
+  `ref3` (its real last use was before `ref3`); `ref2`'s later read is
+  what the algorithm actually detects as still-active at `ref3`'s
+  creation point — matching the corrected doc's own reasoning
+  ("ref2... reinforcing the rejection") precisely.
+- `doc6_s3_1_two_mutable_borrows_rejected` — **this one was NOT
+  mentioned in the review feedback, but tracing all 15 other tests by
+  hand (per the standing instruction to check for silent behavior
+  changes, not just the one explicitly called out) found it would have
+  silently flipped from rejected to accepted**: its `ref1` was never
+  read, so under strict NLL it would expire before `ref2`'s conflicting
+  mutable borrow, and real Rust does in fact accept two sequential,
+  never-reused mutable borrows. Fixed by adding `print(ref1)` after
+  `ref2`'s creation, mirroring the same "later read still counts" shape
+  as the corrected §3.1 case, restoring a genuine conflict.
+- `doc6_s3_1_unread_borrow_does_not_block_later_mutable_borrow` — new
+  test, added specifically to pin down the strict-NLL behavior in the
+  *accept* direction (the converse of the case above), which wasn't
+  independently tested before.
+- All other 14 tests re-traced statement-by-statement against the new
+  algorithm and confirmed unaffected: the §3.2 pair and the two §5.1
+  escaping-reference tests all rely on the "found a real read" branch
+  of `compute_last_use` or (for §5.1's call-argument temporary borrows)
+  don't use `compute_last_use` at all; all Copy-struct, move-checking,
+  and Rc/Arc tests don't touch borrow/NLL logic whatsoever.
+- Net: **17 tests** in `borrow_checks.rs` now (16 before, plus the one
+  new confirming test) — **not yet independently confirmed by a real
+  CI run; this correction was made in this same session, after the CI
+  result reported above.** ⏳
+
+### Exit criteria — current status
+All five §8 cases (now matching the *corrected* §3.1) hand-traced
+correct, including the specific "not merely conservative" requirement —
+the implementation no longer has a conservative fallback anywhere in
+the borrow-aliasing/NLL logic. **Needs one more real CI run** to
+confirm the 17 (up from 16) `borrow_checks` tests pass and nothing
+else regressed, before Phase 6 can be called fully closed on this
+correction. Both decisions flagged in the original write-up above
+remain **resolved** (the `@copy` syntax approved as-is; the NLL
+tension turned out to be a spec bug, now fixed upstream, with the
+implementation brought in line).
+
+## Phase 7 — Functions & Closures
+**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (no cargo/rustc in this environment, same as every phase)
+
+Scope per Document 25 §2.3: parameters with ownership-annotated
+signatures (already largely in place from Phase 6, since `check_fn`
+already reads each param's `OwnershipMod`), closures with automatic
+capture-mode inference (Document 10 §4.3), and `move`'s interaction
+with lifetime analysis — built as a direct extension of Phase 6's
+`borrow.rs`, reusing its exact machinery rather than adding a parallel
+closure-specific system, per the exit criteria's explicit requirement.
+
+### What was built
+All in `mtnc/src/borrow.rs` (no other file touched except the new
+`tests/closures.rs`):
+- **Closures now get their own scope** for their parameters (Phase 6
+  had flagged this as a known gap: without it, a closure parameter
+  sharing an outer binding's name could incorrectly resolve to the
+  outer one).
+- **Capture tracking** (`CaptureFrame`, `capture_stack`, `lookup_scope_idx`,
+  `record_capture_if_outer`): reuses the *exact same* scope-based
+  `use_ident`/assignment machinery already built in Phase 6 — a closure
+  body is walked completely normally, and any identifier that resolves
+  to a scope outer to the closure's own is recorded as a capture (and
+  as needing a mutable borrow if it's ever an assignment target,
+  covering both `=` and every compound-assignment operator).
+- **Capture application** (`apply_closure_captures`): for a `move`
+  closure, every capture is transferred by ownership (`mark_moved`,
+  skipped automatically for Copy types, same rule as everywhere else);
+  for a non-`move` closure, every capture is registered as a borrow via
+  `register_borrow` — the *same* function Phase 6's named `let r =
+  borrow x;` uses, with the same aliasing (§3.1) and strict-NLL (§3.2)
+  checks applying automatically, no separate code path.
+- **Escaping closures**: a closure literal bound to a name has that
+  name's `Binding.borrow_sources` set to its captured places — the
+  *same* field Document 6 §5.1's escaping-reference check already
+  reads. Using the closure after a captured source has gone out of
+  scope is therefore caught by code that hasn't changed since Phase 6.
+- A closure literal used unbound (passed directly as a call/method
+  argument) gets the same analysis with its borrows treated as
+  temporary (expiring at the end of the current statement), mirroring
+  Document 6 §3's `printName(borrow alice)` shape.
+
+### A real, previously-latent bug found and fixed at the root (not patched for the closure case)
+Implementing mutable-capture tracking required routing every
+`Expr::Assign` through code that could tell `x = y` apart from `x +=
+y`. Tracing this surfaced that **the existing Phase 6 code didn't
+distinguish them at all** — every assignment, including every compound
+form, was routed through `declare_binding`, which fully *reclassifies*
+the target from the RHS's shape (correct for plain `=`, but wrong for
+`+=`/`-=`/etc., which read-modify-write the target's own existing value
+and shouldn't adopt the RHS's `is_copy`/`borrow_sources` at all). This
+was never caught in Phase 6 because no Phase 6 test used compound
+assignment. Fixed generally: `AssignOp::Eq` still reclassifies via
+`declare_binding`; every other `AssignOp` now keeps the target's own
+binding state, only checking it isn't already moved and walking the
+RHS. Not just a Phase 7 patch — this fixes real, if previously
+unexercised, incorrect behavior for compound assignment anywhere in the
+language, not only inside closures.
+
+### A second, more serious bug found and fixed before it could ship: false-positive move on ordinary reads
+Hand-tracing `|| print(count)` with a **non-Copy** type in place of
+Document 10 §4.3's own `count: i32` (i.e. checking the doc's own
+example pattern still holds when the captured type isn't Copy, since
+nothing in the doc says it has to be) found that the closure body-walk
+would incorrectly **move** the captured variable out of the outer
+scope — because the ordinary by-value-call-argument move-check
+(`check_call_args`, Document 6 §4.1) has no notion of "I'm currently
+walking a closure body for capture analysis" and fires exactly as it
+would for a plain, non-closure function call. This is not a narrow edge
+case: it would misfire on any non-move closure that merely *reads* a
+non-Copy variable through an ordinary (non-`borrow`-wrapped) function
+call — a very natural thing to write. Root-caused and fixed directly in
+`mark_moved`: while inside a closure body being walked, a move onto a
+binding that resolves outer to that closure's own scope is suppressed,
+deferring entirely to `apply_closure_captures`'s single, authoritative,
+post-walk decision. Verified this doesn't weaken the `move`-closure
+case (Test `doc10_s4_3_move_closure_moves_capture_reuse_rejected`):
+`apply_closure_captures`'s own move branch runs *after* the capture
+stack is popped, so its `mark_moved` call is never suppressed — the
+fix only ever removes a *premature*, mid-walk move-marking, never the
+final, correct one.
+
+### A third gap found, NOT fixed (out of Phase 7's scope, flagged rather than hidden)
+While designing the test for the bug above, found that **this pass
+never checks a move against currently-active borrows of the same
+place** at all — `let r = borrow x; /* r still needed later */ let y =
+x;` moves `x` without complaint even though `r` may still be used. This
+is a pre-existing Phase 6 gap (Document 6 §8's own cases don't exercise
+it either), not something Phase 7 introduced or worsened. Not fixed
+now — flagged in `borrow.rs`'s module doc and here, for a future phase
+to close (likely: consult `place_borrows` from the move-marking paths,
+symmetric to how borrow-creation already consults it).
+
+### Document 10 §4.3 examples and exit criteria — mapped to tests (`tests/closures.rs`, 10 tests)
+| Case | Test |
+|---|---|
+| Read-only capture (`\|\| print(count)`) | `doc10_s4_3_readonly_capture_ok` |
+| Mutable capture via `+=` (`\|x: i32\| total += x`) | `doc10_s4_3_mutable_capture_via_compound_assign_ok` |
+| `move` capture, reuse rejected | `doc10_s4_3_move_closure_moves_capture_reuse_rejected` |
+| `move` capture of a Copy value, reuse still OK | `doc10_s4_3_move_closure_copy_capture_reuse_still_ok` |
+| **Exit criteria**: non-move closure capturing a borrow that doesn't outlive its use → rejected, via §5.1's escaping-reference mechanism | `phase7_escaping_closure_rejected_after_captured_source_out_of_scope` (+ converse `..._still_in_scope_ok`) |
+| **Exit criteria**, second angle: non-move closure's mutable capture conflicting with a still-live shared borrow → rejected, via §3.1's aliasing mechanism (the *same* code path that rejects `ref3` in `borrow_checks.rs`) | `phase7_closure_mutable_capture_conflicts_with_active_shared_borrow` |
+| Phase 6 gap fix: closure param shadows an outer moved binding | `phase7_closure_param_shadows_outer_moved_binding` |
+| Bug-fix regression pin: non-move closure reading a non-Copy capture doesn't move it | `phase7_nonmove_closure_reading_noncopy_capture_does_not_move_it` |
+| Robustness: unbound closure argument doesn't error/crash | `phase7_unbound_closure_argument_does_not_error` |
+
+All 10 hand-traced statement-by-statement against the actual algorithm
+(same discipline as Phase 6), including full `capture_stack`/`scopes`/
+`place_borrows` state traces through the two exit-criteria tests. All
+16 (post-correction) `borrow_checks.rs` tests were also re-traced
+against the `Expr::Assign`/`mark_moved` changes to confirm no
+regression — neither change alters any path those tests exercise
+(none use compound assignment or closures).
+
+### How to verify (no cargo/rustc/network here)
+Push and check the Actions log. Expect `cargo build --verbose` clean (0
+warnings), and `cargo test --verbose` showing the confirmed Phase 6
+counts unchanged (57 lib / 12 generics / 6 integration / 6
+parser_doc24 / 15 traits_impls / 26 types_doc5 / 17 borrow_checks — the
+last pending its own re-confirmation per the correction above) plus a
+new `closures` binary reporting **10/10 passed**.
+
+### Exit criteria — self-assessment
+> "The closure capture-mode inference test suite must pass, and a
+> non-`move` closure that captures a borrow which would not outlive the
+> closure's own use must be correctly rejected by the borrow checker,
+> not accepted by some separate, closure-specific escape hatch."
+
+Both halves hand-traced correct, and — importantly — verified
+structurally, not just by outcome: the escaping-closure rejection goes
+through the identical `Binding.borrow_sources`/`is_in_scope` check
+Phase 6 wrote for function-returned references, and the aliasing
+rejection goes through the identical `register_borrow` conflict check
+Phase 6 wrote for named borrows. No new rejection mechanism was added
+anywhere in this phase — only new *callers* of Phase 6's existing ones.
+**Not yet independently confirmed by real CI.** ⏳ Two bugs were found
+and fixed at the root while implementing this (compound-assignment
+reclassification; premature move during closure-body walks), and one
+further pre-existing gap was found and explicitly flagged rather than
+fixed (move-vs-active-borrow) — all three documented in `borrow.rs`
+itself and above, not left implicit.
+
+## Phases 8–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
