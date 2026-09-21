@@ -420,3 +420,64 @@ fn primitive_copy_types_are_never_moved() {
         "#,
     );
 }
+
+// ============================================================
+// Phase 8 (Document 25 §2.3): "generators suspend mid-function...
+// check explicitly whether a local borrow that's still live across a
+// yield point gets the same soundness scrutiny a closure's captured
+// borrow got in Phase 7 -- don't assume this is automatically
+// covered." Explicitly verified here, both directions, rather than
+// assumed: `yield` was already an ordinary statement to
+// `compute_last_use`'s forward scan and `check_expr`'s walk (both
+// written in Phase 6, before `yield`/generators were a named concern
+// at all) -- so a borrow spanning a yield point was ALREADY correctly
+// kept alive across it, and a conflicting borrow after a yield is
+// ALREADY correctly rejected, with no new code needed. These two
+// tests are that verification made concrete and permanent, not just
+// asserted in a report.
+// ============================================================
+
+#[test]
+fn phase8_borrow_still_needed_after_yield_point_stays_correctly_live() {
+    // `r` is read only AFTER the `yield` -- if `yield` were somehow
+    // invisible to the last-use scan, this would be indistinguishable
+    // from `r` being unread, which (per the strict-NLL rule Document 6
+    // §3.1 now requires) would make `r` die immediately and this
+    // would accidentally still pass for the WRONG reason. The
+    // adversarial test below is what actually rules that out.
+    assert_ok(
+        r#"
+        fn gen() {
+            let x = 5;
+            let r = borrow x;
+            yield 1;
+            print(r);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn phase8_conflicting_borrow_after_yield_still_rejected() {
+    // The adversarial case that actually distinguishes "yield is
+    // properly transparent to last-use tracking" from "the test above
+    // passed for an unrelated reason": `r`'s only read is AFTER both
+    // the `yield` and the conflicting `borrow mut` -- so `r` is
+    // genuinely still live at the point `r2` is created, exactly
+    // mirroring `borrow_checks.rs`'s own
+    // `doc6_s3_1_mutable_while_immutable_active_rejected` shape, just
+    // with a `yield` statement sitting in between. Must still be
+    // rejected; if it weren't, that would mean a yield point was
+    // somehow resetting or bypassing the aliasing check.
+    assert_rejected(
+        r#"
+        fn gen() {
+            let mut x = 5;
+            let r = borrow x;
+            yield 1;
+            let r2 = borrow mut x;
+            print(r);
+        }
+        "#,
+    );
+}
