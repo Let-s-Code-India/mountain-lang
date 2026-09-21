@@ -1504,7 +1504,12 @@ tension turned out to be a spec bug, now fixed upstream, with the
 implementation brought in line).
 
 ## Phase 7 — Functions & Closures
-**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (no cargo/rustc in this environment, same as every phase)
+**Status: 🟢 Complete — confirmed by real CI.** Actual downloaded CI
+log: **149 tests total, 0 failures, 0 warnings** (57 lib + 17
+borrow_checks + 10 closures + 12 generics + 6 integration + 6
+parser_doc24 + 15 traits_impls + 26 types_doc5). Matches the predicted
+counts exactly (17, up from 16 post-NLL-correction; 10 new closures
+tests). Clean run, no regressions.
 
 Scope per Document 25 §2.3: parameters with ownership-annotated
 signatures (already largely in place from Phase 6, since `check_fn`
@@ -1638,14 +1643,303 @@ Phase 6 wrote for function-returned references, and the aliasing
 rejection goes through the identical `register_borrow` conflict check
 Phase 6 wrote for named borrows. No new rejection mechanism was added
 anywhere in this phase — only new *callers* of Phase 6's existing ones.
-**Not yet independently confirmed by real CI.** ⏳ Two bugs were found
+**Confirmed by real CI: 149 total, 0 failures, 0 warnings** (17
+borrow_checks + 10 closures, both hand-trace predictions exactly
+right). Two bugs were found
 and fixed at the root while implementing this (compound-assignment
 reclassification; premature move during closure-body walks), and one
 further pre-existing gap was found and explicitly flagged rather than
 fixed (move-vs-active-borrow) — all three documented in `borrow.rs`
 itself and above, not left implicit.
 
-## Phases 8–25
+## Phase 8 — Full Control Flow
+**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (no cargo/rustc in this environment, same as every phase)
+
+Scope per Document 25 §2.3: `if`/`match` exhaustiveness via real
+pattern-matrix decomposition (Document 9 §2.5, Document 17 §4.5's
+Maranget reference), all four loop forms with labeled `break`/
+`continue` (Document 9 §3), and `yield` generators lowered to an
+explicit state machine (Document 9 §4). This phase touched more
+existing, previously-verified code than any prior one — including a
+foundational lexer gap that had been latent since Phase 1 — so extra
+weight was put on tracing every change against the actual current
+source before writing tests, per standing instruction #9.
+
+### 1. A foundational, previously-latent lexer gap: no lifetime/label token existed at all
+Labeled loops (Document 9 §3.5's `'outer: for ...`) and `&'a Type`
+(Document 6 §5.1) both need a `'ident` token. Checking the actual
+parser (not assuming) showed every loop-label field was hardcoded to
+`None` specifically because the lexer had never tokenized `'ident` at
+all — `lex_char` unconditionally treated a leading `'` as the start of
+a char literal, so `'outer:` would have produced a hard "unterminated
+char literal" lex error, not just a silently-dropped label. This had
+never surfaced before because no prior phase's tests happened to write
+`'a`-shaped source (Phase 6's own `longest` test deliberately used
+`&str` without an explicit lifetime, which in hindsight was already
+sidestepping this).
+
+Fixed at the root, in the lexer: `lex_char` now disambiguates exactly
+the way real-world Rust's lexer does — an identifier-start character
+immediately followed by a second `'` is a char literal (`'a'`); an
+identifier-start character NOT immediately closed is a lifetime/label
+token (`'a`, `'outer`); anything else (escapes, digits, symbols) is
+unaffected, taking the exact same path as before. Verified against the
+one pre-existing char-literal test (preserved exactly) plus three new
+inline lexer tests for the escape/digit-unaffected case and both
+lifetime shapes (bare label, single-letter type-position lifetime).
+
+Wired into every place that needed it: loop-label parsing (`'outer:`
+before any loop form), `break`/`continue` labels, `&'a Type` (stores
+the name in `Type::Ref.lifetime`, which already existed as a field but
+was always `None`), and generic lifetime parameters (`fn
+longest<'a>(...)`) — the last of these is parsed-and-discarded rather
+than tracked (no `GenericParam::Lifetime` variant exists, and adding
+one is out of Phase 8's scope; named lifetimes remain structurally
+inert everywhere, consistent with Document 6's own established
+scope through Phase 6/11) so the syntax parses instead of erroring,
+which is the concrete, previously-broken thing this fixes.
+
+**Scope cut, flagged rather than silently handled:** `LoopExpr::DoWhile`
+has no `label` field in the AST at all (Document 9 never shows a
+labeled do-while example either) — a label before `do` still parses
+(so it doesn't error) but has no effect. Real gap, not exercised by
+any Document 9 example.
+
+### 2. Exhaustiveness checking (`src/exhaustive.rs`) — a real Maranget-style algorithm, not a shortcut
+Implements genuine pattern-matrix usefulness checking: constructor
+specialization, a default matrix for non-exhaustive/infinite domains,
+and full recursive decomposition of nested patterns (an enum variant
+containing further sub-patterns), not a "collect top-level variant
+names" heuristic. Handles:
+- User-declared enums (via a `EnumTable` built from `types.rs`'s
+  existing `enums` registry).
+- `Option`/`Result` as synthetic two-variant enums (`Some`/`None`,
+  `Ok`/`Err`) — they're ordinary enums per Document 7 §3.2 but live as
+  dedicated `Ty::OptionTy`/`Ty::ResultTy` variants rather than entries
+  in the enum registry, so they're special-cased structurally.
+- `bool` as a genuine two-constructor finite domain — exhaustive via
+  `true`/`false` alone, no wildcard needed.
+- Tuples, recursively over element types.
+- Or-patterns, both nested (`Pattern::Or`) and this parser's actual
+  representation of a `|`-combined top-level arm (`MatchArm.patterns:
+  Vec<Pattern>` — confirmed by reading `parse_match_expr` directly:
+  Document 9 §2.1's `HttpMethod::Put | HttpMethod::Delete => ..` is
+  stored as two separate patterns on one arm, not a nested `Or`).
+- Guards excluded from the coverage matrix entirely (Document 9 §2.3).
+
+Every other type (ints, floats, strings, chars, structs, arrays) is
+treated as infinite/unenumerable — literal patterns over them are real
+matrix rows, but only a wildcard (or destructuring whose own parts are
+all-covering) can make such a match exhaustive, matching Document 9
+§2.2's own `match statusCode {200=>..,404=>..,500=>.., _=>..}` example
+requiring the `_`.
+
+**A real disambiguation problem, resolved by reading the actual
+parser, not assumed:** `HttpMethod::Get` (no parens) parses as
+`Pattern::Ident("HttpMethod::Get")` — structurally identical to a
+genuine capturing binding like `n` in `n if n < 0 => ..`. Resolved by
+checking, at exhaustiveness-analysis time, whether the pattern's name
+(or its last `::`-segment) matches a registered NULLARY variant of the
+scrutinee's type; only then is it treated as a real constructor,
+otherwise it's a wildcard-equivalent binding exactly as it would be for
+any other type.
+
+**A real bug caught before shipping, not after:** the first draft's
+`specialize` function computed a wildcard row's expansion width as a
+hardcoded 0, correct only for nullary constructors — specializing by
+any constructor with fields (e.g. `Some(_)`) against a matrix
+containing a plain wildcard row would have produced a 0-wide expansion
+instead of the correct width, desyncing that row's column count from
+every other row and the query, corrupting the whole recursion. Caught
+by re-reading my own draft before writing any tests (the same
+discipline Phase 6/7 applied to `borrow.rs`), fixed by unifying to one
+`specialize` that always takes the column's type and computes real
+arity via the same `Ctx::field_types` the rest of the algorithm uses —
+no parallel/inconsistent arity computation left anywhere.
+
+**A defensive fix, not just an optimization:** made `is_useful` use
+`col_tys.first()` with a `Ty::Unit` fallback instead of `col_tys[0]`
+direct indexing, so a hypothetical arity-mismatched pattern (a gap
+types.rs doesn't fully guard against — see PROGRESS.md's Phase 3
+notes on pattern-binding types not being distributed yet) makes this
+check imprecise at worst, never panics the compiler itself (Document 1
+Pillar I: a crash is strictly worse than an overly-cautious
+diagnostic).
+
+Hand-traced against 5 representative cases before writing any test
+(HttpMethod with a `|`-arm and a data-carrying variant; a genuinely
+non-exhaustive HttpMethod match; `bool`; `i32` literals with and
+without a wildcard; `Option`) — all traced to the correct result. 14
+tests in `tests/exhaustiveness.rs`, each grounded in a specific
+Document 9/7 example or a directly-adjacent case (nested enum
+decomposition, guard-exclusion, tuple-with-catchall).
+
+### 3. Loop type-checking (`types.rs`) — `Expr::Loop` was completely unchecked before this phase
+Confirmed by reading the code directly: `Expr::Loop` (all four forms)
+fell into a catch-all that did nothing — not even walking into the
+body, meaning zero type errors inside ANY loop, of any form, were ever
+reported. Added real checking for all four forms:
+- `loop`: Document 9 §3.1's loop-as-expression form — its type is the
+  unified type of every `break <value>;` that targets it specifically
+  (same "no cross-branch guessing" rule Document 5 rule 5 already
+  applies to `match`/`if`). Tracked via a `loop_frames` stack pushed/
+  popped around each loop, with `Stmt::Break`'s handling recording a
+  break's already-checked value type directly into its target frame —
+  **a single pass**, not a separate collect-then-recheck pass (a first
+  draft tried the latter and would have reported any real type error
+  inside a `break <value>;` expression twice; caught while designing
+  it, before it was ever a working version to regress from).
+- `while`/`do-while`: condition checked against `bool`.
+- `for`: element-type inference limited to what's directly
+  determinable without a real `Iterable` trait (Phase 16 territory,
+  not built) — `[T]` unwraps to `T`; a `Range` (whose own `check_expr`
+  already returns the bare element type) is used as-is; anything else
+  falls back to the iterator's own checked type. Covers Document 9
+  §3.3's own examples; flagged, not silently wrong, for anything
+  genuinely needing `Iterable` dispatch.
+- Labeled `break`/`continue` (Document 9 §3.5): resolved against the
+  WHOLE `loop_frames` stack (not just the innermost), so a label
+  naming an outer loop from inside a nested one resolves correctly; an
+  unresolvable label, or a bare `break`/`continue` outside any loop,
+  is now a real error where it previously did nothing at all.
+
+**Incidental fix, called out separately (not core Phase 8 scope):**
+`Stmt::TargetBlock` (`#target(native){..}`) was also never walked into
+by the type checker — noticed and fixed alongside this work since it's
+the same match arm and a one-line fix, not because Document 2 §8's
+directive blocks are part of Phase 8's stated scope.
+
+10 tests in `tests/control_flow.rs`: Document 9 §3.1's own
+loop-break-value example, incompatible-break-type rejection, `while`
+condition/body checking (confirming bodies are now actually visited),
+Document 9 §3.5's own nested-labeled-loop example, valid/invalid label
+resolution in both directions, and the `&'a str` lexer-fix regression
+check.
+
+### 4. Generators (`src/generator.rs`) — a real, scoped lowering + interpreter, since no LLVM backend exists yet
+Document 25 §2.3's exit criterion ("the generator state machine must
+correctly resume from every yield point across multiple `.next()`
+calls, preserving local state correctly between suspensions") needs
+something *executable* to verify against, and Phase 10 (real codegen)
+doesn't exist yet. Rather than skip this or fake it, built a genuine
+state-machine lowering — Document 9 §4's own described technique
+("compiling the function body into an enum representing which yield
+point I'm resuming from plus the captured locals"), implemented as
+real Rust data structures (`LoweredGenerator`, `GenStep`) — plus a
+small interpreter (`GeneratorState::next`) that actually executes it,
+so tests call `.next()` repeatedly against real lowered output and
+assert on real yielded values and real preserved local state, the way
+a future LLVM-generated `poll` function would behave.
+
+**Explicitly scoped, not a general Mountain evaluator:** supports
+exactly the statement/expression shapes Document 9 §4's own
+`fibonacci` example uses (`let`/assignment with simple initializers,
+`yield`, one enclosing `loop`, integer arithmetic) — anything outside
+that is a real `LowerError`, never silent mis-lowering. Building a
+general interpreter would mean re-implementing the whole language's
+runtime semantics ahead of Phase 10; this proves the state-machine
+*transformation* is correct for a real, representative case, which is
+what the exit criterion actually asks for.
+
+**A real parsing-shape risk, checked rather than assumed:** whether a
+trailing `loop {}` with no semicolon parses as `Stmt::Expr` or as the
+block's own `tail` expression matters for finding it during lowering.
+Checked by reading `parser::parse_stmt` directly: a block-like
+expression at the end of a block, with no following `;`, becomes
+`Block.tail`, not a statement — meaning Document 9 §4's *own* example
+(no semicolon after the loop's closing brace) parses via `tail`, not
+`stmts.last()`. The first draft only checked `stmts.last()`, which
+would have failed to lower the specification's own central example.
+Fixed to check both representations.
+
+Hand-traced the full `fibonacci` lowering and five consecutive
+`.next()` calls by hand against the real algorithm before writing any
+test — produced 0, 1, 1, 2, 3, matching the real Fibonacci sequence
+exactly, with `a`/`b`/`next` locals correctly evolving across
+suspensions. 5 tests in `tests/generators.rs`: successful lowering of
+Document 9 §4's actual example, the full 10-value sequence against
+real Fibonacci numbers (matching Document 24 §3's `.take(10)` usage),
+explicit local-state assertions after a specific `.next()` call (not
+just checking yielded values), a one-shot (non-looping) generator's
+finish/re-`.next()` semantics, and an explicit-error check for an
+unsupported shape (a function call inside a generator body).
+
+### 5. The borrow-checker/yield interaction — explicitly checked, per your instruction, not assumed
+You flagged this specifically: "generators suspend mid-function...
+don't assume this is automatically covered — check it explicitly."
+Checked by hand-tracing two concrete cases against the actual Phase
+6/7 algorithm before writing anything: a borrow whose only read occurs
+*after* a `yield`, and the adversarial case of a conflicting borrow
+created *after* a `yield` while an earlier borrow (read still later)
+remains genuinely live. **Both trace correctly with zero new code**,
+because `yield` was already just an ordinary statement to
+`compute_last_use`'s forward scan and `check_expr`'s walk — both
+written in Phase 6, before generators were a named concern at all, and
+neither ever special-cased or skipped `yield`. This is a verified
+result, not an assumption: two tests
+(`phase8_borrow_still_needed_after_yield_point_stays_correctly_live`,
+`phase8_conflicting_borrow_after_yield_still_rejected`) were added to
+`tests/borrow_checks.rs` to make the verification permanent rather
+than just asserted in this report — the second one specifically rules
+out the case where the first passes for the wrong reason (e.g. if
+`yield` somehow reset the aliasing table).
+
+### `.github/workflows/ci.yml`
+No changes needed — picks up all five new/extended test files
+automatically.
+
+### Predicted test counts (real counts required from CI, not this table)
+| Suite | Count | Note |
+|---|---|---|
+| lib (inline) | 60 | 57 confirmed + 3 new lexer tests |
+| borrow_checks | 19 | 17 confirmed + 2 new yield-borrow tests |
+| closures | 10 | unchanged |
+| control_flow | 10 | new |
+| exhaustiveness | 14 | new |
+| generators | 5 | new |
+| generics | 12 | unchanged |
+| integration | 6 | unchanged |
+| parser_doc24 | 6 | unchanged |
+| traits_impls | 15 | unchanged |
+| types_doc5 | 26 | unchanged |
+| **Total** | **183** | |
+
+### How to verify (no cargo/rustc/network here)
+Push and check the Actions log. Expect `cargo build --verbose` clean (0
+warnings — this phase touched `lexer.rs`/`parser.rs`/`types.rs`
+directly, higher regression surface than Phase 6/7's mostly-additive
+changes, so watch this closely), `cargo test --verbose` showing
+**183/183** if every hand-trace in this report was correct, with the
+pre-existing 57(+3) lib tests and all Phase 1–7 external test files'
+counts unchanged (regression check — the lexer/loop-checking changes
+specifically touch code every prior phase's tests already exercise).
+
+### Exit criteria — self-assessment
+> "The exhaustiveness checker must correctly reject every
+> non-exhaustive match test case (and correctly accept exhaustive
+> ones)... the generator state machine must correctly resume from
+> every yield point across multiple `.next()` calls, preserving local
+> state correctly between suspensions."
+
+Both hand-traced correct, with a real algorithm (not a heuristic) for
+exhaustiveness and a real, executable lowering+interpreter (not a
+description) for generators, per the standing "implement for real,
+verify via an executable prototype harness" guidance. The
+yield/borrow-checker interaction you specifically flagged was checked
+explicitly, not assumed, with the verification result pinned down by
+two new tests. **Not yet independently confirmed by real CI.** ⏳ One
+foundational, previously-latent gap (no lifetime token at all) was
+found and fixed at the root while pursuing labeled loops specifically;
+three real bugs in this phase's own new code were caught and fixed
+before shipping (exhaustiveness's zero-arity `specialize`, the
+double-pass break-value type-checking, and the wrong-statement-form
+generator-loop detection); one scope cut is flagged (`DoWhile` has no
+label field in the AST). Nothing here required a sign-off-worthy
+interpretive judgment call the way Phase 6's NLL tension did — every
+design decision was grounded directly in a specific Document 6/9/17
+passage or an explicit, stated scope boundary.
+
+## Phases 9–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
