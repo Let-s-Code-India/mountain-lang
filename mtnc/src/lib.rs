@@ -1,12 +1,14 @@
 //! `mtnc` — the Mountain compiler.
-//! Phase 6 scope (Document 25 §2.3) adds the Borrow Checker
-//! (`borrow.rs`), implementing Document 6's ownership/borrowing/
-//! lifetime rules as a standalone pass. See `borrow.rs`'s module doc
-//! for exactly what it checks and its documented scope limits.
+//! Phase 8 scope (Document 25 §2.3) adds the exhaustiveness checker
+//! (`exhaustive.rs`, wired into `types::TypeChecker::check_match`) and
+//! full control-flow support (loop labels, generator lowering). See
+//! each module's own doc comment for exactly what it checks.
 
 pub mod ast;
 pub mod borrow;
 pub mod diagnostics;
+pub mod exhaustive;
+pub mod generator;
 pub mod lexer;
 pub mod manifest;
 pub mod parser;

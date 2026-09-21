@@ -326,18 +326,69 @@ impl Lexer {
         }
     }
 
+    /// Dispatches on a leading `'`: either a char literal (`'a'`,
+    /// `'\n'`) or a lifetime/label token (`'a`, `'outer`) — Document 2
+    /// never separately tokenizes lifetimes ("Lifetimes aren't
+    /// separately tokenized by the lexer" was this project's own
+    /// working assumption through Phase 7, since nothing exercised
+    /// `'a`-shaped source until Phase 8's labeled-loop requirement
+    /// surfaced it), but Document 9 §3.5's `label ::= "'" IDENT ":"`
+    /// grammar and Document 6 §5.1's `&'a str` both need it — so this
+    /// is a real, previously-latent lexer gap, fixed here at the same
+    /// place `'` was already dispatched from, not a new dispatch path.
+    /// Disambiguation follows the same rule real-world Rust uses:
+    /// an identifier-start character immediately followed by a SECOND
+    /// `'` is a (single-character) char literal; anything else
+    /// starting with an identifier character is a lifetime/label,
+    /// consuming no closing quote at all. A non-identifier first
+    /// character (a digit, symbol, escape, or space) is always treated
+    /// as an ordinary char literal, exactly as before this change —
+    /// unaffected, so `'a'`/`'\n'`/`'0'`/`'"'`/etc. all still lex
+    /// identically to Phase 1.
     fn lex_char(&mut self) {
         let span = self.here();
         let start = self.i;
-        self.advance(); // opening '
+        self.advance(); // consume opening '
+
         if self.peek(0) == '\\' {
             self.advance();
             if !self.at_end() {
                 self.advance();
             }
-        } else if self.peek(0) != '\'' {
+            self.finish_char_literal(span, start);
+            return;
+        }
+
+        let c0 = self.peek(0);
+        if c0.is_alphabetic() || c0 == '_' {
+            let ident_start = self.i;
+            while !self.at_end() && (self.peek(0).is_alphanumeric() || self.peek(0) == '_') {
+                self.advance();
+            }
+            let ident: String = self.chars[ident_start..self.i].iter().collect();
+            if ident.chars().count() == 1 && self.peek(0) == '\'' {
+                // Single identifier character immediately closed by a
+                // second `'` -- an ordinary char literal like `'a'`.
+                self.advance(); // consume closing '
+                self.emit(TokenKind::Char(format!("'{}'", ident)), span);
+            } else {
+                // No closing quote right after a single char -- a
+                // lifetime/label token (`'a`, `'outer`), never itself
+                // consuming a closing `'` (there isn't one).
+                self.emit(TokenKind::Lifetime(ident), span);
+            }
+            return;
+        }
+
+        // Non-identifier first character (digit, symbol, whitespace,
+        // etc.) -- always an ordinary char literal, same as before.
+        if self.peek(0) != '\'' && !self.at_end() {
             self.advance();
         }
+        self.finish_char_literal(span, start);
+    }
+
+    fn finish_char_literal(&mut self, span: Span, start: usize) {
         let mut closed = false;
         if self.peek(0) == '\'' {
             self.advance();
@@ -488,7 +539,7 @@ mod tests {
                 TokenKind::Ident(s) | TokenKind::Int(s) | TokenKind::IntHex(s)
                 | TokenKind::IntOct(s) | TokenKind::IntBin(s) | TokenKind::Float(s)
                 | TokenKind::Str(s) | TokenKind::RawStr(s) | TokenKind::Char(s)
-                | TokenKind::DocComment(s) | TokenKind::Error(s) => s,
+                | TokenKind::DocComment(s) | TokenKind::Error(s) | TokenKind::Lifetime(s) => s,
                 TokenKind::Bool(b) => b.to_string(),
                 TokenKind::Null => "null".to_string(),
                 TokenKind::Op(o) => o.to_string(),
@@ -616,6 +667,40 @@ mod tests {
     #[test]
     fn char_literal() {
         assert_eq!(kinds("'a'"), vec![TokenKind::Char("'a'".into())]);
+    }
+
+    #[test]
+    fn char_literal_escape_and_digit_unaffected_by_lifetime_disambiguation() {
+        // Phase 8 rewrote `lex_char` to disambiguate char-literals from
+        // lifetime/label tokens -- these two shapes (escape sequence,
+        // non-identifier first character) take the SAME code path as
+        // before that change and must lex identically.
+        let (toks, errs) = tokenize("'\\n' '0'");
+        assert!(errs.is_empty());
+        let kinds: Vec<TokenKind> = toks.into_iter().filter(|t| t.kind != TokenKind::Eof).map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![TokenKind::Char("'\\n'".into()), TokenKind::Char("'0'".into())]);
+    }
+
+    #[test]
+    fn lifetime_token_for_loop_label_shape() {
+        // Document 9 §3.5's `'outer:` -- before Phase 8 this was a
+        // hard lex error (misread as an unterminated char literal).
+        let (toks, errs) = tokenize("'outer");
+        assert!(errs.is_empty(), "expected no lex errors, got: {:?}", errs);
+        let kinds: Vec<TokenKind> = toks.into_iter().filter(|t| t.kind != TokenKind::Eof).map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![TokenKind::Lifetime("outer".into())]);
+    }
+
+    #[test]
+    fn lifetime_token_for_type_annotation_shape() {
+        // Document 6 §5.1's `&'a str` -- single-letter name, the case
+        // that must NOT be mistaken for the char literal `'a'` despite
+        // sharing a one-character identifier, because there's no
+        // second `'` immediately after it here.
+        let (toks, errs) = tokenize("'a str");
+        assert!(errs.is_empty(), "expected no lex errors, got: {:?}", errs);
+        let kinds: Vec<TokenKind> = toks.into_iter().filter(|t| t.kind != TokenKind::Eof).map(|t| t.kind).collect();
+        assert_eq!(kinds[0], TokenKind::Lifetime("a".into()));
     }
 
     #[test]

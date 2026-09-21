@@ -278,6 +278,13 @@ pub enum TokenKind {
     Str(String),
     RawStr(String),
     Char(String),
+    /// `'ident` — a lifetime or loop-label token (Document 6 §5.1's
+    /// `&'a str`, Document 9 §3.5's `label ::= "'" IDENT ":"`). Stores
+    /// just the bare name, no leading quote — unlike `Char`, which
+    /// keeps its surrounding quotes for historical/compatibility
+    /// reasons (see `lexer::lex_char`'s doc comment for the
+    /// char-vs-lifetime disambiguation rule).
+    Lifetime(String),
     Bool(bool),
     Null,
     DocComment(String),

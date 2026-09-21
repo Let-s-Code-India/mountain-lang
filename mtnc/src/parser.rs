@@ -87,6 +87,18 @@ impl Parser {
         matches!(self.peek_kind(), TokenKind::Ident(_))
     }
 
+    /// Consumes a bare `'name` label token if present (used after
+    /// `break`/`continue`, Document 9 §3.5), returning its name.
+    /// Unlike the loop-prefix case, no trailing `:` is expected here.
+    fn eat_label(&mut self) -> Option<String> {
+        if let TokenKind::Lifetime(name) = self.peek_kind().clone() {
+            self.advance();
+            Some(name)
+        } else {
+            None
+        }
+    }
+
     fn eat_kw(&mut self, kw: Keyword) -> bool {
         if self.check_kw(kw) { self.advance(); true } else { false }
     }
@@ -350,6 +362,22 @@ impl Parser {
         let mut params = Vec::new();
         loop {
             if self.check_op(Op::Gt) { break; }
+            if let TokenKind::Lifetime(_) = self.peek_kind() {
+                // Document 6 §5.1's `fn longest<'a>(...)` -- a lifetime
+                // generic parameter. `GenericParam` has no lifetime
+                // variant (named lifetimes aren't tracked as a distinct
+                // kind of generic anywhere in this implementation --
+                // Document 6's own scope through Phase 6/11 treats
+                // every lifetime as structurally inert, matching
+                // `Type::Ref.lifetime` being stored but never consulted
+                // semantically), so this is consumed and intentionally
+                // dropped rather than added to `params` -- purely so
+                // the syntax parses instead of erroring, not a claim
+                // that lifetime bounds are checked.
+                self.advance();
+                if !self.eat_delim(Delim::Comma) { break; }
+                continue;
+            }
             if self.eat_kw(Keyword::Const) {
                 let name = self.expect_word()?;
                 self.expect_delim(Delim::Colon)?;
@@ -924,11 +952,26 @@ impl Parser {
             return Ok(Type::Array(Box::new(elem), size));
         }
         if self.eat_op(Op::Amp) {
-            // Lifetimes ('a syntax) aren't separately tokenized by the
-            // Phase 1 lexer (no dedicated lifetime token kind exists
-            // yet — flagged gap, see PROGRESS.md), so `lifetime` is
-            // always None here for now.
-            let lifetime = None;
+            // Document 6 §5.1's `&'a str` -- the lifetime token itself
+            // is optional (bare `&Type` uses elision, Document 6 §5.2).
+            // This was a real, previously-latent gap through Phase 7:
+            // the lexer had no dedicated lifetime token at all, so any
+            // source actually writing `&'a Type` would have hit a hard
+            // lex error on the `'a` (mis-lexed as an unterminated char
+            // literal) well before reaching this function -- not just
+            // silently dropped the name. Fixed at the lexer level
+            // (`lexer::lex_char`'s new char-vs-lifetime disambiguation)
+            // for Phase 8's labeled-loop requirement, which needs the
+            // same token; wired in here too since it's the identical
+            // gap. Named lifetimes are still not tracked semantically
+            // anywhere beyond storing the name (Document 6's own scope
+            // through Phase 6/11 treats them as structurally inert).
+            let lifetime = if let TokenKind::Lifetime(name) = self.peek_kind().clone() {
+                self.advance();
+                Some(name)
+            } else {
+                None
+            };
             let mutable = self.eat_kw(Keyword::Mut);
             let inner = self.parse_type()?;
             return Ok(Type::Ref { lifetime, mutable, inner: Box::new(inner) });
@@ -1162,13 +1205,15 @@ impl Parser {
             return Ok(StmtOrTail::Stmt(Stmt::Return(value)));
         }
         if self.eat_kw(Keyword::Break) {
+            let label = self.eat_label();
             let value = if self.check_delim(Delim::Semi) { None } else { Some(self.parse_expr(0)?) };
             self.expect_delim(Delim::Semi)?;
-            return Ok(StmtOrTail::Stmt(Stmt::Break { label: None, value }));
+            return Ok(StmtOrTail::Stmt(Stmt::Break { label, value }));
         }
         if self.eat_kw(Keyword::Continue) {
+            let label = self.eat_label();
             self.expect_delim(Delim::Semi)?;
-            return Ok(StmtOrTail::Stmt(Stmt::Continue { label: None }));
+            return Ok(StmtOrTail::Stmt(Stmt::Continue { label }));
         }
         if self.check_kw(Keyword::Yield) {
             self.advance();
@@ -1400,6 +1445,32 @@ impl Parser {
         if self.check_kw(Keyword::Loop) || self.check_kw(Keyword::While)
             || self.check_kw(Keyword::For) || self.check_kw(Keyword::Do) {
             return Ok(Expr::Loop(Box::new(self.parse_loop_expr()?)));
+        }
+        // Document 9 §3.5: `'outer: for ... { ... }` -- a label prefix
+        // before any of the four loop forms. Checked as its own
+        // dispatch branch (rather than folded into `parse_loop_expr`)
+        // since the label token appears BEFORE the loop keyword itself
+        // and every loop form shares the same prefix grammar.
+        if matches!(self.peek_kind(), TokenKind::Lifetime(_))
+            && matches!(self.peek_at(1), TokenKind::Delim(Delim::Colon)) {
+            let label = self.eat_label();
+            self.expect_delim(Delim::Colon)?;
+            let mut loop_expr = self.parse_loop_expr()?;
+            match &mut loop_expr {
+                LoopExpr::Loop { label: l, .. }
+                | LoopExpr::While { label: l, .. }
+                | LoopExpr::For { label: l, .. } => *l = label,
+                // `do`/`while` has no label slot in the AST (Document 9
+                // never shows a labeled do-while example either) --
+                // scoped out rather than adding an AST field for an
+                // undemonstrated case; the label is still parsed
+                // (so `'x: do { ... } while (c);` doesn't error) but
+                // silently has no effect, same principle as this
+                // project's existing "parsed but semantically inert"
+                // treatment of lifetime annotations elsewhere.
+                LoopExpr::DoWhile { .. } => {}
+            }
+            return Ok(Expr::Loop(Box::new(loop_expr)));
         }
         if self.check_kw(Keyword::Spawn) {
             self.advance();

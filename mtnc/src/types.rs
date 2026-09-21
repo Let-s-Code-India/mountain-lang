@@ -368,6 +368,15 @@ pub struct TypeChecker {
     functions: HashMap<String, FunctionShape>,
     traits: HashMap<String, TraitShape>,
     impls_by_type: HashMap<String, Vec<ImplRecord>>,
+    /// Stack of currently-enclosing loops (Phase 8, Document 9 §3.5),
+    /// innermost last. Replaces an earlier draft that walked each
+    /// `loop`'s body twice (once to collect `break <value>;` types,
+    /// once normally) -- which would have reported any real type error
+    /// inside a break-value expression twice over. This single-pass
+    /// design has `check_stmt`'s `Break` handling record a break's
+    /// checked value type directly into its target frame as it's
+    /// encountered during the ONE normal walk, via `find_loop_frame`.
+    loop_frames: Vec<LoopFrame>,
     pub errors: Vec<TypeError>,
 }
 
@@ -407,6 +416,17 @@ impl Env {
     }
 }
 
+/// One entry in `TypeChecker::loop_frames` — Phase 8.
+struct LoopFrame {
+    label: Option<String>,
+    /// Only `LoopExpr::Loop` collects break values (Document 9 §3.1:
+    /// only `loop` can be an expression) -- `while`/`for`/`do-while`
+    /// still push a frame (so `break`/`continue` inside them resolves
+    /// correctly), just never accumulate into `break_types`.
+    collects_breaks: bool,
+    break_types: Vec<Ty>,
+}
+
 impl TypeChecker {
     pub fn new() -> Self {
         TypeChecker {
@@ -415,6 +435,7 @@ impl TypeChecker {
             functions: HashMap::new(),
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
+            loop_frames: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -807,13 +828,88 @@ impl TypeChecker {
             Stmt::Expr(e) => {
                 self.check_expr(e, None, env, ctx);
             }
-            Stmt::Return(_) | Stmt::Item(_) | Stmt::Break { .. }
-            | Stmt::Continue { .. } | Stmt::Yield(_) | Stmt::TargetBlock(..) => {
-                // Return-value-vs-fn-return-type checking, nested items,
-                // and loop control-flow aren't part of Phase 3's core
-                // scope (Document 25 §2.3 scopes this phase to the type
-                // system + struct/enum data shapes); not silently
-                // "checked and passed" -- simply not yet visited.
+            Stmt::Return(inner) => {
+                // Cross-checking against the enclosing function's
+                // declared return type still isn't done (would need
+                // that type threaded into every `check_block`/
+                // `check_stmt` call, a broader change than Phase 8's
+                // control-flow scope) -- flagged, unchanged from
+                // before. What Phase 8 *does* fix: the returned
+                // expression itself is now actually walked, so a type
+                // error inside `return expr;` is caught instead of
+                // silently skipped (previously this whole statement
+                // was a no-op).
+                if let Some(e) = inner {
+                    self.check_expr(e, None, env, ctx);
+                }
+            }
+            Stmt::Yield(e) => {
+                self.check_expr(e, None, env, ctx);
+            }
+            Stmt::Break { label, value } => {
+                let target = self.find_loop_frame(label, ctx);
+                let bty = value.as_ref().map(|e| self.check_expr(e, None, env, ctx));
+                if let (Some(idx), Some(ty)) = (target, bty) {
+                    if self.loop_frames[idx].collects_breaks {
+                        self.loop_frames[idx].break_types.push(ty);
+                    }
+                }
+            }
+            Stmt::Continue { label } => {
+                self.find_loop_frame(label, ctx);
+            }
+            Stmt::TargetBlock(_, block) => {
+                // Document 2 §8's `#target(native|wasm|all) { .. }`
+                // directive blocks weren't walked into at all before
+                // (an orthogonal, incidental gap noticed and fixed
+                // here alongside Phase 8's control-flow work, since
+                // it's the same match arm and a one-line fix -- not
+                // itself Phase 8 scope, called out separately in
+                // PROGRESS.md rather than silently folded in).
+                self.check_block(block, env, None, ctx);
+            }
+            Stmt::Item(_) => {
+                // Nested item declarations (a `fn`/`struct`/etc.
+                // declared inside a block) still aren't registered or
+                // checked -- would need a real nested-registration
+                // pass, out of scope here, unchanged from before.
+            }
+        }
+    }
+
+    /// Document 9 §3.5: resolves a `break`/`continue`'s optional label
+    /// to the index of its target frame in `loop_frames` (searching the
+    /// whole stack, not just the innermost entry, so a label naming an
+    /// OUTER loop from inside a nested one still resolves correctly);
+    /// `None` label targets the innermost frame unconditionally.
+    /// Reports an error (label doesn't name any enclosing loop; or bare
+    /// `break`/`continue` with no enclosing loop at all) and returns
+    /// `None` when nothing valid is found.
+    fn find_loop_frame(&mut self, label: &Option<String>, ctx: &str) -> Option<usize> {
+        match label {
+            Some(name) => {
+                let found = self.loop_frames.iter().rposition(|f| f.label.as_deref() == Some(name.as_str()));
+                if found.is_none() {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "label `'{}'` does not name an enclosing loop (Document 9 §3.5)",
+                            name
+                        ),
+                        context: ctx.into(),
+                    });
+                }
+                found
+            }
+            None => {
+                if self.loop_frames.is_empty() {
+                    self.errors.push(TypeError {
+                        message: "`break`/`continue` outside of any loop".into(),
+                        context: ctx.into(),
+                    });
+                    None
+                } else {
+                    Some(self.loop_frames.len() - 1)
+                }
             }
         }
     }
@@ -1241,10 +1337,108 @@ impl TypeChecker {
                 }
                 expected.cloned().unwrap_or(Ty::Unit)
             }
-            Expr::Loop(_) | Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_)
+            Expr::Loop(loop_expr) => self.check_loop(loop_expr, expected, env, ctx),
+            Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_)
             | Expr::TryCatch { .. } | Expr::Styled { .. } | Expr::Layout { .. }
             | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => {
                 expected.cloned().unwrap_or(Ty::Unit)
+            }
+        }
+    }
+
+    /// Phase 8 (Document 9 §3): full loop-form type-checking. Prior to
+    /// this phase `Expr::Loop` was entirely unchecked -- a loop body's
+    /// contents (and everything nested inside it) were silently never
+    /// visited by the type checker at all, regardless of loop form.
+    fn check_loop(&mut self, loop_expr: &LoopExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        match loop_expr {
+            LoopExpr::Loop { label, body } => {
+                // Document 9 §3.1: `loop` is the one form that can
+                // produce a value, via `break <value>;` — its overall
+                // type is the common type of every `break <value>;`
+                // that targets THIS loop specifically (Rule 5's "no
+                // cross-branch guessing" applies here exactly as it
+                // does to `match` arms: incompatible break-value types
+                // are a compile error, not unioned). Collected via
+                // `loop_frames` as `check_block` runs its one, normal
+                // pass over `body` below — not a separate pre-pass, so
+                // a type error inside a `break <value>;` expression is
+                // reported exactly once, not twice.
+                self.loop_frames.push(LoopFrame { label: label.clone(), collects_breaks: true, break_types: Vec::new() });
+                env.push();
+                self.check_block(body, env, None, ctx);
+                env.pop();
+                let frame = self.loop_frames.pop().unwrap();
+                let mut common = expected.cloned();
+                for bty in frame.break_types {
+                    match &common {
+                        Some(c) if *c != bty => {
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "`loop`'s `break` values have incompatible types: `{}` and `{}` (Document 5 rule 5, applied to Document 9 §3.1's loop-as-expression form)",
+                                    c, bty
+                                ),
+                                context: ctx.into(),
+                            });
+                        }
+                        None => common = Some(bty),
+                        _ => {}
+                    }
+                }
+                common.unwrap_or(Ty::Unit)
+            }
+            LoopExpr::While { label, cond, body } => {
+                self.check_expr(cond, Some(&Ty::Bool), env, ctx);
+                self.loop_frames.push(LoopFrame { label: label.clone(), collects_breaks: false, break_types: Vec::new() });
+                env.push();
+                self.check_block(body, env, None, ctx);
+                env.pop();
+                self.loop_frames.pop();
+                Ty::Unit
+            }
+            LoopExpr::For { label, pattern, iter, body } => {
+                let iter_ty = self.check_expr(iter, None, env, ctx);
+                self.loop_frames.push(LoopFrame { label: label.clone(), collects_breaks: false, break_types: Vec::new() });
+                env.push();
+                // Element-type inference is limited to what's directly
+                // determinable without a real `Iterable` trait (that's
+                // Document 16/Phase 16's `collections::iterator`, not
+                // built yet): `[T]`/`[T; N]` unwrap to `T`; anything
+                // else (including a `Range`, whose own `check_expr`
+                // already returns the bare element type directly, e.g.
+                // `0..10` checks as `i32` already, not a wrapped
+                // "Range<i32>") is used as-is. This covers Document 9
+                // §3.3's own two examples (`for i in 0..10`, and
+                // element access via `collection.enumerate()`-style
+                // iteration) without inventing a full trait-resolution
+                // pass; anything genuinely needing `Iterable` dispatch
+                // to know its element type is a documented gap, not a
+                // silent wrong answer -- see PROGRESS.md.
+                let elem_ty = match &iter_ty {
+                    Ty::Array(elem) => (**elem).clone(),
+                    other => other.clone(),
+                };
+                if let Pattern::Ident(name) | Pattern::Mut(name) = pattern {
+                    env.insert(name.clone(), elem_ty);
+                }
+                self.check_block(body, env, None, ctx);
+                env.pop();
+                self.loop_frames.pop();
+                Ty::Unit
+            }
+            LoopExpr::DoWhile { body, cond } => {
+                // No label slot on `DoWhile` at all (see the parser's
+                // own note where labels are wired up) -- still pushes
+                // a frame (label `None`) so an unlabeled `break`/
+                // `continue` inside it is recognized as being inside
+                // *some* loop.
+                self.loop_frames.push(LoopFrame { label: None, collects_breaks: false, break_types: Vec::new() });
+                env.push();
+                self.check_block(body, env, None, ctx);
+                env.pop();
+                self.check_expr(cond, Some(&Ty::Bool), env, ctx);
+                self.loop_frames.pop();
+                Ty::Unit
             }
         }
     }
@@ -1492,7 +1686,23 @@ impl TypeChecker {
     }
 
     fn check_match(&mut self, match_expr: &MatchExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
-        self.check_expr(&match_expr.scrutinee, None, env, ctx);
+        let scrutinee_ty = self.check_expr(&match_expr.scrutinee, None, env, ctx);
+        // Phase 8 (Document 9 §2.5 / Document 17 §4.5): real
+        // pattern-matrix exhaustiveness checking, not a heuristic --
+        // see `exhaustive.rs`'s module doc for the algorithm and its
+        // scope. `enum_table` is rebuilt from `self.enums` each call
+        // rather than cached: enum counts are small, this keeps
+        // `exhaustive.rs` fully decoupled from `EnumShape`'s own
+        // layout, and `check_match` isn't a hot path relative to the
+        // rest of type-checking.
+        let enum_table: crate::exhaustive::EnumTable = self
+            .enums
+            .iter()
+            .map(|(name, shape)| (name.clone(), shape.variants.as_slice()))
+            .collect();
+        if let Err(message) = crate::exhaustive::check_exhaustiveness(&scrutinee_ty, &match_expr.arms, &enum_table) {
+            self.errors.push(TypeError { message, context: ctx.into() });
+        }
         let mut common: Option<Ty> = expected.cloned();
         for arm in &match_expr.arms {
             env.push();
