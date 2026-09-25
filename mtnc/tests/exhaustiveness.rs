@@ -288,3 +288,69 @@ fn nested_enum_missing_one_case_is_non_exhaustive() {
         "#,
     );
 }
+
+// ============================================================
+// Proactive fix, per the explicit instruction to check whether the
+// same class of issue affects exhaustiveness anywhere else: the bug
+// causing the tuple-pattern failure above (`full_signature` not
+// recognizing a single-constructor product type as complete) turned
+// out to affect tuple STRUCTS identically -- Document 9 §2.4's OTHER
+// worked example (`struct Point(f64, f64);` with three arms, the last
+// a bare `Point(x, y)` catch-all) has the exact same shape and would
+// have failed the exact same way before this fix. Not previously
+// covered by any test in this file; added here specifically because
+// checking for this was asked for, not discovered independently.
+// ============================================================
+
+#[test]
+fn doc9_s2_4_point_tuple_struct_with_final_catchall_exhaustive() {
+    assert_exhaustive(
+        r#"
+        struct Point(f64, f64);
+        fn describe(point: Point) {
+            match point {
+                Point(0.0, 0.0) => 1,
+                Point(x, 0.0) => 2,
+                Point(x, y) => 3,
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
+fn point_tuple_struct_missing_final_catchall_is_non_exhaustive() {
+    assert_non_exhaustive(
+        r#"
+        struct Point(f64, f64);
+        fn describe(point: Point) {
+            match point {
+                Point(0.0, 0.0) => 1,
+                Point(x, 0.0) => 2,
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
+fn tuple_containing_enum_with_wildcard_catchall_exhaustive() {
+    // A deeper combination than either fixed case alone: a tuple whose
+    // OWN element is an enum, with only one specific-variant arm plus
+    // a fully-wildcard catch-all tuple arm -- exercises `Ctor::Tuple`
+    // specialization feeding into a NESTED enum-variant sub-column,
+    // rather than either shape in isolation.
+    let src = format!(
+        r#"
+        {http_method}
+        fn handle(httpMethod: HttpMethod, flag: bool) {{
+            match (httpMethod, flag) {{
+                (HttpMethod::Get, true) => 1,
+                (x, y) => 2,
+            }}
+        }}
+        "#,
+        http_method = HTTP_METHOD
+    );
+    assert_exhaustive(&src);
+}
