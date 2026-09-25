@@ -1653,7 +1653,116 @@ fixed (move-vs-active-borrow) — all three documented in `borrow.rs`
 itself and above, not left implicit.
 
 ## Phase 8 — Full Control Flow
-**Status: 🟡 Implemented, hand-traced, ⏳ pending real `cargo test`/CI confirmation** (no cargo/rustc in this environment, same as every phase)
+**Status: 🟡 First CI round: 1 real failure found and fixed at the root, plus one additional, proactively-identified instance of the same bug — ⏳ pending re-confirmation** (no cargo/rustc in this environment, same as every phase)
+
+**Real CI result, round 1:** `borrow_checks` (19), `closures` (10),
+`control_flow` (10) all green; `exhaustiveness` reported **13
+passed, 1 failed** (`doc9_s2_4_tuple_pattern_with_final_catchall_exhaustive`)
+before `cargo test`'s default fail-fast stopped the remaining targets
+— **not a sign of additional problems, just genuinely unconfirmed**
+until this round is repushed. `--no-fail-fast` added to
+`ci.yml` permanently (see below) so every future round gets full
+results in one pass rather than needing to fix-and-repush
+target-by-target.
+
+### The bug, traced in the actual code before touching anything
+Failing source — Document 9 §2.4's own canonical example:
+```mtn
+match pair {
+    (0, 0) => 1,
+    (x, y) if x == y => 2,
+    (x, y) => 3,
+}
+```
+Genuinely exhaustive (the final bare `(x, y)` matches everything), but
+reported non-exhaustive. Traced `is_useful`/`full_signature` against
+this exact input by hand before forming any hypothesis: the guard
+exclusion itself (`check_exhaustiveness` skipping the middle arm
+entirely) was confirmed correct in isolation — the middle arm
+contributes zero rows regardless, exactly as it should. **The real
+bug: `full_signature` had no case for `Ty::Tuple` at all**, so a tuple
+scrutinee always fell through to "not enumerable," which routes
+through the default-matrix path. But `(x, y)` — even with every
+sub-pattern a wildcard — lowers to `Ctor(Tuple, [Wildcard, Wildcard])`,
+never to a bare `CtorPat::Wildcard`; the default-matrix path only ever
+picks up rows that ARE literally `Wildcard`. So the all-wildcard tuple
+catch-all could never be recognized as covering anything, regardless
+of what the guarded arm did or didn't do — the mechanism the review
+hypothesized (a guarded row incorrectly marking its shape as "handled")
+was a reasonable place to look but wasn't what was actually happening;
+the guard-handling code path was never reached for this failure at
+all, since the bug was one level up, in how tuples were (not) recognized
+as a complete-signature type in the first place.
+
+### Fixed generally, not patched for this one shape
+Added `Ty::Tuple(_) => Some(vec![Ctor::Tuple])` to `full_signature`, so
+a tuple's single, always-present constructor now goes through the
+*real* constructor-specialization path (the one already proven correct
+by the other 13 tests for enums/bool/Option/Result) instead of the
+infinite-domain fallback. Verified by hand-tracing the fix against the
+exact failing input: now correctly reports exhaustive.
+
+### Checked for the same class of issue elsewhere, as asked — found one more real instance, fixed proactively
+A tuple is a single-constructor product type; the same "no `Some(..)`
+case in `full_signature`" gap applied identically to **tuple structs**
+— Document 9 §2.4's *other* worked example in the same section
+(`struct Point(f64, f64);` with a final bare `Point(x, y)` catch-all)
+has the exact same shape and would have failed the exact same way,
+untested until checked for specifically. Fixed alongside the tuple fix:
+`full_signature`/`field_types` now also recognize a registered tuple
+struct's single constructor as complete, via a new `Ctx::struct_fields`
+lookup sourced from `types.rs`'s existing `self.structs` registry
+(mirroring how `self.enums` already feeds `EnumTable`) — plumbed
+through as a new `StructTable` parameter to `check_exhaustiveness`.
+Named-field structs are structurally unaffected either way, since
+`Pattern` has no variant for destructuring one at all.
+
+Also traced (not just asserted) a deeper combination — a tuple whose
+element is itself an enum, with one specific-variant arm plus a
+fully-wildcard catch-all (`match (httpMethod, flag) { (HttpMethod::Get,
+true) => .., (x, y) => .. }`) — by hand, through the full recursive
+specialization across both the `Tuple` and nested `HttpMethod`
+constructor sets, confirming the fix composes correctly under nesting,
+not just at the top level.
+
+**A real lifetime bug caught in this fix's own first draft, before
+compiling anything:** `StructTable` was initially typed as
+`HashMap<String, &'a [Ty]>` (mirroring `EnumTable`), but unlike
+`EnumShape.variants` (which already exists as a persistent
+`Vec<(String, Vec<Ty>)>` field `EnumTable` can borrow a slice from
+directly), a struct's field TYPES have to be freshly extracted from
+`StructShape.fields`'s `(name, Ty)` pairs — an unavoidable allocation.
+Borrowing a slice from that freshly-built, function-local `Vec` would
+have been a dangling reference the moment the building closure
+returned. Caught by re-reading the draft before it was ever compiled;
+fixed by making `StructTable` own its data (`HashMap<String, Vec<Ty>>`)
+instead of borrowing, since there was no actual need for
+`EnumTable`-style zero-copy borrowing here in the first place.
+
+**Verified no regression:** re-traced all 13 previously-passing tests
+against the fix by inspection — none reference `Ty::Tuple` or an
+unregistered-as-enum `Ty::Named` type at any point `full_signature` is
+consulted, so the fix is additive and isolated to the cases it's meant
+to correct.
+
+### Tests added (net +3, `tests/exhaustiveness.rs` now 17)
+- `doc9_s2_4_point_tuple_struct_with_final_catchall_exhaustive` +
+  `point_tuple_struct_missing_final_catchall_is_non_exhaustive` — the
+  proactively-found Point case, both directions, so this doesn't stay
+  a silent fix.
+- `tuple_containing_enum_with_wildcard_catchall_exhaustive` — the
+  nested-combination confidence check described above.
+- The original failing test (`doc9_s2_4_tuple_pattern_with_final_catchall_exhaustive`)
+  is unchanged — it was a correct test catching a real bug, not a test
+  that needed fixing.
+
+`.github/workflows/ci.yml` also got `--no-fail-fast` added to the test
+step permanently, so a future failure anywhere doesn't hide results
+from every target after it — see the "How to verify" and "Predicted
+test counts" sections at the end of this Phase 8 entry for the current,
+consolidated numbers and re-verification instructions (this correction
+section only covers what changed in this round; the original write-up
+immediately below is otherwise unchanged from before CI ran).
 
 Scope per Document 25 §2.3: `if`/`match` exhaustiveness via real
 pattern-matrix decomposition (Document 9 §2.5, Document 17 §4.5's
@@ -1885,34 +1994,36 @@ out the case where the first passes for the wrong reason (e.g. if
 `yield` somehow reset the aliasing table).
 
 ### `.github/workflows/ci.yml`
-No changes needed — picks up all five new/extended test files
-automatically.
+No changes needed here specifically — the `--no-fail-fast` addition is
+covered in the correction section at the top of this Phase 8 entry.
 
-### Predicted test counts (real counts required from CI, not this table)
+### Predicted test counts (post-fix; real counts required from CI)
 | Suite | Count | Note |
 |---|---|---|
 | lib (inline) | 60 | 57 confirmed + 3 new lexer tests |
 | borrow_checks | 19 | 17 confirmed + 2 new yield-borrow tests |
 | closures | 10 | unchanged |
-| control_flow | 10 | new |
-| exhaustiveness | 14 | new |
-| generators | 5 | new |
-| generics | 12 | unchanged |
-| integration | 6 | unchanged |
-| parser_doc24 | 6 | unchanged |
-| traits_impls | 15 | unchanged |
-| types_doc5 | 26 | unchanged |
-| **Total** | **183** | |
+| control_flow | 10 | confirmed green in CI round 1 |
+| exhaustiveness | 17 | **14 confirmed (13 passed/1 failed) → fixed, +3 new tests → 17** |
+| generators | 5 | unconfirmed (fail-fast stopped before this target ran) |
+| generics | 12 | unconfirmed (fail-fast stopped before this target ran) |
+| integration | 6 | unconfirmed (fail-fast stopped before this target ran) |
+| parser_doc24 | 6 | unconfirmed (fail-fast stopped before this target ran) |
+| traits_impls | 15 | unconfirmed (fail-fast stopped before this target ran) |
+| types_doc5 | 26 | unconfirmed (fail-fast stopped before this target ran) |
+| **Total** | **186** | |
 
 ### How to verify (no cargo/rustc/network here)
-Push and check the Actions log. Expect `cargo build --verbose` clean (0
-warnings — this phase touched `lexer.rs`/`parser.rs`/`types.rs`
-directly, higher regression surface than Phase 6/7's mostly-additive
-changes, so watch this closely), `cargo test --verbose` showing
-**183/183** if every hand-trace in this report was correct, with the
-pre-existing 57(+3) lib tests and all Phase 1–7 external test files'
-counts unchanged (regression check — the lexer/loop-checking changes
-specifically touch code every prior phase's tests already exercise).
+Push and check the Actions log — `--no-fail-fast` is now in `ci.yml`
+(see the correction section above), so this round should cover every
+target in one pass regardless of any individual failure. Expect
+`cargo build --verbose` clean (0 warnings), and `cargo test --verbose`
+showing **186/186**: the 3 previously-confirmed-green suites unchanged
+(borrow_checks 19, closures 10, control_flow 10), `exhaustiveness` now
+at 17/17 (up from the reported 13/14), and the six suites that never
+got to run this round (generators, generics, integration,
+parser_doc24, traits_impls, types_doc5) reporting their real counts
+for the first time.
 
 ### Exit criteria — self-assessment
 > "The exhaustiveness checker must correctly reject every
@@ -1921,23 +2032,22 @@ specifically touch code every prior phase's tests already exercise).
 > every yield point across multiple `.next()` calls, preserving local
 > state correctly between suspensions."
 
-Both hand-traced correct, with a real algorithm (not a heuristic) for
-exhaustiveness and a real, executable lowering+interpreter (not a
-description) for generators, per the standing "implement for real,
-verify via an executable prototype harness" guidance. The
-yield/borrow-checker interaction you specifically flagged was checked
-explicitly, not assumed, with the verification result pinned down by
-two new tests. **Not yet independently confirmed by real CI.** ⏳ One
-foundational, previously-latent gap (no lifetime token at all) was
-found and fixed at the root while pursuing labeled loops specifically;
-three real bugs in this phase's own new code were caught and fixed
-before shipping (exhaustiveness's zero-arity `specialize`, the
-double-pass break-value type-checking, and the wrong-statement-form
-generator-loop detection); one scope cut is flagged (`DoWhile` has no
-label field in the AST). Nothing here required a sign-off-worthy
-interpretive judgment call the way Phase 6's NLL tension did — every
-design decision was grounded directly in a specific Document 6/9/17
-passage or an explicit, stated scope boundary.
+Real CI already found one genuine exhaustiveness bug this hand-trace
+process missed the first time around — Document 9 §2.4's own tuple
+example, reported non-exhaustive when it wasn't — now fixed at the
+root (a missing `Ty::Tuple` case in `full_signature`, not a
+guard-handling bug as first hypothesized) and, per the explicit
+instruction to check for the same class of issue elsewhere, found and
+fixed one more real instance proactively (tuple structs, Document 9
+§2.4's *other* worked example) before it could cause a second,
+separate failure report. The generator lowering+interpreter and the
+yield/borrow-checker interaction are untouched by this fix and remain
+hand-traced-only pending the six suites that haven't run yet in CI.
+**Not yet independently confirmed by real CI.** ⏳ Full accounting of
+every bug found and fixed this phase (lexer, loop type-checking,
+exhaustiveness ×2) is in the correction section at the top of this
+entry and in `exhaustive.rs`'s own doc comments. One scope cut remains
+flagged (`DoWhile` has no label field in the AST).
 
 ## Phases 9–25
 **Status: ⚪ Not started**
