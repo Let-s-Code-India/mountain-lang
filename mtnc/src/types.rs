@@ -1690,17 +1690,27 @@ impl TypeChecker {
         // Phase 8 (Document 9 §2.5 / Document 17 §4.5): real
         // pattern-matrix exhaustiveness checking, not a heuristic --
         // see `exhaustive.rs`'s module doc for the algorithm and its
-        // scope. `enum_table` is rebuilt from `self.enums` each call
-        // rather than cached: enum counts are small, this keeps
-        // `exhaustive.rs` fully decoupled from `EnumShape`'s own
-        // layout, and `check_match` isn't a hot path relative to the
-        // rest of type-checking.
+        // scope. `enum_table`/`struct_table` are rebuilt from
+        // `self.enums`/`self.structs` each call rather than cached:
+        // counts are small, this keeps `exhaustive.rs` fully decoupled
+        // from `EnumShape`/`StructShape`'s own layout, and `check_match`
+        // isn't a hot path relative to the rest of type-checking.
+        // `struct_table` only includes tuple structs (`is_tuple`) --
+        // Document 9 §2.4's own `Point(x, y)` shape -- since a
+        // named-field struct has no corresponding `Pattern` variant to
+        // ever be looked up against anyway.
         let enum_table: crate::exhaustive::EnumTable = self
             .enums
             .iter()
             .map(|(name, shape)| (name.clone(), shape.variants.as_slice()))
             .collect();
-        if let Err(message) = crate::exhaustive::check_exhaustiveness(&scrutinee_ty, &match_expr.arms, &enum_table) {
+        let struct_table: crate::exhaustive::StructTable = self
+            .structs
+            .iter()
+            .filter(|(_, shape)| shape.is_tuple)
+            .map(|(name, shape)| (name.clone(), shape.fields.iter().map(|(_, ty)| ty.clone()).collect()))
+            .collect();
+        if let Err(message) = crate::exhaustive::check_exhaustiveness(&scrutinee_ty, &match_expr.arms, &enum_table, &struct_table) {
             self.errors.push(TypeError { message, context: ctx.into() });
         }
         let mut common: Option<Ty> = expected.cloned();

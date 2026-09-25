@@ -79,6 +79,23 @@ use std::collections::HashMap;
 /// about `EnumShape` itself (kept to the one thing actually used).
 pub type EnumTable<'a> = HashMap<String, &'a [(String, Vec<Ty>)]>;
 
+/// Tuple-struct registry: struct name -> field types, in declared
+/// order (`types::StructShape.fields`' types only, filtered to
+/// `is_tuple` structs by the caller -- a named-field struct has no
+/// corresponding `Pattern` variant to match against at all, so it
+/// would never be looked up here anyway, but the caller filters it out
+/// explicitly rather than relying on that). Owned (`Vec<Ty>`), not
+/// borrowed like `EnumTable`: a struct's field types have to be
+/// extracted from `StructShape.fields`' `(name, Ty)` pairs into a
+/// types-only list, which is a real allocation regardless -- there's
+/// no pre-existing `Vec<Ty>`-shaped field to borrow a slice from the
+/// way `EnumShape.variants` already matches `EnumTable`'s shape
+/// exactly. (A first draft tried `&'a [Ty]` here anyway, which would
+/// have borrowed from a temporary `Vec` dropped at the end of the
+/// `.map()` closure that builds the table -- a dangling reference,
+/// caught before it was ever compiled, not after.)
+pub type StructTable = HashMap<String, Vec<Ty>>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Ctor {
     /// A named variant (user enum, or synthetic `Some`/`None`/`Ok`/`Err`).
@@ -103,6 +120,7 @@ enum CtorPat {
 
 struct Ctx<'a> {
     enums: &'a EnumTable<'a>,
+    structs: &'a StructTable,
 }
 
 impl<'a> Ctx<'a> {
@@ -126,13 +144,37 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// A tuple STRUCT's single constructor (Document 9 §2.4's own
+    /// `struct Point(f64, f64);` example): its field types, keyed by
+    /// the struct's own type name -- a `Pattern::TupleStruct` over it
+    /// (`Point(x, y)`) writes exactly that name as its "constructor",
+    /// not a variant of it, since a struct has exactly one shape.
+    /// `None` for anything that isn't a registered tuple struct
+    /// (including a named-field struct, which has no corresponding
+    /// `Pattern` variant to ever reach this at all).
+    fn struct_fields(&self, ty: &Ty) -> Option<(String, Vec<Ty>)> {
+        match ty {
+            Ty::Named(name) => self.structs.get(name).map(|tys| (name.clone(), tys.to_vec())),
+            _ => None,
+        }
+    }
+
     fn field_types(&self, ty: &Ty, ctor: &Ctor) -> Vec<Ty> {
         match ctor {
-            Ctor::Variant(name) => self
-                .variants_of(ty)
-                .and_then(|vs| vs.into_iter().find(|(n, _)| n == name))
-                .map(|(_, tys)| tys)
-                .unwrap_or_default(),
+            Ctor::Variant(name) => {
+                if let Some(tys) = self
+                    .variants_of(ty)
+                    .and_then(|vs| vs.into_iter().find(|(n, _)| n == name).map(|(_, tys)| tys))
+                {
+                    return tys;
+                }
+                if let Some((sname, tys)) = self.struct_fields(ty) {
+                    if &sname == name {
+                        return tys;
+                    }
+                }
+                vec![]
+            }
             Ctor::Tuple => match ty {
                 Ty::Tuple(tys) => tys.clone(),
                 _ => vec![],
@@ -143,15 +185,49 @@ impl<'a> Ctx<'a> {
 
     /// The full constructor set for `ty`, if -- and only if -- it's
     /// one this module can enumerate completely: `bool`'s two values,
-    /// or an enum's (real or synthetic) full variant list. `None`
-    /// means "not enumerable" (Document 9 §2.2's rule: only a
-    /// wildcard/binding can make a match over such a type exhaustive).
+    /// a tuple's or tuple-struct's single always-present shape, or an
+    /// enum's (real or synthetic) full variant list. `None` means "not
+    /// enumerable" (Document 9 §2.2's rule: only a wildcard/binding can
+    /// make a match over such a type exhaustive).
+    ///
+    /// **Bug fixed here, found via real CI failure on Document 9
+    /// §2.4's own worked example** (`match pair { (0,0)=>.., (x,y) if
+    /// x==y=>.., (x,y)=>.. }`, reported non-exhaustive when it's
+    /// genuinely exhaustive): this function originally had no case for
+    /// `Ty::Tuple` at all, so a tuple scrutinee always fell through to
+    /// "not enumerable" — meaning the algorithm never attempted
+    /// constructor-based specialization for tuples, and instead
+    /// treated the whole match as needing a literal `CtorPat::Wildcard`
+    /// row to be recognized as covered. But a tuple pattern is NEVER
+    /// represented that way even when every one of its sub-patterns is
+    /// a wildcard (`(x, y)` lowers to `Ctor(Tuple, [Wildcard,
+    /// Wildcard])`, not to a bare `Wildcard`) — so the all-wildcard
+    /// catch-all tuple arm could never be recognized as covering
+    /// anything via the default-matrix path, regardless of guards. The
+    /// guard-exclusion logic itself (`check_exhaustiveness` skipping
+    /// guarded arms entirely) was traced and confirmed correct in
+    /// isolation; the bug was entirely in this function not
+    /// recognizing tuples (and, checked for the same class of issue as
+    /// requested, tuple STRUCTS — Document 9 §2.4's other worked
+    /// example, `Point(x, y)` — had the identical gap) as
+    /// single-constructor, always-complete types at all. Fixed by
+    /// giving both their own `Some(..)` case here, so the real
+    /// constructor-specialization path (which already handles nested
+    /// decomposition correctly, as the other 13 tests already showed)
+    /// is used for them instead of the infinite-domain fallback.
     fn full_signature(&self, ty: &Ty) -> Option<Vec<Ctor>> {
         match ty {
             Ty::Bool => Some(vec![Ctor::Bool(true), Ctor::Bool(false)]),
-            _ => self
-                .variants_of(ty)
-                .map(|vs| vs.into_iter().map(|(n, _)| Ctor::Variant(n)).collect()),
+            Ty::Tuple(_) => Some(vec![Ctor::Tuple]),
+            _ => {
+                if let Some(vs) = self.variants_of(ty) {
+                    return Some(vs.into_iter().map(|(n, _)| Ctor::Variant(n)).collect());
+                }
+                if let Some((sname, _)) = self.struct_fields(ty) {
+                    return Some(vec![Ctor::Variant(sname)]);
+                }
+                None
+            }
         }
     }
 }
@@ -207,19 +283,30 @@ fn expand_pattern(ctx: &Ctx, pat: &Pattern, ty: &Ty) -> Vec<CtorPat> {
         }
         Pattern::TupleStruct(name, pats) => {
             let short = name.rsplit("::").next().unwrap_or(name);
-            let (vname, field_tys) = match ctx
+            let (vname, field_tys) = if let Some((vname, field_tys)) = ctx
                 .variants_of(ty)
                 .and_then(|vs| vs.into_iter().find(|(n, _)| n == name || n == short))
             {
-                Some((vname, field_tys)) => (vname, field_tys),
-                // Unknown/unregistered path (e.g. a tuple-struct
-                // pattern over a plain `struct`, which this module
-                // doesn't decompose -- see the module doc's scope
-                // note): treat as opaque-but-real, using the full
-                // written name as its identity so at least repeated
-                // identical patterns are recognized as redundant,
-                // without claiming any completeness.
-                None => (name.clone(), pats.iter().map(|_| Ty::Unit).collect()),
+                (vname, field_tys)
+            } else if let Some((sname, field_tys)) = ctx.struct_fields(ty) {
+                // Document 9 §2.4's own `Point(x, y)` shape: a tuple
+                // struct, not an enum variant -- now uses its real,
+                // registered field types (see `full_signature`'s doc
+                // comment for the bug this fixes) instead of the
+                // Unit-placeholder fallback below, so its constructor
+                // is correctly recognized as complete/decomposable.
+                (sname, field_tys)
+            } else {
+                // Genuinely unknown/unregistered (e.g. a struct this
+                // module has no registration for at all -- shouldn't
+                // normally happen given the caller always builds
+                // `structs` from the same registry `types.rs` itself
+                // uses, but kept as a safe fallback): treat as
+                // opaque-but-real, using the full written name as its
+                // identity so at least repeated identical patterns are
+                // recognized as redundant, without claiming any
+                // completeness.
+                (name.clone(), pats.iter().map(|_| Ty::Unit).collect())
             };
             cartesian_ctor(ctx, Ctor::Variant(vname), pats, &field_tys)
         }
@@ -370,8 +457,9 @@ pub fn check_exhaustiveness(
     scrutinee_ty: &Ty,
     arms: &[MatchArm],
     enums: &EnumTable,
+    structs: &StructTable,
 ) -> Result<(), String> {
-    let ctx = Ctx { enums };
+    let ctx = Ctx { enums, structs };
     let mut rows: Vec<Vec<CtorPat>> = Vec::new();
     for arm in arms {
         if arm.guard.is_some() {
