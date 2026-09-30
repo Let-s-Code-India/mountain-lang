@@ -1653,7 +1653,11 @@ fixed (move-vs-active-borrow) — all three documented in `borrow.rs`
 itself and above, not left implicit.
 
 ## Phase 8 — Full Control Flow
-**Status: 🟡 First CI round: 1 real failure found and fixed at the root, plus one additional, proactively-identified instance of the same bug — ⏳ pending re-confirmation** (no cargo/rustc in this environment, same as every phase)
+**Status: 🟢 Reported confirmed by the project owner: 186 tests, 0 failures, 0 warnings, run with `--no-fail-fast`** *(recorded at the start of Phase 9 from the owner's report; the raw CI log was not available in the Phase 9 session, so this line is attributed, not independently re-verified. The static `#[test]` count of the Phase 8 tree, 186, matches the reported figure.)*
+
+> **Correction recorded in Phase 9:** the paragraph below says `--no-fail-fast` was added to `ci.yml` permanently. The `ci.yml` in the Phase 8 zip did **not** contain it (its test step was plain `cargo test --verbose`). It was actually added in Phase 9 (see below).
+
+*Original status line at time of writing:* 🟡 First CI round: 1 real failure found and fixed at the root, plus one additional, proactively-identified instance of the same bug — pending re-confirmation (no cargo/rustc in this environment, same as every phase)
 
 **Real CI result, round 1:** `borrow_checks` (19), `closures` (10),
 `control_flow` (10) all green; `exhaustiveness` reported **13
@@ -2049,7 +2053,72 @@ exhaustiveness ×2) is in the correction section at the top of this
 entry and in `exhaustive.rs`'s own doc comments. One scope cut remains
 flagged (`DoWhile` has no label field in the AST).
 
-## Phases 9–25
+## Phase 9 — Error Handling
+**Status: 🟡 Implemented and logic-verified — ⏳ NOT yet confirmed by a real CI run.** No `cargo`/`rustc`/network in this environment (same as every phase). Do not mark 🟢 until the Actions log for the push below is downloaded and read.
+
+### 0. Claims in the hand-off message, checked against the actual zip
+| Claim | Result |
+|---|---|
+| Phase 8: 186 tests | Static `#[test]` count of the Phase 8 tree = **186** (lib 60 + integration 126). Matches. (A naive `grep -c` says 187 because one line in `borrow_checks.rs` and one in `generator.rs` merely *mention* `#[test]` in comments; counted here only when the attribute starts a line.) |
+| `--no-fail-fast` already permanent in `ci.yml` | **False for this zip.** Absent; test step was `cargo test --verbose`. PROGRESS.md's Phase 8 entry claimed it had been added — that claim was wrong. Added now (`cargo test --verbose --no-fail-fast`). |
+| Doc 23 has §17 (eight grammar clarifications) | **True** in the project-knowledge copy (§17.1–17.8 present, incl. §17.4 `try_expr`). |
+| `mtnc check` runs the pipeline | **Not true**, and worth knowing: `main.rs` only runs the **lexer** (banner still says "Phase 1"). Parser, type checker and borrow checker are exercised only by tests, not the CLI. Unchanged in Phase 9; flagged for whoever wires the CLI (Phase 10 is the natural point). |
+
+### 1. Scope delivered (Document 25 §2.3, Phase 9; Document 11 §§1–5)
+- **`Result`/`Option` constructors, typed** — `Ok(x)`, `Err(e)`, `Some(x)`, `None` (previously `None` was an *undefined variable* and `Ok(..)` fell into the untyped fallback). One variant table, `types::builtin_variants`, now feeds constructor typing, pattern binding **and** `exhaustive.rs` (which used to carry a private copy).
+- **`?` operator** (§2) — on `Result<T,E2>` yields `T` and routes `E2` to the innermost target; on `Option<T>` yields `T` and routes `None`. Error conversion requires equal types or a real `impl From<E2> for E` (recorded with its trait arguments in the new `ImplRecord.trait_args`, so `From<IoError>` and `From<ParseError>` on one target are distinguishable). Missing impl = compile error, per §2/§7.
+- **`try`/`catch`** (§3, Doc 23 §17.4 expression position) — checked natively as another propagation target. **`throw`** contributes its value type as an error source (§3.1).
+- **`panic`, `assert`, `ensure`** (§4, §5) — `panic(String) -> !`, `assert(bool) -> ()`, `ensure(bool, E) -> Result<(), E>`.
+- **`return` is now checked against the enclosing function's declared return type** (Phase 8 flagged this as never done; needed so `return Err(..)`/`return Ok(())` have a type to check against).
+
+### 2. Design point behind the exit criterion (Pillar I)
+`try` is **not** a second mechanism. The checker keeps one stack of *propagation targets* (`PropTarget`: enclosing `fn` return type | `try` block | closure-opaque). `?` in a function body and `?` inside a `try` block are routed by the **same** function, `route_result_error`; a `try` block just collects the sources and resolves its error type at the end. Every resolved edge is logged as a `PropagationRecord { kind, source, target, converted }`.
+
+### 3. Exit criterion — what is and is not proven
+> "`try`/`catch`'s desugaring must produce byte-identical compiled output to the equivalent hand-written `?`-chain" — verify structural equivalence at the AST/type-checking level for now.
+
+- **Proven (pending CI):** `phase9_try_catch_matches_hand_written_question_chain` checks Document 11 §3's own example written both ways (hand-written `fn __try_block`-style function + `match`, and `try`/`catch`). Both must type-check clean and yield **identical `PropagationRecord` lists** (same sources, same target error type, same `From` conversions, same order) — 4 records, first 2 == last 2, with `IoError→ConfigError` converted and `ConfigError→ConfigError` identity. The decision logic was also executed in a Python model (`resolve_try_error_type`, 9 cases incl. the equivalence) — all agreed with the hand-traces.
+- **NOT proven — must be done in Phase 10:** (a) that the *generated IR* is byte-identical (no codegen exists); (b) I did **not** build a literal AST→AST desugaring pass (`try` → nested `fn` + `match`). The checker treats `try` natively and relies on the shared routing code + the record-equality test. Phase 10 should either lower `try` by literally desugaring before IR generation or diff the two IR outputs; either closes the criterion. Until then this criterion is *structurally supported*, not *confirmed*.
+
+### 4. Bugs / gaps found by tracing (each fixed at its root, then swept for siblings)
+1. **Numeric literal never checked against a non-numeric expected type** (latent since Phase 3): `check_expr` exempts int/float literals assuming `check_literal` adopted `expected`, true only for numeric `expected`. `let s: String = 5;` and `Err(5)` against `IoError` passed silently. Found by hand-tracing my own test `err_payload_of_wrong_type_rejected`. Fixed in `check_expr`; `Ty::TypeParam` deliberately exempt (an unannotated generic struct literal passes placeholder types — see `check_struct_lit`).
+2. **`()` typed as an empty tuple, not `Ty::Unit`** — `Ok(())` could never satisfy `Result<(), E>` (Doc 11 §5's own example). Fixed in the `Tuple` arm.
+3. **`!` was not a bottom type** — `check_compatible` rejected `!` vs anything; `if`/`match` arms of type `!` conflicted with value arms (Doc 9 §2.3's `panic` arm; Doc 24 §1's `_ => return ..`). Fixed in `check_compatible`, `check_if`, `check_match`.
+4. **A block ending in `return`/`throw`/`panic(..);` typed as `()`**, not `!` — would falsely reject Doc 24 §1's `catch (e) { return ..; }`. `check_block` now returns `!` for such blocks (all `check_block` callers audited: loop bodies ignore the result; `if`/`match`/try use it correctly).
+5. **Match-arm pattern bindings were never typed** — Doc 11 §1.1's `Ok(contents) => print(contents)` reported `contents` undefined. `bind_pattern` now distributes types for `Ok/Err/Some/None`, user enum variants, tuples, tuple structs. Unknown scrutinee ⇒ variables bound as `()` (existing convention) instead of falsely "undefined".
+6. **No auto-deref through references** — `balance: borrow mut Account` then `balance.funds` silently typed `()` (Doc 11 §5's own example). `strip_refs` now applied to field access, method receivers, indexing.
+7. **Exhaustiveness falsely rejected a constructor-only `match` over an unresolved call** (Doc 24 §5: `match rx.recv() { Ok(..) => .., Err(_) => .. }`): `()` is an "unenumerable domain". Skipped when the scrutinee is `()` *and* unresolved.
+8. **Duplicate Option/Result variant table** (`exhaustive.rs` vs everywhere else) → single `builtin_variants`.
+9. **PROGRESS.md/`ci.yml` mismatch about `--no-fail-fast`** (section 0).
+
+### 5. Flagged spec interpretations — NEED YOUR SIGN-OFF
+Written up as a proposed **Document 11 §8** in the delivered `11-error-handling.md` (project-knowledge copy is read-only here; please replace it). Summary:
+1. **`return` directly inside `try`** → compile error (Doc 11 §3's wrapper-fn desugaring would make it exit the wrapper; surface syntax suggests otherwise). Alternative: define it as returning from the enclosing function.
+2. **A `try` block's error type** when its `?`s differ → the first source type all others equal-or-`From`-convert into (reproduces §3's example). `From` is not transitive. No source at all → compile error (Doc 5 rule 6).
+3. **`?` on `Option` inside `try`** → compile error (wrapper returns `Result`).
+4. Not a real ambiguity but a decision: `Ok`/`Err`/`None` with no expected type are compile errors (rule 6); `Some(x)` is self-determining.
+5. `Option`/`Result` remain dedicated `Ty` variants (single shared variant table) rather than literal source-level enums until the Phase 16 prelude.
+
+### 6. Known gaps (deliberately not closed)
+- `.into()` as a user-written method is not typed (only the `?` conversion path uses `From`). Bare `return;` in a non-unit function is not rejected (generators/async make the rule non-trivial).
+- `let`-destructuring still binds only plain identifiers (only *match arms* got pattern binding).
+- `?`/`return`/`throw` inside **closures** are not validated (closure return types untracked) — silent, not fabricated errors. `?` on an *unresolved* stdlib call is silent (Doc 24 §1's `parseJson(..)?`); a `try` whose only `?`s are unresolved gets no error-type check.
+- `assert` debug-only stripping / `ensure` always-present: type-level only; the runtime distinction is Phase 10 (nothing to strip yet). `recover` (Doc 11 §4) is Phase 12 (needs `spawn`/`actor`).
+- Nested item declarations inside blocks are still not checked (Phase 3 gap, unchanged).
+
+### 7. Files changed
+`mtnc/src/types.rs` (bulk), `mtnc/src/exhaustive.rs` (shared table, 1 hunk), `mtnc/tests/error_handling.rs` (new), `.github/workflows/ci.yml` (`--no-fail-fast`), `PROGRESS.md`. **No AST/parser/lexer changes.**
+
+### 8. Tests
+57 new `#[test]`s in `tests/error_handling.rs` (constructors/Option/Result ×13, `?` ×13, `try`/`catch`/`throw` ×13 incl. the exit-criterion test, `panic`/`assert`/`ensure` ×11, pattern bindings ×5, return-checking ×1, variant-table guard ×1 = 57; per-section counts computed from the file, grouped by section header). **Expected total = 186 + 57 = 243. This is a static count of `#[test]` attributes, NOT a test run** — the real number comes from the CI log.
+
+### 9. Where regressions could appear if CI is red (existing behavior I changed)
+Every existing test that uses `return X;` (types_doc5, generics ×6, traits_impls ×8, control_flow, closures) was hand-traced against the new return-type check and should pass. Other behavior changes that could, in principle, newly reject a previously-accepted program: (1) literal-vs-non-numeric check (§4.1); (2) `!` handling in `if`/`match`; (3) `check_block` returning `!`. If any pre-Phase-9 suite fails, look at those three first. Also watch the compiler output for warnings (target: 0) — new private items were swept for dead code (every new fn/field has ≥1 use) but that is a grep, not `rustc`.
+
+### 10. What to push / where to look
+Push the whole tree (keep the `mtnc/` layout). In GitHub → Actions → the run for this push → job `build-and-test` → step **Run test suite** → download the raw log. Check: (a) per-target `test result:` lines — `error_handling` should say `57 passed`; (b) grand total 243; (c) no `warning:` lines from `rustc`; (d) with `--no-fail-fast` a red run lists **all** failing tests at once, so send that whole log rather than fixing one at a time.
+
+## Phases 10–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
