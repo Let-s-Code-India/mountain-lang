@@ -30,7 +30,9 @@ jobs:
         run: cargo build --verbose
 
       - name: Run test suite
-        run: cargo test --verbose
+        # --no-fail-fast: one failing test binary must not hide the results
+        # of the remaining ones (every phase gets full results in one run).
+        run: cargo test --verbose --no-fail-fast
 
       - name: Smoke test — mtnc --version
         run: cargo run -- --version
