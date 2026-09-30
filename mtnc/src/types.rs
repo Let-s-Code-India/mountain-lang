@@ -131,6 +131,63 @@ impl std::fmt::Display for Ty {
     }
 }
 
+/// The single source of truth for `Option`/`Result`'s variants
+/// (Document 7 §3.2: both are ordinary two-variant enums). Phase 9:
+/// constructor typing (`Ok(..)`/`Err(..)`/`Some(..)`/`None`), pattern
+/// binding, and `exhaustive.rs`'s constructor sets ALL read this one
+/// table, so the three can never disagree about what an `Option` or
+/// `Result` is made of. (Before Phase 9, `exhaustive.rs` carried its own
+/// private copy.) Returns `None` for any other type.
+pub fn builtin_variants(ty: &Ty) -> std::option::Option<Vec<(&'static str, Vec<Ty>)>> {
+    match ty {
+        Ty::OptionTy(inner) => Some(vec![
+            ("Some", vec![(**inner).clone()]),
+            ("None", vec![]),
+        ]),
+        Ty::ResultTy(ok, err) => Some(vec![
+            ("Ok", vec![(**ok).clone()]),
+            ("Err", vec![(**err).clone()]),
+        ]),
+        _ => None,
+    }
+}
+
+/// Auto-dereferences any number of reference layers (`&T`, `borrow mut
+/// T`) so field access, method resolution and indexing work through a
+/// `borrow`ed parameter (Document 11 §5's `balance: borrow mut Account`
+/// followed by `balance.funds`). Before Phase 9 a `Ty::Ref` receiver
+/// silently fell through to `Ty::Unit`.
+fn strip_refs(t: Ty) -> Ty {
+    match t {
+        Ty::Ref(_, inner) => strip_refs(*inner),
+        other => other,
+    }
+}
+
+/// True if a block can never fall off its end normally: no tail
+/// expression, and its final statement is `return`/`break`/`continue`,
+/// a `throw`, or a call to `panic`. Such a block has type `!`
+/// (Document 5 §2.5) rather than `()`, so e.g. a `catch` block ending in
+/// `return ...;` (Document 24 §1) unifies with the `try` block's value type.
+fn block_diverges(block: &Block) -> bool {
+    if block.tail.is_some() {
+        return false;
+    }
+    match block.stmts.last() {
+        Some(Stmt::Return(_)) | Some(Stmt::Break { .. }) | Some(Stmt::Continue { .. }) => true,
+        Some(Stmt::Expr(e)) => expr_diverges(e),
+        _ => false,
+    }
+}
+
+fn expr_diverges(e: &Expr) -> bool {
+    match e {
+        Expr::Return(_) | Expr::Throw(_) => true,
+        Expr::Call { callee, .. } => matches!(callee.as_ref(), Expr::Ident(n) if n.as_str() == "panic"),
+        _ => false,
+    }
+}
+
 fn ty_is_integer(t: &Ty) -> bool {
     matches!(t, Ty::I8|Ty::I16|Ty::I32|Ty::I64|Ty::I128|Ty::Isize|Ty::U8|Ty::U16|Ty::U32|Ty::U64|Ty::U128|Ty::Usize)
 }
@@ -350,6 +407,12 @@ pub struct TraitShape {
 #[derive(Debug, Clone)]
 pub struct ImplRecord {
     pub trait_name: Option<String>,
+    /// The trait reference's own generic arguments, resolved (Phase 9):
+    /// `impl From<IoError> for AppError` records `[IoError]` here. Needed
+    /// so the `?` operator's `.into()` step (Document 11 §2) can ask "does
+    /// `From<E2> for E` exist" -- `trait_name` alone can't distinguish
+    /// `From<IoError>` from `From<ParseError>` on the same target type.
+    pub trait_args: Vec<Ty>,
     pub methods: HashMap<String, FnSig>,
 }
 
@@ -377,6 +440,16 @@ pub struct TypeChecker {
     /// checked value type directly into its target frame as it's
     /// encountered during the ONE normal walk, via `find_loop_frame`.
     loop_frames: Vec<LoopFrame>,
+    /// Phase 9: stack of propagation targets (see `PropTarget`).
+    prop_targets: Vec<PropTarget>,
+    /// Phase 9: set whenever a call/method/path/field/await fell back to
+    /// the "unresolved, stay silent" result. `check_propagate` consults
+    /// it to tell "`?` applied to an unresolvable stdlib call" (silent)
+    /// from "`?` applied to something genuinely not a Result/Option"
+    /// (a real error).
+    saw_unresolved: bool,
+    /// Phase 9: every resolved propagation edge, in source order.
+    pub propagations: Vec<PropagationRecord>,
     pub errors: Vec<TypeError>,
 }
 
@@ -416,6 +489,72 @@ impl Env {
     }
 }
 
+/// Where a `?`, `throw` or `return` at the current lexical position
+/// sends control (Phase 9, Document 11 §2-§4). A stack, innermost last.
+///
+/// Pillar I design point: a `try` block is NOT a separate error
+/// mechanism -- it is just another `PropTarget` on the SAME stack a
+/// function body uses, and `?` inside it is routed by the SAME
+/// `route_result_error` code that routes `?` in a `fn` body. That shared
+/// code path is what makes the Document 11 §3 desugaring equivalence
+/// structural rather than coincidental.
+enum PropTarget {
+    /// An enclosing `fn` body; holds its declared return type (`()` if
+    /// none was declared).
+    FnRet(Ty),
+    /// A `try { }` block currently being checked (Document 11 §3).
+    Try(TryFrame),
+    /// A closure body: the closure's own return type isn't tracked yet
+    /// (Phase 7 gave closures capture analysis only), so `?`/`return`
+    /// inside one is not validated -- silent, like every other
+    /// unresolved construct in this checker, never a fabricated error.
+    Opaque,
+}
+
+/// Error-propagation facts collected while checking one `try` block.
+struct TryFrame {
+    /// The error type of every `?`-on-`Result` and every `throw` inside
+    /// the block, in source order.
+    err_sources: Vec<Ty>,
+    /// True if a `?` was applied to an expression whose type this
+    /// checker couldn't resolve (stdlib functions before Phase 16, etc.).
+    /// Then "no error sources found" is not evidence the block has none.
+    saw_opaque: bool,
+}
+
+/// Owned snapshot of the top `PropTarget`, so callers can inspect it
+/// and then call `&mut self` methods without holding a borrow.
+enum TargetView {
+    Fn(Ty),
+    Try,
+    Opaque,
+}
+
+/// Which propagation path a `PropagationRecord` describes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropKind {
+    /// `?` on a `Result`: the `Err` value is propagated.
+    ResultErr,
+    /// `?` on an `Option`: `None` is propagated.
+    OptionNone,
+}
+
+/// One resolved error-propagation edge (Phase 9). Recorded identically
+/// for `?` in a `fn` body and for `?`/`throw` inside a `try` block, so
+/// two programs with the same propagation behavior yield equal record
+/// lists -- this is the pre-codegen check for Document 11 §7's
+/// "`try`/`catch` is byte-identical to the hand-written `?`-chain".
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropagationRecord {
+    pub kind: PropKind,
+    /// The error type being propagated (`None` for `OptionNone`).
+    pub source: Option<Ty>,
+    /// The error type it lands in (`None` for `OptionNone`).
+    pub target: Option<Ty>,
+    /// True iff `source != target`, i.e. a `From` conversion runs.
+    pub converted: bool,
+}
+
 /// One entry in `TypeChecker::loop_frames` — Phase 8.
 struct LoopFrame {
     label: Option<String>,
@@ -436,6 +575,9 @@ impl TypeChecker {
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
             loop_frames: Vec::new(),
+            prop_targets: Vec::new(),
+            saw_unresolved: false,
+            propagations: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -697,7 +839,10 @@ impl TypeChecker {
                 }
             }
 
-            self.impls_by_type.entry(target_name).or_default().push(ImplRecord { trait_name, methods });
+            let trait_args: Vec<Ty> = impl_decl.trait_ref.as_ref()
+                .map(|tr| tr.args.iter().map(resolve_type).collect::<Vec<Ty>>())
+                .unwrap_or_default();
+            self.impls_by_type.entry(target_name).or_default().push(ImplRecord { trait_name, trait_args, methods });
         } else if let ItemKind::Mod(m) = &item.kind {
             for inner in &m.items {
                 self.register_impls(inner);
@@ -765,7 +910,11 @@ impl TypeChecker {
             env.insert(p.name.clone(), resolve_with_self(&p.ty));
         }
         let expected_ret = f.return_type.as_ref().map(|t| resolve_with_self(t));
+        // Phase 9: `?`/`return` inside this body propagate to this
+        // function's declared return type (Document 11 §2/§4).
+        self.prop_targets.push(PropTarget::FnRet(expected_ret.clone().unwrap_or(Ty::Unit)));
         self.check_block(body, &mut env, expected_ret.as_ref(), &f.name);
+        self.prop_targets.pop();
     }
 
     fn check_block(&mut self, block: &Block, env: &mut Env, expected_tail: Option<&Ty>, ctx: &str) -> Option<Ty> {
@@ -775,6 +924,10 @@ impl TypeChecker {
         }
         let result = if let Some(tail) = &block.tail {
             Some(self.check_expr(tail, expected_tail, env, ctx))
+        } else if block_diverges(block) {
+            // Phase 9: a block that can't fall through has type `!`
+            // (Document 5 §2.5), not `()`.
+            Some(Ty::Never)
         } else {
             None
         };
@@ -829,19 +982,9 @@ impl TypeChecker {
                 self.check_expr(e, None, env, ctx);
             }
             Stmt::Return(inner) => {
-                // Cross-checking against the enclosing function's
-                // declared return type still isn't done (would need
-                // that type threaded into every `check_block`/
-                // `check_stmt` call, a broader change than Phase 8's
-                // control-flow scope) -- flagged, unchanged from
-                // before. What Phase 8 *does* fix: the returned
-                // expression itself is now actually walked, so a type
-                // error inside `return expr;` is caught instead of
-                // silently skipped (previously this whole statement
-                // was a no-op).
-                if let Some(e) = inner {
-                    self.check_expr(e, None, env, ctx);
-                }
+                // Phase 9: checked against the enclosing function's
+                // declared return type (Phase 8 only walked the value).
+                self.check_return(inner.as_ref(), env, ctx);
             }
             Stmt::Yield(e) => {
                 self.check_expr(e, None, env, ctx);
@@ -963,6 +1106,29 @@ impl TypeChecker {
         ));
         if !self_checking_literal {
             self.check_compatible(&actual, expected, ctx);
+        } else {
+            // Phase 9 fix of a latent Phase 3 hole: the exemption above
+            // assumes `check_literal` already adopted `expected`, which
+            // is only true when `expected` is numeric (int literals
+            // adopt any numeric type, float literals any float type).
+            // For a NON-numeric expected type (`let s: String = 5;`,
+            // `Err(5)` against `Result<_, IoError>`), `check_literal`
+            // just returns `i32`/`f64` and nothing ever reported the
+            // mismatch. `Ty::TypeParam` stays exempt: an unannotated
+            // generic struct literal legitimately passes its field's
+            // placeholder type as `expected` (see `check_struct_lit`).
+            let literal_mismatch = match (expr, expected) {
+                (Expr::Literal(Literal::Int(_) | Literal::IntHex(_) | Literal::IntOct(_) | Literal::IntBin(_)), Some(t)) => {
+                    !matches!(t, Ty::TypeParam(_)) && !ty_is_numeric(t)
+                }
+                (Expr::Literal(Literal::Float(_)), Some(t)) => {
+                    !matches!(t, Ty::TypeParam(_)) && !ty_is_float(t)
+                }
+                _ => false,
+            };
+            if literal_mismatch {
+                self.check_compatible(&actual, expected, ctx);
+            }
         }
         actual
     }
@@ -972,6 +1138,12 @@ impl TypeChecker {
             Expr::Literal(lit) => self.check_literal(lit, expected, ctx),
 
             Expr::Ident(name) => {
+                // Phase 9: `None` (Document 11 §1.2) is a keyword, so it
+                // can never be a local variable -- it is always the
+                // built-in `Option` variant.
+                if name.as_str() == "None" {
+                    return self.check_variant_ctor("None", &[], expected, env, ctx);
+                }
                 if let Some(t) = env.get(name) {
                     t.clone()
                 } else {
@@ -979,6 +1151,9 @@ impl TypeChecker {
                         message: format!("undefined variable `{}`", name),
                         context: ctx.into(),
                     });
+                    // Already reported; don't let a downstream `?` pile a
+                    // second, derived error on top of this one.
+                    self.saw_unresolved = true;
                     expected.cloned().unwrap_or(Ty::Unit)
                 }
             }
@@ -1015,6 +1190,7 @@ impl TypeChecker {
                         }
                     }
                 }
+                self.saw_unresolved = true;
                 expected.cloned().unwrap_or(Ty::Unit) // module/struct-assoc paths: Phase 4+ resolves these fully
             }
 
@@ -1053,6 +1229,14 @@ impl TypeChecker {
                     }
                     Ty::Array(Box::new(first))
                 }
+            }
+
+            Expr::Tuple(items) if items.is_empty() => {
+                // `()` is the unit VALUE (Document 5 §2.5). It parses as
+                // an empty tuple expression, but its type is `Ty::Unit`,
+                // not `Ty::Tuple(vec![])` -- otherwise `Ok(())` could never
+                // satisfy `Result<(), E>` (Document 11 §5's own example).
+                Ty::Unit
             }
 
             Expr::Tuple(items) => {
@@ -1127,7 +1311,7 @@ impl TypeChecker {
                 lt
             }
 
-            Expr::Propagate(inner) => self.check_expr(inner, None, env, ctx),
+            Expr::Propagate(inner) => self.check_propagate(inner, expected, env, ctx),
 
             Expr::Field { expr: inner, name } => {
                 let t = self.check_expr(inner, None, env, ctx);
@@ -1135,7 +1319,7 @@ impl TypeChecker {
             }
 
             Expr::Index { expr: inner, index } => {
-                let t = self.check_expr(inner, None, env, ctx);
+                let t = strip_refs(self.check_expr(inner, None, env, ctx));
                 self.check_expr(index, None, env, ctx);
                 match t {
                     Ty::Array(elem) => *elem,
@@ -1150,6 +1334,23 @@ impl TypeChecker {
             }
 
             Expr::Call { callee, args } => {
+                // Phase 9 (Document 11): the built-in variant constructors
+                // and the error-handling intrinsics. `Ok`/`Err`/`Some` are
+                // keywords and always mean the built-in variants;
+                // `panic`/`assert`/`ensure` yield to a user-declared
+                // function of the same name (they are ordinary prelude
+                // names, not reserved by the grammar).
+                if let Expr::Ident(name) = callee.as_ref() {
+                    match name.as_str() {
+                        "Ok" | "Err" | "Some" => {
+                            return self.check_variant_ctor(name, args, expected, env, ctx);
+                        }
+                        "panic" | "assert" | "ensure" if !self.functions.contains_key(name.as_str()) => {
+                            return self.check_error_intrinsic(name, args, expected, env, ctx);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Expr::Ident(name) = callee.as_ref() {
                     if let Some(shape) = self.functions.get(name).cloned() {
                         if shape.generics.is_empty() {
@@ -1235,11 +1436,12 @@ impl TypeChecker {
                 for arg in args {
                     self.check_expr(&arg.value, None, env, ctx);
                 }
+                self.saw_unresolved = true;
                 expected.cloned().unwrap_or(Ty::Unit)
             }
 
             Expr::MethodCall { receiver, name, args } => {
-                let recv_ty = self.check_expr(receiver, None, env, ctx);
+                let recv_ty = strip_refs(self.check_expr(receiver, None, env, ctx));
                 let sig = self.resolve_method(&recv_ty, name);
                 match sig {
                     Some(sig) => {
@@ -1285,6 +1487,7 @@ impl TypeChecker {
                                 context: ctx.into(),
                             });
                         }
+                        self.saw_unresolved = true;
                         expected.cloned().unwrap_or(Ty::Unit)
                     }
                 }
@@ -1299,15 +1502,30 @@ impl TypeChecker {
                 Ty::Ref(*mutable, Box::new(t))
             }
 
-            Expr::Await(inner) | Expr::Throw(inner) => {
+            Expr::Await(inner) => {
                 self.check_expr(inner, None, env, ctx);
+                // `await`'s result type isn't modeled until Phase 12.
+                self.saw_unresolved = true;
                 expected.cloned().unwrap_or(Ty::Unit)
             }
 
-            Expr::Return(inner) => {
-                if let Some(e) = inner {
-                    self.check_expr(e, None, env, ctx);
+            Expr::Throw(inner) => {
+                // Document 11 §3.1: `throw <value>` inside a `try` block
+                // is `return Err(<value>)` of the implicit wrapper -- so
+                // the value's type is an error source for the block,
+                // exactly like the error type of a `?`.
+                let t = self.check_expr(inner, None, env, ctx);
+                if !self.record_try_source(t) && !self.top_is_opaque() {
+                    self.errors.push(TypeError {
+                        message: "`throw` is only valid inside a `try` block (Document 11 §3.1); outside one, return `Err(..)` instead".into(),
+                        context: ctx.into(),
+                    });
                 }
+                Ty::Never
+            }
+
+            Expr::Return(inner) => {
+                self.check_return(inner.as_deref(), env, ctx);
                 Ty::Never
             }
 
@@ -1331,15 +1549,22 @@ impl TypeChecker {
                         inner_env.insert(n.clone(), ty.as_ref().map(resolve_type).unwrap_or(Ty::Unit));
                     }
                 }
+                // Phase 9: `?`/`return`/`throw` inside a closure body do
+                // not target the enclosing function.
+                self.prop_targets.push(PropTarget::Opaque);
                 match &c.body {
                     ClosureBody::Expr(e) => { self.check_expr(e, None, &mut inner_env, ctx); }
                     ClosureBody::Block(b) => { self.check_block(b, &mut inner_env, None, ctx); }
                 }
+                self.prop_targets.pop();
                 expected.cloned().unwrap_or(Ty::Unit)
             }
             Expr::Loop(loop_expr) => self.check_loop(loop_expr, expected, env, ctx),
+            Expr::TryCatch { try_block, catch_var, catch_block } => {
+                self.check_try_catch(try_block, catch_var, catch_block, expected, env, ctx)
+            }
             Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_)
-            | Expr::TryCatch { .. } | Expr::Styled { .. } | Expr::Layout { .. }
+            | Expr::Styled { .. } | Expr::Layout { .. }
             | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => {
                 expected.cloned().unwrap_or(Ty::Unit)
             }
@@ -1631,6 +1856,12 @@ impl TypeChecker {
     }
 
     fn check_compatible(&mut self, actual: &Ty, expected: Option<&Ty>, ctx: &str) {
+        // `!` (Document 5 §2.5) is the bottom type: an expression that
+        // never produces a value (`panic(..)`, `return ..`, `throw ..`)
+        // is compatible with any expected type.
+        if *actual == Ty::Never {
+            return;
+        }
         if let Some(exp) = expected {
             if actual != exp {
                 self.errors.push(TypeError {
@@ -1646,7 +1877,16 @@ impl TypeChecker {
         let then_ty = self.check_block(&if_expr.then_block, env, expected, ctx).unwrap_or(Ty::Unit);
         match &if_expr.else_branch {
             Some(ElseBranch::Block(b)) => {
-                let else_ty = self.check_block(b, env, Some(&then_ty), ctx).unwrap_or(Ty::Unit);
+                // Phase 9: a diverging (`!`) branch contributes no value,
+                // so it neither constrains nor conflicts with the other.
+                let else_expected = if then_ty == Ty::Never { expected } else { Some(&then_ty) };
+                let else_ty = self.check_block(b, env, else_expected, ctx).unwrap_or(Ty::Unit);
+                if then_ty == Ty::Never {
+                    return else_ty;
+                }
+                if else_ty == Ty::Never {
+                    return then_ty;
+                }
                 // Rule 5: no cross-branch guessing -- both arms of an
                 // if-expression must agree; the compiler never
                 // synthesizes a union/common-supertype.
@@ -1661,7 +1901,14 @@ impl TypeChecker {
                 }
             }
             Some(ElseBranch::If(inner)) => {
-                let else_ty = self.check_if(inner, Some(&then_ty), env, ctx);
+                let else_expected = if then_ty == Ty::Never { expected } else { Some(&then_ty) };
+                let else_ty = self.check_if(inner, else_expected, env, ctx);
+                if then_ty == Ty::Never {
+                    return else_ty;
+                }
+                if else_ty == Ty::Never {
+                    return then_ty;
+                }
                 if else_ty != then_ty {
                     self.errors.push(TypeError {
                         message: format!(
@@ -1686,7 +1933,18 @@ impl TypeChecker {
     }
 
     fn check_match(&mut self, match_expr: &MatchExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let saved_unresolved = std::mem::replace(&mut self.saw_unresolved, false);
         let scrutinee_ty = self.check_expr(&match_expr.scrutinee, None, env, ctx);
+        // Phase 9: a scrutinee whose type could not be resolved (an
+        // unmodeled stdlib call, e.g. Document 24 §5's `match rx.recv()
+        // { Ok(..) => .., Err(_) => .. }`) is typed `()`. To the
+        // exhaustiveness checker `()` is an unenumerable domain, so any
+        // constructor-only match over it would be reported non-exhaustive
+        // -- a false positive on valid code. Skip the check in exactly
+        // that case, the same "unresolved => stay silent" convention used
+        // everywhere else in this checker.
+        let scrutinee_unresolved = scrutinee_ty == Ty::Unit && self.saw_unresolved;
+        self.saw_unresolved = saved_unresolved || self.saw_unresolved;
         // Phase 8 (Document 9 §2.5 / Document 17 §4.5): real
         // pattern-matrix exhaustiveness checking, not a heuristic --
         // see `exhaustive.rs`'s module doc for the algorithm and its
@@ -1710,16 +1968,25 @@ impl TypeChecker {
             .filter(|(_, shape)| shape.is_tuple)
             .map(|(name, shape)| (name.clone(), shape.fields.iter().map(|(_, ty)| ty.clone()).collect()))
             .collect();
-        if let Err(message) = crate::exhaustive::check_exhaustiveness(&scrutinee_ty, &match_expr.arms, &enum_table, &struct_table) {
-            self.errors.push(TypeError { message, context: ctx.into() });
+        if !scrutinee_unresolved {
+            if let Err(message) = crate::exhaustive::check_exhaustiveness(&scrutinee_ty, &match_expr.arms, &enum_table, &struct_table) {
+                self.errors.push(TypeError { message, context: ctx.into() });
+            }
         }
         let mut common: Option<Ty> = expected.cloned();
+        let mut saw_arm = false;
+        let mut all_arms_diverge = true;
         for arm in &match_expr.arms {
             env.push();
-            // Pattern-introduced bindings aren't type-distributed against
-            // the scrutinee's shape yet (needs enum-variant-field lookup
-            // threaded through pattern matching) -- flagged gap, same
-            // category as the `let`-destructuring one above.
+            // Phase 9: pattern-introduced bindings are now distributed
+            // against the scrutinee's type for the shapes Document 11
+            // needs (`Ok(v)`/`Err(e)`/`Some(x)`/`None`) and, by the same
+            // table lookup, user enum variants, tuples and tuple structs
+            // (see `bind_pattern`). `let`-destructuring is still the
+            // Phase 3 gap (only plain identifiers bind there).
+            for pat in &arm.patterns {
+                self.bind_pattern(pat, &scrutinee_ty, env);
+            }
             if let Some(guard) = &arm.guard {
                 self.check_expr(guard, Some(&Ty::Bool), env, ctx);
             }
@@ -1728,6 +1995,14 @@ impl TypeChecker {
                 MatchArmBody::Block(b) => self.check_block(b, env, common.as_ref(), ctx).unwrap_or(Ty::Unit),
             };
             env.pop();
+            saw_arm = true;
+            // Phase 9: an arm of type `!` (`panic(..)`, `return ..`)
+            // contributes no value and can't conflict (Document 9 §2.3's
+            // own `n if n < 0 => panic("invalid age")` example).
+            if arm_ty == Ty::Never {
+                continue;
+            }
+            all_arms_diverge = false;
             match &common {
                 Some(c) if *c != arm_ty => {
                     // Rule 5 again, for `match`: Document 5 §7's own
@@ -1744,6 +2019,9 @@ impl TypeChecker {
                 None => common = Some(arm_ty),
                 _ => {}
             }
+        }
+        if saw_arm && all_arms_diverge && common.is_none() {
+            return Ty::Never;
         }
         common.unwrap_or(Ty::Unit)
     }
@@ -1839,6 +2117,492 @@ impl TypeChecker {
     /// primitives (`impl Comparable for i32` registers under the key
     /// `"i32"`, matching how `parse_type_ref` already lexes primitive
     /// type names as plain identifiers — see Phase 1's design note).
+    // ==================================================================
+    // Phase 9 — Error handling (Document 11)
+    // ==================================================================
+
+    /// Owned snapshot of the innermost propagation target.
+    fn top_target(&self) -> Option<TargetView> {
+        match self.prop_targets.last() {
+            Some(PropTarget::FnRet(t)) => Some(TargetView::Fn(t.clone())),
+            Some(PropTarget::Try(_)) => Some(TargetView::Try),
+            Some(PropTarget::Opaque) => Some(TargetView::Opaque),
+            None => None,
+        }
+    }
+
+    fn top_is_opaque(&self) -> bool {
+        matches!(self.prop_targets.last(), Some(PropTarget::Opaque))
+    }
+
+    /// If the innermost target is a `try` block, records `ty` as one of
+    /// its error sources and returns true; otherwise returns false.
+    fn record_try_source(&mut self, ty: Ty) -> bool {
+        if let Some(PropTarget::Try(frame)) = self.prop_targets.last_mut() {
+            frame.err_sources.push(ty);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mark_try_opaque(&mut self) {
+        if let Some(PropTarget::Try(frame)) = self.prop_targets.last_mut() {
+            frame.saw_opaque = true;
+        }
+    }
+
+    /// Does `impl From<src> for target` exist (Document 3 Category F;
+    /// Document 11 §2)? Identical types always convert (the blanket
+    /// `From<T> for T`), handled by the caller.
+    fn from_impl_exists(&self, src: &Ty, target: &Ty) -> bool {
+        let Some(key) = ty_lookup_name(target) else { return false };
+        self.impls_by_type
+            .get(&key)
+            .map(|impls| {
+                impls.iter().any(|r| {
+                    r.trait_name.as_deref() == Some("From") && r.trait_args.first() == Some(src)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Document 11 §2: `expr?`. On `Result<T, E2>` it evaluates to `T`
+    /// and routes `E2` to the innermost propagation target; on
+    /// `Option<T>` it evaluates to `T` and routes `None`.
+    fn check_propagate(&mut self, inner: &Expr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let saved = std::mem::replace(&mut self.saw_unresolved, false);
+        let operand_ty = self.check_expr(inner, None, env, ctx);
+        let operand_unresolved = self.saw_unresolved;
+        self.saw_unresolved = saved || operand_unresolved;
+        match operand_ty {
+            Ty::ResultTy(ok, err) => {
+                self.route_result_error(&err, ctx);
+                *ok
+            }
+            Ty::OptionTy(some) => {
+                self.route_option_none(ctx);
+                *some
+            }
+            other => {
+                if operand_unresolved {
+                    // Can't tell what the operand is (stdlib call not yet
+                    // modeled) -- stay silent, but remember it so a
+                    // `try` block doesn't wrongly conclude "no errors".
+                    self.mark_try_opaque();
+                } else {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "the `?` operator can only be applied to `Result<_, _>` or `Option<_>`, found `{}` (Document 11 §2)",
+                            other
+                        ),
+                        context: ctx.into(),
+                    });
+                }
+                expected.cloned().unwrap_or(Ty::Unit)
+            }
+        }
+    }
+
+    /// Returns `Some(converted)` if `src` can flow into `target` (equal
+    /// types, or a real `impl From<src> for target`); `None` after
+    /// reporting an error otherwise. Document 11 §2: the conversion is
+    /// "never automatic/implicit type coercion ... always backed by a
+    /// real, developer-written trait implementation".
+    fn check_err_conversion(&mut self, src: &Ty, target: &Ty, ctx: &str) -> Option<bool> {
+        if src == target {
+            return Some(false);
+        }
+        if self.from_impl_exists(src, target) {
+            return Some(true);
+        }
+        self.errors.push(TypeError {
+            message: format!(
+                "`?` cannot convert error type `{}` into `{}`: no `impl From<{}> for {}` exists (Document 11 §2)",
+                src, target, src, target
+            ),
+            context: ctx.into(),
+        });
+        None
+    }
+
+    /// Routes the `Err(E2)` half of `?` to the innermost target. The
+    /// SAME function serves `?` in a `fn` body and `?` in a `try` block
+    /// -- see the `PropTarget` doc comment for why that matters.
+    fn route_result_error(&mut self, err: &Ty, ctx: &str) {
+        match self.top_target() {
+            Some(TargetView::Fn(ret)) => match ret {
+                Ty::ResultTy(_, target_err) => {
+                    if let Some(converted) = self.check_err_conversion(err, &target_err, ctx) {
+                        self.propagations.push(PropagationRecord {
+                            kind: PropKind::ResultErr,
+                            source: Some(err.clone()),
+                            target: Some(*target_err),
+                            converted,
+                        });
+                    }
+                }
+                other => {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "`?` on a `Result` requires the enclosing function to return `Result<_, E>`, but it returns `{}` (Document 11 §2)",
+                            other
+                        ),
+                        context: ctx.into(),
+                    });
+                }
+            },
+            Some(TargetView::Try) => {
+                self.record_try_source(err.clone());
+            }
+            Some(TargetView::Opaque) => {}
+            None => {
+                self.errors.push(TypeError {
+                    message: "`?` used outside any function body".into(),
+                    context: ctx.into(),
+                });
+            }
+        }
+    }
+
+    /// Routes the `None` half of `?` on an `Option`.
+    fn route_option_none(&mut self, ctx: &str) {
+        match self.top_target() {
+            Some(TargetView::Fn(ret)) => {
+                if matches!(ret, Ty::OptionTy(_)) {
+                    self.propagations.push(PropagationRecord {
+                        kind: PropKind::OptionNone,
+                        source: None,
+                        target: None,
+                        converted: false,
+                    });
+                } else {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "`?` on an `Option` requires the enclosing function to return `Option<_>`, but it returns `{}` (Document 11 §2)",
+                            ret
+                        ),
+                        context: ctx.into(),
+                    });
+                }
+            }
+            Some(TargetView::Try) => {
+                self.errors.push(TypeError {
+                    message: "`?` on an `Option` inside a `try` block is not supported: the block's implicit wrapper returns `Result`, which cannot carry `None` (Document 11 §3; see PROGRESS.md Phase 9 flagged interpretation 3)".into(),
+                    context: ctx.into(),
+                });
+            }
+            Some(TargetView::Opaque) => {}
+            None => {
+                self.errors.push(TypeError {
+                    message: "`?` used outside any function body".into(),
+                    context: ctx.into(),
+                });
+            }
+        }
+    }
+
+    /// Picks the single error type a `try` block's implicit wrapper
+    /// returns (Document 11 §3's `Result<(), ConfigError>`): the first
+    /// source type that EVERY source type equals or converts into via a
+    /// real `From` impl. Also emits one `PropagationRecord` per source.
+    /// FLAGGED INTERPRETATION: Document 11 §3's example wrapper names a
+    /// single declared error type without saying how it is derived when
+    /// the block's `?`s carry different types; this is the rule that
+    /// reproduces its example (`IoError` + `ConfigError` ->
+    /// `ConfigError`, given `From<IoError> for ConfigError`).
+    fn resolve_try_error_type(&mut self, sources: &[Ty], ctx: &str) -> Option<Ty> {
+        if sources.is_empty() {
+            return None;
+        }
+        let mut chosen: Option<Ty> = None;
+        for cand in sources {
+            if sources.iter().all(|s| s == cand || self.from_impl_exists(s, cand)) {
+                chosen = Some(cand.clone());
+                break;
+            }
+        }
+        match chosen {
+            Some(target) => {
+                for s in sources {
+                    self.propagations.push(PropagationRecord {
+                        kind: PropKind::ResultErr,
+                        source: Some(s.clone()),
+                        target: Some(target.clone()),
+                        converted: *s != target,
+                    });
+                }
+                Some(target)
+            }
+            None => {
+                let listed: Vec<String> = sources.iter().map(|t| format!("`{}`", t)).collect();
+                self.errors.push(TypeError {
+                    message: format!(
+                        "`try` block propagates error types {} but none of them is a type all the others convert into via `impl From<..>` (Document 11 §3, §2)",
+                        listed.join(", ")
+                    ),
+                    context: ctx.into(),
+                });
+                Some(sources[0].clone())
+            }
+        }
+    }
+
+    /// Document 11 §3: `try { .. } catch (e) { .. }`.
+    fn check_try_catch(
+        &mut self,
+        try_block: &Block,
+        catch_var: &str,
+        catch_block: &Block,
+        expected: Option<&Ty>,
+        env: &mut Env,
+        ctx: &str,
+    ) -> Ty {
+        self.prop_targets.push(PropTarget::Try(TryFrame { err_sources: Vec::new(), saw_opaque: false }));
+        let try_raw = self.check_block(try_block, env, expected, ctx);
+        let frame = match self.prop_targets.pop() {
+            Some(PropTarget::Try(f)) => f,
+            _ => TryFrame { err_sources: Vec::new(), saw_opaque: false },
+        };
+        let try_ty = try_raw.unwrap_or(Ty::Unit);
+
+        let bound = match self.resolve_try_error_type(&frame.err_sources, ctx) {
+            Some(t) => t,
+            None => {
+                if !frame.saw_opaque {
+                    self.errors.push(TypeError {
+                        message: "cannot infer the error type of this `try` block: it contains no `?` on a `Result` and no `throw` (Document 5 rule 6: ambiguity is an error, not a default)".into(),
+                        context: ctx.into(),
+                    });
+                }
+                Ty::Unit
+            }
+        };
+
+        env.push();
+        env.insert(catch_var.to_string(), bound);
+        let catch_expected: Option<Ty> = if try_ty == Ty::Never { expected.cloned() } else { Some(try_ty.clone()) };
+        let catch_ty = self.check_block(catch_block, env, catch_expected.as_ref(), ctx).unwrap_or(Ty::Unit);
+        env.pop();
+
+        if try_ty == Ty::Never {
+            catch_ty
+        } else if catch_ty == Ty::Never {
+            try_ty
+        } else {
+            if catch_ty != try_ty {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "`try` block and `catch` block have incompatible types: `{}` and `{}` (Document 5 rule 5: no cross-branch guessing)",
+                        try_ty, catch_ty
+                    ),
+                    context: ctx.into(),
+                });
+            }
+            try_ty
+        }
+    }
+
+    /// `return` / `return <expr>` (Document 11 §4). The value is checked
+    /// against the enclosing function's declared return type.
+    /// Bare `return;` is NOT validated against a non-unit return type
+    /// (generators/async make that rule non-trivial) -- known gap.
+    fn check_return(&mut self, value: Option<&Expr>, env: &mut Env, ctx: &str) {
+        let expected: Option<Ty> = match self.top_target() {
+            Some(TargetView::Fn(t)) => Some(t),
+            Some(TargetView::Try) => {
+                self.errors.push(TypeError {
+                    message: "`return` directly inside a `try` block is ambiguous: under Document 11 §3's wrapper-function desugaring it would return from the wrapper, not the enclosing function; move the `return` into the `catch` block or after the `try` (see PROGRESS.md Phase 9 flagged interpretation 2)".into(),
+                    context: ctx.into(),
+                });
+                None
+            }
+            Some(TargetView::Opaque) | None => None,
+        };
+        if let Some(e) = value {
+            self.check_expr(e, expected.as_ref(), env, ctx);
+        }
+    }
+
+    /// `Ok(x)` / `Err(e)` / `Some(x)` / `None` (Document 11 §1, built on
+    /// `builtin_variants`'s single table).
+    ///
+    /// `Some(x)` alone determines its full type (`Option<typeof x>`).
+    /// `Ok(x)`, `Err(e)` and `None` do NOT -- each leaves one type
+    /// parameter free -- so without an expected type they are ambiguous
+    /// and, per Document 5 inference rule 6, an error asking for an
+    /// annotation (never a silent default). Inside a closure body,
+    /// where return types aren't tracked yet, they stay silent instead.
+    fn check_variant_ctor(&mut self, name: &str, args: &[Arg], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let arity = if name == "None" { 0 } else { 1 };
+        if args.len() != arity {
+            self.errors.push(TypeError {
+                message: format!("`{}` expects {} argument(s), found {} (Document 11 §1)", name, arity, args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+            return expected.cloned().unwrap_or(Ty::Unit);
+        }
+        let (payload_expected, whole): (Option<Ty>, Option<Ty>) = match (name, expected) {
+            ("Ok", Some(Ty::ResultTy(ok, _))) => (Some((**ok).clone()), expected.cloned()),
+            ("Err", Some(Ty::ResultTy(_, err))) => (Some((**err).clone()), expected.cloned()),
+            ("Some", Some(Ty::OptionTy(inner))) => (Some((**inner).clone()), expected.cloned()),
+            ("None", Some(Ty::OptionTy(_))) => (None, expected.cloned()),
+            _ => (None, None),
+        };
+        let payload_ty: Option<Ty> = if arity == 1 {
+            Some(self.check_expr(&args[0].value, payload_expected.as_ref(), env, ctx))
+        } else {
+            None
+        };
+        if let Some(w) = whole {
+            return w;
+        }
+        let family = if name == "Ok" || name == "Err" { "Result" } else { "Option" };
+        if let Some(exp) = expected {
+            self.errors.push(TypeError {
+                message: format!("`{}` builds a `{}` value, but `{}` is expected", name, family, exp),
+                context: ctx.into(),
+            });
+            return exp.clone();
+        }
+        if name == "Some" {
+            return Ty::OptionTy(Box::new(payload_ty.unwrap_or(Ty::Unit)));
+        }
+        if !self.top_is_opaque() {
+            self.errors.push(TypeError {
+                message: format!(
+                    "cannot infer the full type of `{}`: it leaves a type parameter of `{}` undetermined -- add a type annotation (Document 5 rule 6)",
+                    name, family
+                ),
+                context: ctx.into(),
+            });
+        }
+        Ty::Unit
+    }
+
+    /// `panic(msg)`, `assert(cond)`, `ensure(cond, err)` (Document 11
+    /// §4, §5). Type-level behavior only; debug-vs-release stripping of
+    /// `assert` is a codegen concern (Phase 10) with nothing to strip
+    /// yet -- see PROGRESS.md.
+    fn check_error_intrinsic(&mut self, name: &str, args: &[Arg], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let (want, result): (usize, Ty) = match name {
+            "panic" => (1, Ty::Never),
+            "assert" => (1, Ty::Unit),
+            _ => (2, Ty::Unit), // `ensure`, result rebuilt below
+        };
+        if args.len() != want {
+            self.errors.push(TypeError {
+                message: format!("`{}` expects {} argument(s), found {} (Document 11 §4/§5)", name, want, args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+            return if name == "panic" { Ty::Never } else { expected.cloned().unwrap_or(Ty::Unit) };
+        }
+        match name {
+            "panic" => {
+                self.check_expr(&args[0].value, Some(&Ty::StringTy), env, ctx);
+                result
+            }
+            "assert" => {
+                self.check_expr(&args[0].value, Some(&Ty::Bool), env, ctx);
+                result
+            }
+            _ => {
+                self.check_expr(&args[0].value, Some(&Ty::Bool), env, ctx);
+                let err_expected = match expected {
+                    Some(Ty::ResultTy(_, e)) => Some((**e).clone()),
+                    _ => None,
+                };
+                let err_ty = self.check_expr(&args[1].value, err_expected.as_ref(), env, ctx);
+                Ty::ResultTy(Box::new(Ty::Unit), Box::new(err_ty))
+            }
+        }
+    }
+
+    /// The field types a constructor named `name` (last path segment)
+    /// carries when matched against a value of type `ty`, if known:
+    /// built-in `Option`/`Result` variants, user enum variants, or a
+    /// tuple struct's single constructor.
+    fn ctor_field_types(&self, name: &str, ty: &Ty) -> Option<Vec<Ty>> {
+        if let Some(variants) = builtin_variants(ty) {
+            return variants.into_iter().find(|(n, _)| *n == name).map(|(_, tys)| tys);
+        }
+        if let Ty::Named(tn) = ty {
+            if let Some(shape) = self.enums.get(tn) {
+                return shape.variants.iter().find(|(n, _)| n.as_str() == name).map(|(_, tys)| tys.clone());
+            }
+            if let Some(shape) = self.structs.get(tn) {
+                if shape.is_tuple && tn.as_str() == name {
+                    return Some(shape.fields.iter().map(|(_, t)| t.clone()).collect());
+                }
+            }
+        }
+        None
+    }
+
+    /// Binds the variables a match-arm pattern introduces, with types
+    /// taken from the scrutinee's shape. When a constructor's field
+    /// types can't be determined (scrutinee is an unresolved stdlib
+    /// value), sub-pattern variables are bound as `()` -- this
+    /// checker's existing "unknown => `()`" convention -- instead of
+    /// being left undefined, which would report a false "undefined
+    /// variable" for perfectly valid code.
+    fn bind_pattern(&self, pat: &Pattern, ty: &Ty, env: &mut Env) {
+        match pat {
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Array(..) => {}
+            Pattern::Mut(n) => env.insert(n.clone(), ty.clone()),
+            Pattern::Ident(n) => {
+                // A path (`HttpMethod::Get`) or a nullary variant of the
+                // scrutinee's own type (`None`) is a constructor test,
+                // not a fresh binding -- same rule `exhaustive.rs` uses.
+                let is_ctor = n.contains("::") || {
+                    let last = n.rsplit("::").next().unwrap_or(n.as_str());
+                    self.ctor_field_types(last, ty).map(|f| f.is_empty()).unwrap_or(false)
+                };
+                if !is_ctor {
+                    env.insert(n.clone(), ty.clone());
+                }
+            }
+            Pattern::Tuple(subs) => match ty {
+                Ty::Tuple(tys) if tys.len() == subs.len() => {
+                    for (p, t) in subs.iter().zip(tys.iter()) {
+                        self.bind_pattern(p, t, env);
+                    }
+                }
+                _ => {
+                    for p in subs {
+                        self.bind_pattern(p, &Ty::Unit, env);
+                    }
+                }
+            },
+            Pattern::TupleStruct(name, subs) => {
+                let last = name.rsplit("::").next().unwrap_or(name.as_str());
+                match self.ctor_field_types(last, ty) {
+                    Some(tys) if tys.len() == subs.len() => {
+                        for (p, t) in subs.iter().zip(tys.iter()) {
+                            self.bind_pattern(p, t, env);
+                        }
+                    }
+                    _ => {
+                        for p in subs {
+                            self.bind_pattern(p, &Ty::Unit, env);
+                        }
+                    }
+                }
+            }
+            Pattern::Or(alts) => {
+                for a in alts {
+                    self.bind_pattern(a, ty, env);
+                }
+            }
+        }
+    }
+
     fn satisfies_bound(&self, ty: &Ty, trait_name: &str) -> bool {
         let Some(key) = ty_lookup_name(ty) else { return false };
         self.impls_by_type.get(&key)
@@ -1870,6 +2634,11 @@ impl TypeChecker {
     }
 
     fn field_type(&mut self, base: &Ty, field: &str, ctx: &str) -> Ty {
+        // Auto-deref through `&T` / `borrow T` (Phase 9; see `strip_refs`).
+        if let Ty::Ref(_, inner) = base {
+            let inner = (**inner).clone();
+            return self.field_type(&inner, field, ctx);
+        }
         if let Ty::Named(n) = base {
             if let Some(shape) = self.structs.get(n) {
                 for (fname, fty) in &shape.fields {
@@ -1906,6 +2675,7 @@ impl TypeChecker {
         // Base type not a known struct (could be a module path result,
         // a foreign/unregistered generic, etc.) -- don't fabricate an
         // error for cases outside this phase's scope.
+        self.saw_unresolved = true;
         Ty::Unit
     }
 }

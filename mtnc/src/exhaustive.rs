@@ -130,15 +130,14 @@ impl<'a> Ctx<'a> {
     /// (including `bool`, handled separately since it isn't
     /// "enum-shaped" — its constructors carry no field types at all).
     fn variants_of(&self, ty: &Ty) -> Option<Vec<(String, Vec<Ty>)>> {
+        // Phase 9: `Option`/`Result`'s variants come from the ONE shared
+        // table in `types::builtin_variants`, also read by constructor
+        // typing and pattern binding -- this file used to carry its own
+        // private copy.
+        if let Some(builtin) = crate::types::builtin_variants(ty) {
+            return Some(builtin.into_iter().map(|(n, tys)| (n.to_string(), tys)).collect());
+        }
         match ty {
-            Ty::OptionTy(inner) => Some(vec![
-                ("Some".to_string(), vec![(**inner).clone()]),
-                ("None".to_string(), vec![]),
-            ]),
-            Ty::ResultTy(ok, err) => Some(vec![
-                ("Ok".to_string(), vec![(**ok).clone()]),
-                ("Err".to_string(), vec![(**err).clone()]),
-            ]),
             Ty::Named(name) => self.enums.get(name).map(|v| v.to_vec()),
             _ => None,
         }
