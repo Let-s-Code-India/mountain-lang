@@ -9,7 +9,7 @@
 //! §4's own `fibonacci` example — not a general Mountain evaluator,
 //! which is Phase 10's job once real codegen exists).
 
-use mtnc::ast::{Item, ItemKind};
+use mtnc::ast::ItemKind;
 use mtnc::generator::{lower_generator, GeneratorState};
 use mtnc::lexer;
 use mtnc::parser::parse_program;
