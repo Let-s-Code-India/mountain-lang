@@ -450,6 +450,19 @@ pub struct TypeChecker {
     saw_unresolved: bool,
     /// Phase 9: every resolved propagation edge, in source order.
     pub propagations: Vec<PropagationRecord>,
+    /// Phase 10 (Document 17 §1 "TYPED AST"): the resolved type of every
+    /// expression the checker visited, keyed by the expression node's
+    /// address (`&Expr as *const Expr as usize`). The AST is never
+    /// mutated or moved after parsing, so node addresses are stable
+    /// identities; this is the smallest mechanism that gives codegen a
+    /// typed view without adding a type slot/id to every `Expr`. Look up
+    /// with `TypeChecker::type_of`.
+    pub expr_types: HashMap<usize, Ty>,
+    /// Phase 10: for every `try`/`catch` expression (keyed like
+    /// `expr_types`), the resolved `(value type, error type)` of Document
+    /// 11 §3's implicit wrapper `Result<value, error>`; consumed by the
+    /// `desugar` pass.
+    pub try_info: HashMap<usize, (Ty, Ty)>,
     pub errors: Vec<TypeError>,
 }
 
@@ -578,8 +591,16 @@ impl TypeChecker {
             prop_targets: Vec::new(),
             saw_unresolved: false,
             propagations: Vec::new(),
+            expr_types: HashMap::new(),
+            try_info: HashMap::new(),
             errors: Vec::new(),
         }
+    }
+
+    /// Phase 10: the type the checker resolved for `expr` (see
+    /// `expr_types`), if it was visited.
+    pub fn type_of(&self, expr: &Expr) -> Option<&Ty> {
+        self.expr_types.get(&(expr as *const Expr as usize))
     }
 
     /// Context-aware type resolution for positions where a user writes
@@ -967,6 +988,12 @@ impl TypeChecker {
                     env.insert(name.clone(), final_ty);
                 } else if let Pattern::Mut(name) = pattern {
                     env.insert(name.clone(), final_ty);
+                } else {
+                    // Phase 10: destructuring `let (a, b) = pair;`
+                    // (Document 5 §3.2, Document 10 §3.3) -- reuse the
+                    // match-arm binder so tuple/tuple-struct patterns
+                    // distribute their field types.
+                    self.bind_pattern(pattern, &final_ty, env);
                 }
                 // Other pattern shapes (tuple/array/tuple-struct
                 // destructuring) would need per-field type distribution;
@@ -1082,6 +1109,7 @@ impl TypeChecker {
     /// through.
     fn check_expr(&mut self, expr: &Expr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
         let actual = self.check_expr_inner(expr, expected, env, ctx);
+        self.expr_types.insert(expr as *const Expr as usize, actual.clone());
         // Only numeric literals and `null` are excluded from this
         // blanket check -- `check_literal`'s `Int`/`IntHex`/`IntOct`/
         // `IntBin`/`Float` arms already adopt-or-default against
@@ -1561,7 +1589,7 @@ impl TypeChecker {
             }
             Expr::Loop(loop_expr) => self.check_loop(loop_expr, expected, env, ctx),
             Expr::TryCatch { try_block, catch_var, catch_block } => {
-                self.check_try_catch(try_block, catch_var, catch_block, expected, env, ctx)
+                self.check_try_catch(expr as *const Expr as usize, try_block, catch_var, catch_block, expected, env, ctx)
             }
             Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_)
             | Expr::Styled { .. } | Expr::Layout { .. }
@@ -1680,10 +1708,18 @@ impl TypeChecker {
                     _ => Ty::I32,
                 }
             }
-            Literal::Float(_) => {
-                match expected {
-                    Some(t) if ty_is_float(t) => t.clone(),
-                    _ => Ty::F64,
+            Literal::Float(text) => {
+                // Document 2 §6.2: an explicit `f32`/`f64` suffix fixes the
+                // literal's precision (Phase 10: it was previously ignored).
+                if text.ends_with("f32") {
+                    Ty::F32
+                } else if text.ends_with("f64") {
+                    Ty::F64
+                } else {
+                    match expected {
+                        Some(t) if ty_is_float(t) => t.clone(),
+                        _ => Ty::F64,
+                    }
                 }
             }
             Literal::Str(_) | Literal::RawStr(_) => Ty::StringTy,
@@ -1732,7 +1768,24 @@ impl TypeChecker {
         // compatibility check reject it before this function's own
         // dimension-aware logic below ever runs. So: only use `lt` as
         // an rhs hint when it isn't a generic-struct type.
-        let rhs_hint = if matches!(lt, Ty::Generic(..)) { None } else { Some(&lt) };
+        // Phase 10: for `a ?? b` the fallback `b` has the payload type of
+        // `a` (`Option<T>`/`Result<T, _>` -> `T`), not `a`'s own type.
+        let coalesce_hint: Option<Ty> = if op == BinaryOp::Coalesce {
+            match &lt {
+                Ty::OptionTy(inner) => Some((**inner).clone()),
+                Ty::ResultTy(ok, _) => Some((**ok).clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let rhs_hint = if op == BinaryOp::Coalesce {
+            coalesce_hint.as_ref()
+        } else if matches!(lt, Ty::Generic(..)) {
+            None
+        } else {
+            Some(&lt)
+        };
         let rt = self.check_expr(rhs, rhs_hint, env, ctx);
         use BinaryOp::*;
         match op {
@@ -1785,6 +1838,7 @@ impl TypeChecker {
             Coalesce => {
                 match lt {
                     Ty::OptionTy(inner) => *inner,
+                    Ty::ResultTy(ok, _) => *ok,
                     other => other,
                 }
             }
@@ -2351,6 +2405,7 @@ impl TypeChecker {
     /// Document 11 §3: `try { .. } catch (e) { .. }`.
     fn check_try_catch(
         &mut self,
+        key: usize,
         try_block: &Block,
         catch_var: &str,
         catch_block: &Block,
@@ -2378,6 +2433,10 @@ impl TypeChecker {
                 Ty::Unit
             }
         };
+
+        // Phase 10: record the wrapper's `Result<value, error>` shape for
+        // the desugar pass (a block that cannot fall through carries `()`).
+        self.try_info.insert(key, (if try_ty == Ty::Never { Ty::Unit } else { try_ty.clone() }, bound.clone()));
 
         env.push();
         env.insert(catch_var.to_string(), bound);
@@ -2671,6 +2730,20 @@ impl TypeChecker {
                 });
                 return Ty::Unit;
             }
+        }
+        // Phase 10: positional access on a tuple (`pair.0`, Document 5 §3.2)
+        // used to fall through to the silent `()` below.
+        if let Ty::Tuple(ts) = base {
+            if let Ok(i) = field.parse::<usize>() {
+                if let Some(t) = ts.get(i) {
+                    return t.clone();
+                }
+            }
+            self.errors.push(TypeError {
+                message: format!("tuple `{}` has no field `{}`", base, field),
+                context: ctx.into(),
+            });
+            return Ty::Unit;
         }
         // Base type not a known struct (could be a module path result,
         // a foreign/unregistered generic, etc.) -- don't fabricate an

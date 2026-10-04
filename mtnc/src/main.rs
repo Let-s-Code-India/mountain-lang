@@ -1,20 +1,21 @@
-//! `mtnc` CLI entry point.
+//! `mtnc` CLI entry point (Document 17 §8).
 //!
-//! Phase 1 scope only implements `build` and `check` (Document 25 §2.3),
-//! and both currently only run the pipeline through the Lexer stage
-//! (Parser/Semantic Analysis/Codegen don't exist yet — later phases).
-//! The full subcommand surface from Document 17 §8 (`run`, `test`,
-//! `bench`, `doc`, `fmt`, etc.) is intentionally not implemented yet;
-//! invoking them prints a clear "not yet implemented in Phase N" message
-//! rather than silently doing nothing or pretending to succeed.
+//! * `mtnc check [path]` — full front end (lexer, parser, type checker incl.
+//!   exhaustiveness, borrow checker); prints every diagnostic; non-zero exit
+//!   if any file has an error.
+//! * `mtnc build <file.mtn|dir> [-o out] [--release] [--emit-ir]` — check, then
+//!   LLVM IR -> native executable. No binary is produced if checking fails.
+//! * `mtnc run <file.mtn|dir> [--release]` — build, then execute, forwarding
+//!   the program's exit code.
+//! * `test`/`bench`/`doc`/`fmt` — not implemented yet (later phases).
 
-use mtnc::diagnostics::Diagnostic;
-use mtnc::lexer;
+use mtnc::codegen::Options;
+use mtnc::driver;
 use mtnc::manifest::Manifest;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -25,17 +26,18 @@ fn main() -> ExitCode {
     }
 
     match args[1].as_str() {
-        "build" => run_lex_pipeline("build", args.get(2)),
-        "check" => run_lex_pipeline("check", args.get(2)),
+        "check" => cmd_check(&args[2..]),
+        "build" => cmd_build(&args[2..], false),
+        "run" => cmd_build(&args[2..], true),
         "--version" | "-V" => {
-            println!("mtnc 0.1.0 (Phase 1 — scaffold, manifest, lexer)");
+            println!("mtnc 0.1.0 (Phase 10 — LLVM IR codegen + native backend)");
             ExitCode::SUCCESS
         }
-        "run" | "test" | "bench" | "doc" | "fmt" => {
+        "test" | "bench" | "doc" | "fmt" => {
             eprintln!(
                 "mtnc {}: not yet implemented — this subcommand depends on \
                  compiler stages introduced in later phases of the Document 25 \
-                 roadmap (Parser: Phase 2, Codegen: Phase 10, etc.)",
+                 roadmap (test/bench: Phase 16+, doc/fmt: Phase 23)",
                 args[1]
             );
             ExitCode::FAILURE
@@ -49,102 +51,156 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("Usage: mtnc <build|check> [path]");
+    eprintln!("Usage: mtnc check [path]");
+    eprintln!("       mtnc build <file.mtn | dir> [-o <out>] [--release] [--emit-ir]");
+    eprintln!("       mtnc run   <file.mtn | dir> [--release]");
     eprintln!("       mtnc --version");
-    eprintln!();
-    eprintln!("Phase 1: 'build' and 'check' currently run source through the Lexer");
-    eprintln!("stage only (tokenize + report diagnostics). Parsing/codegen land in");
-    eprintln!("later phases per Document 25's roadmap.");
 }
 
-/// Locates `mountain.toml` (if present), discovers `.mtn` source files,
-/// and lexes each one, reporting diagnostics. This is the full extent of
-/// what "build"/"check" can do in Phase 1, since there is no parser yet.
-fn run_lex_pipeline(subcommand: &str, path_arg: Option<&String>) -> ExitCode {
-    let root = match path_arg {
+fn report(path: &Path, errors: &[String]) {
+    for e in errors {
+        eprintln!("{}", e);
+    }
+    eprintln!("  --> {}", path.display());
+}
+
+/// `mtnc check`: front end only.
+fn cmd_check(args: &[String]) -> ExitCode {
+    let root = match args.first() {
         Some(p) => PathBuf::from(p),
         None => env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
     if !root.exists() {
-        eprintln!("mtnc {}: path does not exist: {}", subcommand, root.display());
+        eprintln!("mtnc check: path does not exist: {}", root.display());
         return ExitCode::FAILURE;
     }
-
     let manifest_path = root.join("mountain.toml");
     if manifest_path.exists() {
-        match fs::read_to_string(&manifest_path) {
-            Ok(src) => match Manifest::parse(&src) {
-                Ok(m) => {
-                    if let Some(name) = m.get_str("package", "name") {
-                        println!("mtnc {}: package '{}'", subcommand, name);
-                    } else {
-                        println!("mtnc {}: mountain.toml has no [package].name", subcommand);
-                    }
-                }
-                Err(errors) => {
-                    eprintln!("mtnc {}: errors in mountain.toml:", subcommand);
-                    for e in &errors {
-                        eprintln!("  {}", e);
-                    }
-                    return ExitCode::FAILURE;
-                }
+        match fs::read_to_string(&manifest_path).map_err(|e| e.to_string()).and_then(|s| Manifest::parse(&s).map_err(|es| es.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))) {
+            Ok(m) => match m.get_str("package", "name") {
+                Some(name) => println!("mtnc check: package '{}'", name),
+                None => println!("mtnc check: mountain.toml has no [package].name"),
             },
             Err(e) => {
-                eprintln!("mtnc {}: could not read mountain.toml: {}", subcommand, e);
+                eprintln!("mtnc check: errors in mountain.toml: {}", e);
                 return ExitCode::FAILURE;
             }
         }
-    } else {
-        println!("mtnc {}: no mountain.toml found in {}, lexing loose .mtn files", subcommand, root.display());
     }
-
-    let mtn_files = find_mtn_files(&root);
-    if mtn_files.is_empty() {
-        println!("mtnc {}: no .mtn source files found", subcommand);
+    let files = find_mtn_files(&root);
+    if files.is_empty() {
+        println!("mtnc check: no .mtn source files found");
         return ExitCode::SUCCESS;
     }
-
-    let mut had_errors = false;
-    let mut total_tokens = 0usize;
-
-    for path in &mtn_files {
-        let src = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("mtnc {}: could not read {}: {}", subcommand, path.display(), e);
-                had_errors = true;
-                continue;
+    let mut failed = 0usize;
+    for path in &files {
+        match fs::read_to_string(path) {
+            Ok(src) => {
+                if let Err(errors) = driver::check_source(&src) {
+                    failed += 1;
+                    report(path, &errors);
+                }
             }
-        };
-        let (tokens, diagnostics) = lexer::tokenize(&src);
-        total_tokens += tokens.len();
-        if !diagnostics.is_empty() {
-            had_errors = true;
-            for d in &diagnostics {
-                report(path, d);
+            Err(e) => {
+                failed += 1;
+                eprintln!("mtnc check: could not read {}: {}", path.display(), e);
             }
         }
     }
-
-    if had_errors {
-        eprintln!("mtnc {}: lexical errors found, aborting", subcommand);
+    if failed > 0 {
+        eprintln!("mtnc check: {} of {} file(s) have errors", failed, files.len());
         ExitCode::FAILURE
     } else {
-        println!(
-            "mtnc {}: lexed {} file(s), {} token(s), 0 errors",
-            subcommand,
-            mtn_files.len(),
-            total_tokens
-        );
+        println!("mtnc check: checked {} file(s), 0 errors", files.len());
         ExitCode::SUCCESS
     }
 }
 
-fn report(path: &Path, d: &Diagnostic) {
-    // Minimal form of Document 22's canonical format; the full
-    // note:/help: teaching-diagnostic system is Phase 23 scope.
-    eprintln!("error: {}", d.message);
-    eprintln!("  --> {}:{}", path.display(), d.span);
+/// `mtnc build` / `mtnc run`.
+fn cmd_build(args: &[String], run: bool) -> ExitCode {
+    let name = if run { "run" } else { "build" };
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut opts = Options::default();
+    let mut emit_ir = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--release" => opts.release = true,
+            "--emit-ir" => emit_ir = true,
+            "-o" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => out = Some(PathBuf::from(p)),
+                    None => {
+                        eprintln!("mtnc {}: `-o` needs a path", name);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--" => break,
+            other if other.starts_with('-') => {
+                eprintln!("mtnc {}: unknown option '{}'", name, other);
+                return ExitCode::FAILURE;
+            }
+            other => input = Some(PathBuf::from(other)),
+        }
+        i += 1;
+    }
+    let input = input.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let source_path = if input.is_dir() { input.join("main.mtn") } else { input.clone() };
+    let src = match fs::read_to_string(&source_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mtnc {}: could not read {}: {}", name, source_path.display(), e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if emit_ir {
+        return match driver::emit_ir(&src, &opts) {
+            Ok(ir) => {
+                println!("{}", ir);
+                ExitCode::SUCCESS
+            }
+            Err(errors) => {
+                report(&source_path, &errors);
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let exe = match (&out, run) {
+        (Some(o), _) => o.clone(),
+        (None, true) => env::temp_dir().join(format!("mtnc_run_{}", std::process::id())),
+        (None, false) => PathBuf::from(source_path.file_stem().unwrap_or_default()),
+    };
+    if let Err(errors) = driver::build_executable(&src, &exe, &opts) {
+        report(&source_path, &errors);
+        eprintln!("mtnc {}: aborting, no executable produced", name);
+        return ExitCode::FAILURE;
+    }
+    if !run {
+        println!("mtnc build: wrote {}", exe.display());
+        return ExitCode::SUCCESS;
+    }
+    let extra: Vec<&String> = match args.iter().position(|a| a == "--") {
+        Some(p) => args[p + 1..].iter().collect(),
+        None => Vec::new(),
+    };
+    let status = Command::new(&exe).args(extra).status();
+    let _ = fs::remove_file(&exe);
+    match status {
+        Ok(s) => match s.code() {
+            Some(c) => ExitCode::from((c & 0xff) as u8),
+            None => {
+                eprintln!("mtnc run: the program was terminated by a signal");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("mtnc run: could not start the program: {}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn find_mtn_files(root: &Path) -> Vec<PathBuf> {

@@ -1221,7 +1221,25 @@ impl Parser {
             self.expect_delim(Delim::Semi)?;
             return Ok(StmtOrTail::Stmt(Stmt::Yield(e)));
         }
-        let expr = self.parse_expr(0)?;
+        // Phase 10: a block-like expression (`if`/`match`/`loop`/`while`/`for`/
+        // `{ }`/`try`...) in statement position ENDS the statement, as in Rust:
+        // `while c { .. }` followed by `-1` is a statement and then the tail
+        // `-1`, not the subtraction `(while ..) - 1`. Only when the block-like
+        // expression is directly followed by `.`/`?`/etc. (so it is not a
+        // block-like expression after postfix operators) is it re-parsed as an
+        // ordinary expression.
+        let start = self.pos;
+        let block_start = matches!(
+            self.peek_kind(),
+            TokenKind::Keyword(Keyword::If | Keyword::Match | Keyword::Loop | Keyword::While | Keyword::For | Keyword::Do | Keyword::Unsafe | Keyword::Try)
+                | TokenKind::Delim(Delim::LBrace)
+                | TokenKind::Lifetime(_)
+        );
+        let mut expr = if block_start { self.parse_prefix()? } else { self.parse_expr(0)? };
+        if block_start && !is_block_like(&expr) {
+            self.pos = start;
+            expr = self.parse_expr(0)?;
+        }
         if self.eat_delim(Delim::Semi) {
             return Ok(StmtOrTail::Stmt(Stmt::Expr(expr)));
         }
@@ -1299,6 +1317,25 @@ impl Parser {
         loop {
             if self.check_op(Op::Dot) {
                 self.advance();
+                // Phase 10: positional field access `pair.0` (Document 7 §2.4,
+                // Document 5 §3.2). The lexer reads `t.0.1` as `t` `.` `0.1`
+                // (a float), so a float token of the form `A.B` is split into
+                // two chained positional accesses.
+                if let TokenKind::Int(idx) = self.peek_kind().clone() {
+                    self.advance();
+                    expr = Expr::Field { expr: Box::new(expr), name: idx.replace('_', "") };
+                    continue;
+                }
+                if let TokenKind::Float(text) = self.peek_kind().clone() {
+                    let parts: Vec<&str> = text.split('.').collect();
+                    if parts.len() == 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+                        self.advance();
+                        for part in parts {
+                            expr = Expr::Field { expr: Box::new(expr), name: part.to_string() };
+                        }
+                        continue;
+                    }
+                }
                 let name = self.expect_word()?;
                 // optional turbofish on a method call: `.parse::<u64>()`
                 // (Document 16 §1.21.1's `"42".parse::<i32>()?`, used

@@ -6,6 +6,9 @@
 
 pub mod ast;
 pub mod borrow;
+pub mod codegen;
+pub mod desugar;
+pub mod driver;
 pub mod diagnostics;
 pub mod exhaustive;
 pub mod generator;
