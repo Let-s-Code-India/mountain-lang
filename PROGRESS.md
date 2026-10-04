@@ -8,6 +8,26 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 - 🟡 Complete, logic-verified, **pending real-toolchain confirmation**
 - ⚪ Not started
 
+## How this project is run (read this first if you are taking over)
+
+**Three roles.**
+1. **Owner** — has no coding background. Moves files between the other two roles and GitHub; makes the decisions that the standing rules below send to them.
+2. **Manager** (a separate chat) — writes one prompt per phase, then reviews the coding assistant's report, zip and the CI log against the 25 specification documents, and either approves the phase or sends the assistant back to fix it.
+3. **Coding assistant** (the role that wrote this file) — writes all the code for a phase and returns **one zip of the whole repository tree** (including this `PROGRESS.md`) plus a written report.
+
+**The loop.** Manager prompt → coding assistant builds the phase → owner uploads the zip to GitHub (`Let-s-Code-India/mountain-lang`) → GitHub Actions CI runs (`.github/workflows/ci.yml`) → the owner brings the CI log to the manager → the manager approves (phase becomes 🟢) or sends fixes. **Nothing is 🟢 until the manager has seen a real CI log.**
+
+**Historical constraint.** Through Phase 9 the coding assistant had no Rust/LLVM toolchain and delivered one zip per phase after hand-checking its logic 2–3 times. (In Phase 10 the assistant's sandbox happened to allow `apt install rustc-1.91 cargo-1.91 llvm-18-dev`, so the Phase 10 tests were actually run — see the Phase 10 entry — but CI is still the authority.)
+
+**Standing rules for the coding assistant.**
+1. Follow the plan (the 25 documents + the phase prompt) exactly. No invented features, no restructuring. Any deviation, however small, is **asked for and approved first**, stating what, why and the alternative; deviations that were already made are listed as "flagged" and need sign-off.
+2. Fix ordinary bugs at the root and sweep for sibling instances; do not ask for help with normal syntax/logic errors.
+3. Check the logic 2–3 times before delivering (hand-trace new tests, re-read changed functions, cross-check against the AST).
+4. Every number in a report comes from a fresh command, never from memory.
+5. Anything not supported yet gives a clear compile error ("… not yet supported by codegen — Phase N"), never a crash or silent miscompile.
+6. The final reply lists every unresolved choice and pending approval.
+7. The documents are the single source of truth (Doc 11 §8 and Doc 23 §17 are approved and authoritative; Doc 6 §3.1 is the corrected version). A real contradiction is reported, not silently resolved.
+
 ---
 
 ## Phase 1 — Project Scaffold, `mountain.toml` Parsing, CLI Skeleton, Lexer
@@ -2054,7 +2074,7 @@ entry and in `exhaustive.rs`'s own doc comments. One scope cut remains
 flagged (`DoWhile` has no label field in the AST).
 
 ## Phase 9 — Error Handling
-**Status: 🟡 Implemented and logic-verified — ⏳ NOT yet confirmed by a real CI run.** No `cargo`/`rustc`/network in this environment (same as every phase). Do not mark 🟢 until the Actions log for the push below is downloaded and read.
+**Status: 🟢 Confirmed by a real CI log (reviewed by the manager): 243 tests passed, 0 failed** — lib 60, borrow_checks 19, closures 10, control_flow 10, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, parser_doc24 6, traits_impls 15, types_doc5 26. Only warning was the unused import `Item` in `tests/generators.rs:12` (removed in Phase 10). *(The paragraph below is the original Phase 9 hand-off text, kept verbatim.)* Original note: No `cargo`/`rustc`/network in that environment.
 
 ### 0. Claims in the hand-off message, checked against the actual zip
 | Claim | Result |
@@ -2118,7 +2138,71 @@ Every existing test that uses `return X;` (types_doc5, generics ×6, traits_impl
 ### 10. What to push / where to look
 Push the whole tree (keep the `mtnc/` layout). In GitHub → Actions → the run for this push → job `build-and-test` → step **Run test suite** → download the raw log. Check: (a) per-target `test result:` lines — `error_handling` should say `57 passed`; (b) grand total 243; (c) no `warning:` lines from `rustc`; (d) with `--no-fail-fast` a red run lists **all** failing tests at once, so send that whole log rather than fixing one at a time.
 
-## Phases 10–25
+## Phase 10 — LLVM IR codegen + native backend
+**Status: 🟡 Implemented and tested locally (278 tests pass in the assistant's sandbox) — ⏳ NOT yet confirmed by a real CI run.** Do not mark 🟢 until the Actions log for the push is read.
+
+### 0. Housekeeping done first
+- Phase 9 marked 🟢 above (243 passed, from the confirmed CI log).
+- Unused import `Item` removed from `tests/generators.rs` (build now shows **0 warnings**).
+- Stale banners updated: `main.rs` (rewritten, see §2) and the `Cargo.toml` description/"zero external crates" comment.
+
+### 1. Scope delivered (Document 25 Phase 10; Doc 17 §2–7)
+Lexer → Parser → Type check (+ exhaustiveness) → Borrow check → *[desugar `try`/`catch`]* → LLVM IR → object file → system `cc` link → native executable.
+- **CLI (Doc 17 §8).** `mtnc check [path]` runs the *whole* front end (lexer, parser, type checker incl. exhaustiveness, borrow checker), prints all diagnostics, exits non-zero on error (closes the Phase 9 §0 gap). `mtnc build <file|dir> [-o out] [--release] [--emit-ir]` = check + codegen + link; **no executable or object file is left behind when anything fails** (tested). `mtnc run <file|dir> [--release]` builds into a temp file, runs it, and forwards the exit code. `--emit-ir` prints the LLVM IR (a small debugging aid, **flagged**, see §5).
+- **Codegen (`src/codegen.rs`, `src/codegen/expr.rs`, `src/codegen/print.rs`)** with `inkwell 0.10` / LLVM 18. IR generation is **target-agnostic**: pointer width and data layout come from the `TargetMachine` the driver passes in; nothing names a CPU (tested). Phase 15 reuses it with a `wasm32` machine.
+- **Language subset that compiles and runs:** non-generic `fn`s (params, returns, recursion, early `return`), `let`/`let mut`/shadowing, assignment and compound assignment; `i8…i128, u8…u128, isize, usize, f32, f64, bool, char`; arithmetic, comparison, short-circuit `&&`/`||`, bitwise, shifts, `**`, unary `-`/`!`/`~`, `??`, `as` casts; `if`/`else` (statement and expression), `loop` with `break value`, `while`, `do/while`, `for` over `a..b`/`a..=b` integer ranges, labeled `break`/`continue`; structs (stack, by value), tuple structs, enums incl. data-carrying variants (tagged union `{ i32 tag, [N x i64] payload }`), tuples (`t.0`, nested `t.1.0`, `let (a, b) = …`), `match` on ints/bool/char/enums/tuples with guards and or-patterns; `Option`/`Result`, `Some/None/Ok/Err`, `?` (same error type), `try`/`catch`/`throw`, `panic`, `assert`, `ensure`.
+- **Match lowering.** Matches whose arms are all literal / unit-variant / data-variant-with-irrefutable-fields / catch-all with no guards become one LLVM **`switch`** (on the enum tag or the scalar); anything else (guards, tuples, floats, nested refutable patterns) becomes a chain of conditional branches. (Doc 17 §6 says "`switch` where dense"; I use `switch` whenever it is possible and let LLVM pick jump table vs. compares — flagged, §5.)
+- **Overflow / arithmetic (Doc 5 §2.1, Doc 4 §1, Doc 11 §5).** Debug (default): `+ - *` and unary `-` use `llvm.{s,u}{add,sub,mul}.with.overflow` and panic ("attempt to add with overflow", …); shifts check the amount. Release (`--release`): wrapping, shift amount masked, `assert` stripped. Division/remainder by zero always panic; signed `MIN / -1` panics; a **literal** zero divisor is a compile error (Doc 4 §1). Float→int casts saturate (`llvm.fptosi.sat`/`fptoui.sat`). `ensure` is always present.
+- **`panic`** writes `thread 'main' panicked: <message>` to stderr and exits with **code 101** (no source location yet — spans are not carried on expressions; Doc 22 backtraces are Phase 23).
+- **`fn main()`** may return `()` or `Result<(), E>` (Err → exit code 1; Doc 19/24 show Result-returning mains). The C `main` is a generated wrapper around `mtn_main`; all user functions are emitted as `mtn_<name>` so they cannot collide with libc.
+- **Not supported → clear error "… not yet supported by codegen — Phase N":** closures, generic functions/structs/enums, `impl`/`trait`/methods, `dyn`, references/`borrow` params, `Box`/`Rc`/heap types, arrays/`[T]`/indexing, `String` operations, `const`/`static`/`type` items, nested items in fns, `yield`, `async`/`await`/`spawn`/`select`, `table`/`query`, `ui`/`component`, `server`, `actor`, tensors, modules/`use`/`import`, named/default/variadic arguments, `for` over anything but an integer range, `?` with error-type conversion (`From`), matching on string literals, printing 128-bit integers. **The Phase numbers in these messages are my assignment** (the prompt asked for "Phase N" without a table): closures/generics/traits/refs/heap/arrays/consts → 11, async/spawn/actor → 12, modules → 14, std-dependent (`for` over iterables, string match, printing i128) → 16, server → 17, table/query → 18, ui → 19. **Known gap:** the guaranteed tail-call optimization (Doc 10 §6) is **not** implemented (LLVM may still optimize in release builds, but nothing is guaranteed).
+
+### 2. Typed AST (Doc 17 §1 "TYPED AST") — the design
+`TypeChecker` previously returned only errors. Smallest mechanism that gives codegen types: **`TypeChecker::expr_types: HashMap<usize, Ty>`**, filled in `check_expr`, keyed by the address of the `Expr` node (`&Expr as *const Expr as usize`; helper `type_of`). The AST is never mutated or moved after parsing (all nodes live in `Vec`/`Box` heap storage), so addresses are stable identities and no `id`/type slot had to be added to the AST. Codegen reads types with `ty_of(expr)`. A second table `try_info` records, per `try` expression, the resolved `(value type, error type)` of Doc 11 §3's wrapper. **Risk to know about:** this relies on node addresses; any pass that clones or rebuilds expressions must re-run the type checker afterwards (the desugar step does exactly that).
+
+### 3. `try`/`catch` is lowered by literal desugaring (Doc 11 §3, §3.1, §8; `src/desugar.rs`)
+Before IR generation `try { B } catch (e) { C }` becomes `match __try_block_N(<captured locals>) { Ok(_) => {}, Err(e) => { C } }` and a synthesized `fn __try_block_N(<captured>) -> Result<V, E> { B'; return Ok(<tail or ()>); }`, where `B'` has every `throw x` rewritten to `return Err(x)`. `V`/`E` come from the checker's `try_info` (Doc 11 §8.2 rule). The lowered program is type-checked **again** (it is ordinary source).
+- **Normalization rule for the IR-identity test:** the wrapper of the N-th `try` expression (0-based, source/pre-order) is named exactly `__try_block_N` and is inserted immediately before the item containing the `try`. The hand-written test program spells the same wrapper under that name and in that position; everything else is byte-identical, so `emit_ir` of both is compared with `assert_eq!` (debug and release). **This closes the Phase 9 §3 "NOT proven" item (a) and (b).** Test: `try_catch_ir_is_identical_to_the_hand_written_question_mark_chain` (+ a runtime-equivalence test).
+- **Captured variables (flagged interpretation).** Doc 11 §3's wrapper is a free function and never mentions captures. Locals of the enclosing function that the block *reads* are passed as by-value parameters (found by a scoped free-variable analysis). A block that **assigns to / mutably borrows** an outer local, or contains a `break`/`continue` that leaves the block, is rejected with "not yet supported by codegen — Phase 11" (needs by-reference capture). `return` inside `try` was already a type error (Doc 11 §8.1).
+
+### 4. Bugs found and fixed at the root while building this phase (front-end gaps the codegen programs exposed)
+1. **Parser: block-like statement did not end the statement.** `while c { .. } -1` parsed as `(while …) - 1`. A block-like expression (`if`/`match`/`loop`/`while`/`for`/`do`/`unsafe`/`try`/`{}`) in statement position now ends the statement (Rust rule). Tests: `block_like_statement_ends_the_statement`.
+2. **Parser: positional field access** `pair.0` (Doc 7 §2.4, Doc 5 §3.2) did not parse; `t.1.0` lexes as `t . 1.0` (a float) and is now split into two accesses.
+3. **Checker: tuple field typing** — `t.0` silently typed `()`; now typed, and an out-of-range index is an error.
+4. **Checker: `let (a, b) = pair;`** (Doc 5 §3.2, Doc 10 §3.3) reported `a`/`b` undefined; destructuring `let` now binds through `bind_pattern`.
+5. **Checker: `a ?? b`** checked the fallback against `Option<T>` instead of `T`, rejecting `first_even(3,8) ?? 0`; also `Result<T,_> ?? x` now yields `T`.
+6. **Checker: float literal suffix** `0.5f32` was ignored (typed `f64`); now honoured (Doc 2 §6.2).
+Sweeps: all existing `check_expr`/`check_binary` callers re-read; the full prior suite (243 tests) was re-run after each change.
+
+### 5. Flagged deviations / choices needing the owner's sign-off
+1. **`print`/`println`/`eprint`/`eprintln` as compiler intrinsics** until the Phase 16 prelude (as the prompt asked): ints, floats (printed with C `%g`), `bool`, `char` (UTF-8), and string values. A `String` is a static `{ptr, len}` view — no heap, no `+`, no `Display`. Marked in `codegen.rs`/`print.rs`; replace in Phase 16.
+2. **`mtnc build --emit-ir`** — a CLI flag the spec does not list; added so the IR can be inspected/tested. Remove if unwanted.
+3. **`fn main() -> Result<(), E>`** accepted (Err → exit 1); spec only shows it in Doc 19/24 examples.
+4. **`switch` whenever possible** (see §1), and **`panic` message has no file:line** (no spans on expressions).
+5. **Captured-variable handling for `try`** (§3) and the **Phase numbers in "not yet supported" messages** (§1) are my choices.
+6. **Debug is the default build mode; `--release` selects wrapping + `assert` stripping + `default<O2>`** — Doc 5 §2.1 defines the two behaviours but no CLI flag name.
+7. **Linking:** object file → system `cc` (no LTO). The CI runner provides `cc`.
+
+### 6. Files changed
+New: `src/codegen.rs`, `src/codegen/expr.rs`, `src/codegen/print.rs`, `src/desugar.rs`, `src/driver.rs`, `tests/e2e.rs`, `examples/{recursion,loops,shapes,results,trycatch,panics,overflow,numeric,mixed,control}.mtn`. Changed: `src/main.rs` (new CLI), `src/lib.rs` (modules), `src/types.rs` (typed table, try_info, §4 fixes), `src/parser.rs` (§4.1–4.2), `Cargo.toml` (inkwell), `examples/hello.mtn` (now a real hello world), `tests/generators.rs` (import), `.github/workflows/ci.yml`, `PROGRESS.md`.
+
+### 7. Tests (counts from `cargo test` in the sandbox, not from memory)
+Existing 243 unchanged and passing. New `tests/e2e.rs`: **35** (hello, recursion, loops/labels, structs/enums/match/tuples, Option/Result/`?`/`??`/`ensure`, `try`/`catch`, numerics, mixed, diverging control flow; panic → 101; debug overflow → 101; release wraps; div/mod by zero; `MIN / -1`; literal zero divisor = compile error; `assert` debug-only / `ensure` always; shift check/mask; exit-code forwarding; **rejection: type error, borrow error, non-exhaustive `match` → build fails, non-zero exit, no binary/object**; `check` runs the full front end; unsupported features give clear errors; IR: dense/enum `match` → `switch`, guarded `match` → no `switch`, debug uses overflow intrinsics and release does not, unsigned intrinsic, target-agnostic IR, no heap calls for structs; **`try`/`catch` IR == hand-written IR**, runtime equivalence, captured locals, outer-assignment rejected, nested `try`). **Expected total: 243 + 35 = 278.**
+
+### 8. What the manager should read in the CI log
+Job `build-and-test` (runs on `ubuntu-24.04`):
+1. **Install LLVM 18 development packages** — must succeed.
+2. **Build** — no `warning:`/`error:` lines (target: 0 warnings).
+3. **Run test suite** — per-target `test result:` lines: lib 60, borrow_checks 19, closures 10, control_flow 10, **e2e 35**, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, parser_doc24 6, traits_impls 15, types_doc5 26 → **grand total 278, 0 failed**. (e2e invokes the real `mtnc` and the system `cc`.)
+4. **Smoke test — mtnc --version** — prints `mtnc 0.1.0 (Phase 10 — LLVM IR codegen + native backend)`.
+5. **Smoke test — mtnc check on the examples directory** — prints `mtnc check: checked 11 file(s), 0 errors`.
+6. **Smoke test — mtnc run examples/hello.mtn** — `expected: Hello, Mountain!` and `actual:   Hello, Mountain!`; the step fails on any mismatch.
+
+### 9. Exit criterion (Doc 25, Phase 10)
+> A real `.mtn` program using only Phase 1–9 features compiles to a native binary and produces correct output when executed.
+Met locally: `mtnc run examples/hello.mtn` and the other 9 examples compile to native executables and print the asserted output. ⏳ pending the real CI run.
+
+## Phases 11–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
