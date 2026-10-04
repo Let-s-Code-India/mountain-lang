@@ -1,0 +1,59 @@
+// Mixed features: structs with Option fields, guards, early return, shadowing, 128-bit ints, casts.
+struct V2 { x: f64, y: f64 }
+struct Wrap { inner: Option<i32>, tag: bool }
+enum Tree { Leaf(i32), Node(i32, i32), Nothing }
+
+fn len2(v: V2) -> f64 { v.x * v.x + v.y * v.y }
+fn pick(w: Wrap) -> i32 {
+    match w.inner {
+        Some(n) if w.tag => n,
+        Some(n) => -n,
+        None => 0,
+    }
+}
+fn find(t: Tree) -> Option<i32> {
+    match t {
+        Tree::Leaf(v) => Some(v),
+        Tree::Node(a, b) => Some(a + b),
+        Tree::Nothing => None,
+    }
+}
+fn big(a: i128, b: i128) -> i128 { a * b }
+fn early(n: i32) -> i32 {
+    let mut i = 0;
+    while i < 100 {
+        if i == n { return i * 2; }
+        i += 1;
+    }
+    -1
+}
+fn flag(b: bool) -> i32 { match b { true => 1, false => 0 } }
+fn main() {
+    println(len2(V2 { x: 3.0, y: 4.0 }));
+    println(pick(Wrap { inner: Some(5), tag: true }));
+    println(pick(Wrap { inner: Some(5), tag: false }));
+    println(pick(Wrap { inner: None, tag: true }));
+    println(find(Tree::Node(2, 3)) ?? -1);
+    println(find(Tree::Nothing) ?? -1);
+    println(early(7));
+    println(early(500));
+    println(flag(true) + flag(false));
+    let x = 5;
+    let x = x * 2;
+    { let x = 100; println(x); }
+    println(x);
+    let ok = if x > 5 { 1 } else { 0 };
+    println(ok);
+    let c = 'a';
+    println(c as u32);
+    let h: u64 = 0xFF;
+    println(h);
+    let f: f32 = 1.5;
+    println(f < 2.0);
+    let m = big(3, 4);
+    println(m as i64);
+    let u: usize = 10;
+    println(u - 3);
+    let neg = -x;
+    println(neg);
+}
