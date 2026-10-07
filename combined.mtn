@@ -1,0 +1,43 @@
+// Combined 11a features: arrays in structs, methods on primitives (trait default), nested items, borrow recursion, variadics with no extras.
+struct Grid { cells: [i32; 3], n: i32 }
+struct P { x: i32, y: i32 }
+trait Twice { fn twice(borrow self) -> i32; fn quad(borrow self) -> i32 { self.twice() * 2 } }
+impl Twice for i32 { fn twice(borrow self) -> i32 { self * 2 } }
+impl Grid {
+    fn new() -> Grid { Grid { cells: [1, 2, 3], n: 3 } }
+    fn set(borrow mut self, i: usize, v: i32) { self.cells[i] = v; }
+    fn total(borrow self) -> i32 { self.cells[0] + self.cells[1] + self.cells[2] }
+    fn consume(self) -> i32 { self.n }
+}
+fn make() -> [i32; 3] { [7, 8, 9] }
+fn by_value(a: [i32; 3]) -> i32 { a[0] + a[2] }
+fn pts(ps: &[P]) -> i32 { ps[1].x + ps[0].y }
+fn count(...vals: i32) -> i32 { 99 }
+fn depth(borrow mut n: i32, k: i32) { if k > 0 { n += 1; depth(borrow mut n, k - 1); } }
+fn main() {
+    let mut g = Grid::new();
+    g.set(1, 50);
+    println(g.total());
+    println(g.consume());
+    println(make()[1]);
+    println(by_value(make()));
+    let ps: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }];
+    println(pts(borrow ps));
+    println(count());
+    let mut d = 0;
+    depth(borrow mut d, 5);
+    println(d);
+    let v: i32 = 21;
+    println(v.twice());
+    println(v.quad());
+    struct Local { a: i32 }
+    impl Local { fn get(borrow self) -> i32 { self.a } }
+    let l = Local { a: 6 };
+    println(l.get());
+    let mut m: [[i32; 2]; 2] = [[0, 0], [0, 0]];
+    m[1][0] = 5;
+    m[0][1] += 2;
+    println(m[1][0] + m[0][1]);
+    let r = borrow g;
+    println(r.n);
+}
