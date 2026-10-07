@@ -1,6 +1,6 @@
 [package]
 name = "mtnc"
-version = "0.1.0"
+version = "1.0.0-dev"
 edition = "2021"
 description = "Compiler for the Mountain programming language (mtnc)"
 
