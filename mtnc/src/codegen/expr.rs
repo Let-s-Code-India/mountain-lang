@@ -59,7 +59,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     fn gen_stmt(&mut self, s: &Stmt) -> R<()> {
         match s {
             Stmt::Let { pattern, ty, value, .. } => {
-                let annotated = ty.as_ref().map(resolve_type);
+                let annotated = ty.as_ref().map(|t| self.rty(t));
                 match value {
                     Some(v) => {
                         let vty = self.ty_of(v)?;
@@ -106,8 +106,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.terminate();
                 Ok(())
             }
-            Stmt::Yield(_) => unsupported("generators (`yield`)", 11),
-            Stmt::Item(_) => unsupported("items declared inside a function body", 11),
+            Stmt::Yield(_) => unsupported("generators (`yield`)", 12),
+            // Nested items were hoisted and registered with the module-level items.
+            Stmt::Item(_) => Ok(()),
             Stmt::TargetBlock(kind, b) => {
                 if matches!(kind, TargetKind::Native | TargetKind::All) {
                     self.gen_block(b)?;
@@ -237,8 +238,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::StructLit { name, fields, spread } => {
                 if spread.is_some() {
-                    return unsupported("struct update syntax (`..base`)", 11);
+                    return unsupported("struct update syntax (`..base`, needs the `Default` trait)", 16);
                 }
+                let self_name = self.cur_self.as_ref().map(|t| t.to_string());
+                let name: &String = &if name == "Self" { self_name.unwrap_or_else(|| name.clone()) } else { name.clone() };
                 let Some((decl, _)) = self.structs.get(name).cloned() else {
                     return Err(CgErr(format!("unknown struct `{}`", name)));
                 };
@@ -253,10 +256,38 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Field { expr: base, name } => {
                 let bty = self.ty_of(base)?;
+                if self.is_place_expr(base) || matches!(bty, Ty::Ref(..)) {
+                    // Read through the place (auto-deref of references, no whole-struct copy).
+                    let (p, t) = self.place(e)?;
+                    return self.load(p, &t);
+                }
                 let (idx, _) = self.field_index(&bty, name)?;
                 let bv = self.expr(base)?;
                 Ok(self.builder.build_extract_value(bv.into_struct_value(), idx, "field")?)
             }
+            Expr::Index { .. } => {
+                let (p, t) = self.place(e)?;
+                self.load(p, &t)
+            }
+            Expr::Array(items) => {
+                let ty = self.ty_of(e)?;
+                let Ty::Fixed(et, _) = &ty else {
+                    return unsupported("growable `[T]` array literals (annotate the type as `[T; N]`)", 11);
+                };
+                let et = (**et).clone();
+                let lt = self.llty(&ty)?.into_array_type();
+                let mut agg = lt.get_undef();
+                for (i, it) in items.iter().enumerate() {
+                    let v = self.expr_as(it, &et)?;
+                    agg = self.builder.build_insert_value(agg, v, i as u32, "elem")?.into_array_value();
+                }
+                Ok(agg.into())
+            }
+            Expr::Borrow { expr: inner, .. } => {
+                let ty = self.ty_of(e)?;
+                self.gen_borrow(&ty, inner)
+            }
+            Expr::MethodCall { receiver, name, args } => self.method_call(receiver, name, args),
             Expr::If(i) => {
                 let ty = self.ty_of(e)?;
                 self.gen_if(i, &ty)
@@ -292,13 +323,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ok(self.unit())
             }
             Expr::Range { .. } => unsupported("range values outside a `for` loop", 16),
-            Expr::Array(_) | Expr::Index { .. } => unsupported("arrays / indexing", 11),
-            Expr::Closure(_) => unsupported("closures", 11),
-            Expr::MethodCall { .. } => unsupported("method calls (`impl`/traits)", 11),
-            Expr::Borrow { .. } => unsupported("references (`borrow`)", 11),
-            Expr::Await(_) | Expr::Spawn { .. } | Expr::Select(_) => unsupported("`await`/`spawn`/`select` (async & concurrency)", 12),
+            Expr::Closure(_) => unsupported("closures", 12),
+            Expr::Await(_) | Expr::Spawn { .. } => unsupported("`await`/`spawn` (async & concurrency)", 12),
+            Expr::Select(_) => unsupported("`select` (channels)", 13),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
-            Expr::Yield(_) => unsupported("generators (`yield`)", 11),
+            Expr::Yield(_) => unsupported("generators (`yield`)", 12),
             Expr::TryCatch { .. } => Err(CgErr("internal: a `try`/`catch` reached codegen without being desugared".into())),
             Expr::Throw(_) => Err(CgErr("`throw` outside a `try` block".into())),
             Expr::Styled { .. } | Expr::Layout { .. } | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => unsupported("UI expressions", 19),
@@ -309,6 +338,20 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         if let Some((p, t)) = self.lookup_local(name) {
             return self.load(p, &t);
         }
+        if let Some((ce, cty)) = self.consts.get(name).cloned() {
+            // Document 3: a `const` is inlined at every use site.
+            self.const_depth += 1;
+            if self.const_depth > 64 {
+                self.const_depth -= 1;
+                return Err(CgErr(format!("constant `{}` refers to itself", name)));
+            }
+            let v = self.expr_as(ce, &cty);
+            self.const_depth -= 1;
+            return v;
+        }
+        if let Some((p, t)) = self.statics.get(name).cloned() {
+            return self.load(p, &t);
+        }
         if name == "None" {
             let ty = self.ty_of(e)?;
             if let Some(idx) = self.variant_index("None", &ty) {
@@ -317,7 +360,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return Err(CgErr("cannot determine the type of `None` here".into()));
         }
         if self.fns.contains_key(name) {
-            return unsupported("function values", 11);
+            return unsupported("function values", 12);
         }
         Err(CgErr(format!("undefined variable `{}`", name)))
     }
@@ -344,7 +387,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         })
     }
 
-    fn literal(&mut self, l: &Literal, ty: &Ty, neg: bool) -> R<V<'ctx>> {
+    pub(super) fn literal(&mut self, l: &Literal, ty: &Ty, neg: bool) -> R<V<'ctx>> {
         let int_val = match l {
             Literal::Int(t) => Some(parse_int_text(t, None)),
             Literal::IntHex(t) => Some(parse_int_text(t, Some(("0x", 16)))),
@@ -467,21 +510,484 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     // ---- places / assignment ---------------------------------------------
 
+    fn is_place_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Paren(i) => self.is_place_expr(i),
+            Expr::Ident(n) => self.lookup_local(n).is_some() || self.statics.contains_key(n.as_str()),
+            Expr::Field { .. } | Expr::Index { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// The memory location of `e`; an rvalue is first spilled to a temporary.
+    pub(super) fn place_or_spill(&mut self, e: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
+        if self.is_place_expr(e) {
+            return self.place(e);
+        }
+        let ty = self.ty_of(e)?;
+        let v = self.expr_as(e, &ty)?;
+        let p = self.spill(v, &ty)?;
+        Ok((p, ty))
+    }
+
     fn place(&mut self, e: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
         match e {
-            Expr::Ident(n) => self.lookup_local(n).ok_or_else(|| CgErr(format!("undefined variable `{}`", n))),
+            Expr::Ident(n) => {
+                if let Some(x) = self.lookup_local(n) {
+                    return Ok(x);
+                }
+                if let Some(x) = self.statics.get(n.as_str()) {
+                    return Ok(x.clone());
+                }
+                if let Some((ce, cty)) = self.consts.get(n.as_str()).cloned() {
+                    let v = self.expr_as(ce, &cty)?;
+                    let p = self.spill(v, &cty)?;
+                    return Ok((p, cty));
+                }
+                Err(CgErr(format!("undefined variable `{}`", n)))
+            }
             Expr::Paren(i) => self.place(i),
             Expr::Field { expr: base, name } => {
-                let (bp, bty) = self.place(base)?;
-                let (idx, fty) = self.field_index(&bty, name)?;
-                let st = self.llty(&bty)?;
+                let bty = self.ty_of(base)?;
+                let (bp, st_ty) = match &bty {
+                    Ty::Ref(_, inner) => {
+                        // auto-deref: the reference value is the pointer to the struct
+                        let mut v = self.expr(base)?;
+                        let mut cur: Ty = (**inner).clone();
+                        while let Ty::Ref(_, i2) = &cur {
+                            let lt = self.llty(i2)?;
+                            v = self.builder.build_load(lt, v.into_pointer_value(), "deref")?;
+                            cur = (**i2).clone();
+                        }
+                        (v.into_pointer_value(), cur)
+                    }
+                    other => {
+                        let (p, t) = self.place_or_spill(base)?;
+                        let _ = other;
+                        (p, t)
+                    }
+                };
+                let (idx, fty) = self.field_index(&st_ty, name)?;
+                let st = self.llty(&st_ty)?;
                 Ok((self.builder.build_struct_gep(st, bp, idx, "fp")?, fty))
             }
+            Expr::Index { expr: base, index } => self.index_place(base, index),
             _ => unsupported("this assignment target", 11),
         }
     }
 
+    // ---- arrays, slices, references (Phase 11a) -------------------------------
+
+    fn usize_ty(&self) -> IntType<'ctx> {
+        self.int_ty(self.ptr_bits())
+    }
+
+    /// Converts an integer index/bound to pointer width. A negative signed
+    /// value becomes a huge unsigned one and so fails the bounds check.
+    fn to_usize(&mut self, v: V<'ctx>, ty: &Ty) -> R<IntValue<'ctx>> {
+        if !is_int(ty) || matches!(ty, Ty::I128 | Ty::U128) {
+            return Err(CgErr(format!("an index must be a (non-128-bit) integer, found `{}`", ty)));
+        }
+        let iv = v.into_int_value();
+        let ut = self.usize_ty();
+        let (fb, tb) = (iv.get_type().get_bit_width(), ut.get_bit_width());
+        Ok(if fb == tb {
+            iv
+        } else if fb > tb {
+            self.builder.build_int_truncate(iv, ut, "")?
+        } else if is_signed(ty) {
+            self.builder.build_int_s_extend(iv, ut, "")?
+        } else {
+            self.builder.build_int_z_extend(iv, ut, "")?
+        })
+    }
+
+    /// `__mtn_oob(len, idx)` / `__mtn_slice_oob(lo, hi, len)`: print the
+    /// Document 22 §8 style message and exit with code 101.
+    fn oob_fn(&mut self, name: &str, nargs: usize, fmt: &str) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(name) {
+            return f;
+        }
+        let i32t = self.context.i32_type();
+        let i64t = self.int_ty(64);
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let dprintf = self.get_extern("dprintf", Some(i32t.into()), &[i32t.into(), ptr.into()], true);
+        let exit = self.get_extern("exit", None, &[i32t.into()], false);
+        self.noreturn(exit);
+        let ut = self.usize_ty();
+        let params: Vec<BasicMetadataTypeEnum> = (0..nargs).map(|_| ut.into()).collect();
+        let ft = self.context.void_type().fn_type(&params, false);
+        let f = self.module.add_function(name, ft, None);
+        self.noreturn(f);
+        let bb = self.context.append_basic_block(f, "entry");
+        let fmtp = self.c_str(fmt);
+        let b = self.context.create_builder();
+        b.position_at_end(bb);
+        let mut args: Vec<BasicMetadataValueEnum> = vec![i32t.const_int(2, false).into(), fmtp.into()];
+        for i in 0..nargs {
+            let p = f.get_nth_param(i as u32).unwrap().into_int_value();
+            let w = if p.get_type().get_bit_width() < 64 { b.build_int_z_extend(p, i64t, "").unwrap() } else { p };
+            args.push(w.into());
+        }
+        b.build_call(dprintf, &args, "").unwrap();
+        b.build_call(exit, &[i32t.const_int(101, false).into()], "").unwrap();
+        b.build_unreachable().unwrap();
+        f
+    }
+
+    fn bounds_check(&mut self, idx: IntValue<'ctx>, len: IntValue<'ctx>) -> R<()> {
+        let oob = self.builder.build_int_compare(IntPredicate::UGE, idx, len, "oob")?;
+        let f = self.oob_fn("__mtn_oob", 2, "thread 'main' panicked: index out of bounds: the length is %llu but the index is %llu\n");
+        let fail = self.new_block("oob");
+        let ok = self.new_block("inbounds");
+        self.builder.build_conditional_branch(oob, fail, ok)?;
+        self.builder.position_at_end(fail);
+        self.builder.build_call(f, &[len.into(), idx.into()], "")?;
+        self.builder.build_unreachable()?;
+        self.position(ok);
+        Ok(())
+    }
+
+    /// For an array-like expression: (data pointer, element type, length, whether the data is `[N x T]` or `T*`).
+    fn array_parts(&mut self, base: &Expr) -> R<(PointerValue<'ctx>, Ty, IntValue<'ctx>, Option<Ty>)> {
+        let bty = self.ty_of(base)?;
+        let ut = self.usize_ty();
+        match &bty {
+            Ty::Fixed(t, n) => {
+                let (p, _) = self.place_or_spill(base)?;
+                Ok((p, (**t).clone(), ut.const_int(*n, false), Some(bty.clone())))
+            }
+            Ty::Ref(_, inner) => match inner.as_ref() {
+                Ty::Fixed(t, n) => {
+                    let p = self.expr(base)?.into_pointer_value();
+                    Ok((p, (**t).clone(), ut.const_int(*n, false), Some((**inner).clone())))
+                }
+                Ty::Array(t) => {
+                    let sv = self.expr(base)?.into_struct_value();
+                    let data = self.builder.build_extract_value(sv, 0, "data")?.into_pointer_value();
+                    let len = self.builder.build_extract_value(sv, 1, "len")?.into_int_value();
+                    Ok((data, (**t).clone(), len, None))
+                }
+                other => Err(CgErr(format!("cannot index into `&{}`", other))),
+            },
+            Ty::Array(_) => unsupported("indexing a growable `[T]`", 11),
+            other => Err(CgErr(format!("cannot index into type `{}`", other))),
+        }
+    }
+
+    fn elem_ptr(&mut self, data: PointerValue<'ctx>, elem: &Ty, arr_ty: &Option<Ty>, idx: IntValue<'ctx>) -> R<PointerValue<'ctx>> {
+        let zero = self.usize_ty().const_zero();
+        // SAFETY: the index was bounds-checked against the array length just above.
+        unsafe {
+            Ok(match arr_ty {
+                Some(at) => {
+                    let lt = self.llty(at)?;
+                    self.builder.build_in_bounds_gep(lt, data, &[zero, idx], "elem")?
+                }
+                None => {
+                    let lt = self.llty(elem)?;
+                    self.builder.build_in_bounds_gep(lt, data, &[idx], "elem")?
+                }
+            })
+        }
+    }
+
+    fn index_place(&mut self, base: &Expr, index: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
+        let mut ie = index;
+        while let Expr::Paren(i) = ie {
+            ie = i;
+        }
+        if matches!(ie, Expr::Range { .. }) {
+            return Err(CgErr("a range index `a[lo..hi]` makes a slice: write `borrow a[lo..hi]`".into()));
+        }
+        let (data, elem, len, arr_ty) = self.array_parts(base)?;
+        let ity = self.ty_of(index)?;
+        let iv = self.expr_as(index, &ity)?;
+        let idx = self.to_usize(iv, &ity)?;
+        self.bounds_check(idx, len)?;
+        let p = self.elem_ptr(data, &elem, &arr_ty, idx)?;
+        Ok((p, elem))
+    }
+
+    /// `borrow x` / `borrow mut x` with result type `ty`.
+    fn gen_borrow(&mut self, ty: &Ty, inner: &Expr) -> R<V<'ctx>> {
+        let mut ie = inner;
+        while let Expr::Paren(i) = ie {
+            ie = i;
+        }
+        // `borrow a[lo..hi]` -> a slice view
+        if let Expr::Index { expr: base, index } = ie {
+            let mut ix: &Expr = index;
+            while let Expr::Paren(i) = ix {
+                ix = i;
+            }
+            if let Expr::Range { lo, hi, inclusive } = ix {
+                let (data, elem, len, arr_ty) = self.array_parts(base)?;
+                let (lt, ht) = (self.ty_of(lo)?, self.ty_of(hi)?);
+                let lv = self.expr_as(lo, &lt)?;
+                let hv = self.expr_as(hi, &ht)?;
+                let lo_i = self.to_usize(lv, &lt)?;
+                let mut hi_i = self.to_usize(hv, &ht)?;
+                let ut = self.usize_ty();
+                if *inclusive {
+                    // `lo..=hi` is `lo..hi+1`; `hi == usize::MAX` can never be in range.
+                    let full = self.builder.build_int_compare(IntPredicate::EQ, hi_i, ut.const_all_ones(), "")?;
+                    let f = self.oob_fn("__mtn_slice_oob", 3, "thread 'main' panicked: slice range out of bounds: the range is %llu..%llu but the length is %llu\n");
+                    let fail = self.new_block("slice_oob");
+                    let ok = self.new_block("slice_ok");
+                    self.builder.build_conditional_branch(full, fail, ok)?;
+                    self.builder.position_at_end(fail);
+                    self.builder.build_call(f, &[lo_i.into(), hi_i.into(), len.into()], "")?;
+                    self.builder.build_unreachable()?;
+                    self.position(ok);
+                    hi_i = self.builder.build_int_add(hi_i, ut.const_int(1, false), "")?;
+                }
+                let bad_order = self.builder.build_int_compare(IntPredicate::UGT, lo_i, hi_i, "")?;
+                let bad_end = self.builder.build_int_compare(IntPredicate::UGT, hi_i, len, "")?;
+                let bad = self.builder.build_or(bad_order, bad_end, "bad")?;
+                let f = self.oob_fn("__mtn_slice_oob", 3, "thread 'main' panicked: slice range out of bounds: the range is %llu..%llu but the length is %llu\n");
+                let fail = self.new_block("slice_oob");
+                let ok = self.new_block("slice_ok");
+                self.builder.build_conditional_branch(bad, fail, ok)?;
+                self.builder.position_at_end(fail);
+                self.builder.build_call(f, &[lo_i.into(), hi_i.into(), len.into()], "")?;
+                self.builder.build_unreachable()?;
+                self.position(ok);
+                let start = self.elem_ptr_raw(data, &elem, &arr_ty, lo_i)?;
+                let n = self.builder.build_int_sub(hi_i, lo_i, "n")?;
+                return self.build_slice(start, n);
+            }
+        }
+        match ty {
+            Ty::Ref(_, target) if matches!(**target, Ty::Array(_)) => {
+                let ity = self.ty_of(inner)?;
+                let ut = self.usize_ty();
+                match &ity {
+                    Ty::Fixed(_, n) => {
+                        let (p, _) = self.place_or_spill(inner)?;
+                        self.build_slice(p, ut.const_int(*n, false))
+                    }
+                    Ty::Ref(_, i2) => match i2.as_ref() {
+                        Ty::Array(_) => self.expr(inner),
+                        Ty::Fixed(_, n) => {
+                            let p = self.expr(inner)?.into_pointer_value();
+                            self.build_slice(p, ut.const_int(*n, false))
+                        }
+                        other => Err(CgErr(format!("cannot borrow `{}` as a slice", other))),
+                    },
+                    other => Err(CgErr(format!("cannot borrow `{}` as a slice", other))),
+                }
+            }
+            _ => {
+                let (p, _) = self.place_or_spill(inner)?;
+                Ok(p.into())
+            }
+        }
+    }
+
+    /// Pointer to element `idx` WITHOUT a bounds check (the caller checked the range).
+    fn elem_ptr_raw(&mut self, data: PointerValue<'ctx>, elem: &Ty, arr_ty: &Option<Ty>, idx: IntValue<'ctx>) -> R<PointerValue<'ctx>> {
+        self.elem_ptr(data, elem, arr_ty, idx)
+    }
+
+    fn build_slice(&mut self, data: PointerValue<'ctx>, len: IntValue<'ctx>) -> R<V<'ctx>> {
+        let st = self.str_ty();
+        let mut agg = st.get_undef();
+        agg = self.builder.build_insert_value(agg, data, 0, "")?.into_struct_value();
+        agg = self.builder.build_insert_value(agg, len, 1, "")?.into_struct_value();
+        Ok(agg.into())
+    }
+
+    // ---- calls: arguments, methods, associated functions ---------------------
+
+    /// One argument for parameter `p` (Document 10 §2, Document 6 §3).
+    fn gen_arg(&mut self, p: &ParamInfo<'a>, arg: &Expr) -> R<V<'ctx>> {
+        match p.mode {
+            PMode::Value | PMode::Variadic => self.expr_as(arg, &p.ty),
+            PMode::Ref(want_mut) => {
+                let mut a = arg;
+                while let Expr::Paren(i) = a {
+                    a = i;
+                }
+                if let Expr::Borrow { mutable, expr: inner } = a {
+                    if want_mut && !*mutable {
+                        return Err(CgErr(format!("parameter `{}` is `borrow mut`: pass `borrow mut <place>`", p.name)));
+                    }
+                    let (ptr, _) = self.place_or_spill(inner)?;
+                    return Ok(ptr.into());
+                }
+                let t = self.ty_of(a)?;
+                if matches!(t, Ty::Ref(..)) {
+                    return self.expr(a);
+                }
+                Err(CgErr(format!("the argument for the `borrow` parameter `{}` must be written `borrow <place>`", p.name)))
+            }
+        }
+    }
+
+    /// Matches call arguments to parameters: positional first, then named
+    /// (any order), defaults for the rest, extras into the variadic slice.
+    fn resolve_args(&mut self, fname: &str, params: &[ParamInfo<'a>], args: &[Arg]) -> R<Vec<V<'ctx>>> {
+        let n = params.len();
+        let var_idx = params.iter().position(|p| p.mode == PMode::Variadic);
+        let fixed_n = var_idx.unwrap_or(n);
+        let mut slots: Vec<Option<V<'ctx>>> = vec![None; n];
+        let mut extra: Vec<V<'ctx>> = Vec::new();
+        let mut seen_named = false;
+        let mut pos = 0usize;
+        for a in args {
+            match &a.name {
+                None => {
+                    if seen_named {
+                        return Err(CgErr(format!("call to `{}`: a positional argument cannot follow a named argument", fname)));
+                    }
+                    if pos < fixed_n {
+                        let p = params[pos].clone();
+                        slots[pos] = Some(self.gen_arg(&p, &a.value)?);
+                    } else if let Some(vi) = var_idx {
+                        let et = params[vi].ty.clone();
+                        extra.push(self.expr_as(&a.value, &et)?);
+                    } else {
+                        return Err(CgErr(format!("`{}` takes {} argument(s), but more were given", fname, n)));
+                    }
+                    pos += 1;
+                }
+                Some(nm) => {
+                    seen_named = true;
+                    let Some(i) = params.iter().position(|p| &p.name == nm && p.mode != PMode::Variadic) else {
+                        return Err(CgErr(format!("`{}` has no parameter named `{}` (Document 10 §2.2: named arguments must match the declared names)", fname, nm)));
+                    };
+                    if slots[i].is_some() {
+                        return Err(CgErr(format!("call to `{}`: parameter `{}` is given twice", fname, nm)));
+                    }
+                    let p = params[i].clone();
+                    slots[i] = Some(self.gen_arg(&p, &a.value)?);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            if p.mode == PMode::Variadic {
+                out.push(self.variadic_slice(&p.ty, &extra)?);
+                continue;
+            }
+            match slots[i].take() {
+                Some(v) => out.push(v),
+                None => match p.default {
+                    Some(d) => out.push(self.expr_as(d, &p.ty)?),
+                    None => return Err(CgErr(format!("call to `{}` is missing the argument for parameter `{}`", fname, p.name))),
+                },
+            }
+        }
+        Ok(out)
+    }
+
+    /// The extra arguments of a variadic call, as a stack array viewed as a slice.
+    fn variadic_slice(&mut self, elem: &Ty, vals: &[V<'ctx>]) -> R<V<'ctx>> {
+        let et = self.llty(elem)?;
+        let arr_ty = et.array_type(vals.len() as u32);
+        let slot = self.alloca(arr_ty.into(), "varargs")?;
+        let zero = self.usize_ty().const_zero();
+        for (i, v) in vals.iter().enumerate() {
+            let idx = self.usize_ty().const_int(i as u64, false);
+            // SAFETY: `i < vals.len()`, the array's length.
+            let ep = unsafe { self.builder.build_in_bounds_gep(arr_ty, slot, &[zero, idx], "va")? };
+            self.builder.build_store(ep, *v)?;
+        }
+        let len = self.usize_ty().const_int(vals.len() as u64, false);
+        self.build_slice(slot, len)
+    }
+
+    fn call_fn(&mut self, key: &str, display: &str, recv: Option<V<'ctx>>, args: &[Arg]) -> R<V<'ctx>> {
+        let (fv, params, ret) = {
+            let i = &self.fns[key];
+            (i.val, i.params.clone(), i.ret.clone())
+        };
+        let mut vals: Vec<BasicMetadataValueEnum> = Vec::new();
+        if let Some(r) = recv {
+            vals.push(r.into());
+        }
+        for v in self.resolve_args(display, &params, args)? {
+            vals.push(v.into());
+        }
+        let call = self.builder.build_call(fv, &vals, "")?;
+        if ret == Ty::Never {
+            self.builder.build_unreachable()?;
+            self.terminate();
+            return Ok(self.unit());
+        }
+        match call.try_as_basic_value() {
+            ValueKind::Basic(v) => Ok(v),
+            ValueKind::Instruction(_) => Ok(self.unit()),
+        }
+    }
+
+    fn find_method(&self, tystr: &str, name: &str) -> Option<String> {
+        self.methods.get(&(tystr.to_string(), name.to_string())).and_then(|v| v.first().cloned())
+    }
+
+    fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+        let rty = self.ty_of(receiver)?;
+        let mut base = rty.clone();
+        while let Ty::Ref(_, i) = base {
+            base = *i;
+        }
+        if let Ty::DynTrait(_) = base {
+            return unsupported("method calls on `dyn Trait` (dynamic dispatch)", 11);
+        }
+        let tystr = base.to_string();
+        let Some(key) = self.find_method(&tystr, name) else {
+            return Err(CgErr(format!("no method named `{}` found for type `{}` (standard-library methods arrive with the prelude in Phase 16)", name, tystr)));
+        };
+        let Some(kind) = self.fns[&key].self_kind else {
+            return Err(CgErr(format!("`{}::{}` is an associated function without `self`: call it as `{}::{}(..)`", tystr, name, tystr, name)));
+        };
+        let recv: V<'ctx> = match kind {
+            PMode::Ref(_) => {
+                if matches!(rty, Ty::Ref(..)) {
+                    let mut v = self.expr(receiver)?;
+                    let mut cur = rty.clone();
+                    while let Ty::Ref(_, i) = &cur {
+                        if matches!(**i, Ty::Ref(..)) {
+                            let lt = self.llty(i)?;
+                            v = self.builder.build_load(lt, v.into_pointer_value(), "deref")?;
+                            cur = (**i).clone();
+                        } else {
+                            break;
+                        }
+                    }
+                    v
+                } else {
+                    self.place_or_spill(receiver)?.0.into()
+                }
+            }
+            _ => {
+                if let Ty::Ref(_, inner) = &rty {
+                    let p = self.expr(receiver)?.into_pointer_value();
+                    self.load(p, inner)?
+                } else {
+                    self.expr_as(receiver, &base)?
+                }
+            }
+        };
+        let display = format!("{}::{}", tystr, name);
+        self.call_fn(&key, &display, Some(recv), args)
+    }
+
     fn assign(&mut self, op: AssignOp, lhs: &Expr, rhs: &Expr) -> R<()> {
+        let mut root = lhs;
+        loop {
+            match root {
+                Expr::Paren(i) => root = i,
+                Expr::Field { expr, .. } | Expr::Index { expr, .. } => root = expr,
+                _ => break,
+            }
+        }
+        if let Expr::Ident(n) = root {
+            if self.lookup_local(n).is_none() && (self.statics.contains_key(n.as_str()) || self.consts.contains_key(n.as_str())) {
+                return Err(CgErr(format!("cannot assign to the constant/static `{}` (statics are immutable; interior mutability needs `Atomic<T>`, Phase 13)", n)));
+            }
+        }
         let (p, lty) = self.place(lhs)?;
         if op == AssignOp::Eq {
             let rty = self.ty_of(rhs)?;
@@ -1421,9 +1927,6 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // ---- calls --------------------------------------------------------------------
 
     fn call(&mut self, whole: &Expr, callee: &Expr, args: &[Arg]) -> R<V<'ctx>> {
-        if args.iter().any(|a| a.name.is_some()) {
-            return unsupported("named arguments", 11);
-        }
         match callee {
             Expr::Ident(name) => {
                 let user_fn = self.fns.contains_key(name.as_str());
@@ -1438,27 +1941,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     }
                 }
                 if user_fn {
-                    let (fv, ptys, ret) = {
-                        let i = &self.fns[name.as_str()];
-                        (i.val, i.params.clone(), i.ret.clone())
-                    };
-                    if ptys.len() != args.len() {
-                        return Err(CgErr(format!("`{}` expects {} argument(s), found {}", name, ptys.len(), args.len())));
-                    }
-                    let mut vals: Vec<BasicMetadataValueEnum> = Vec::new();
-                    for (a, t) in args.iter().zip(ptys.iter()) {
-                        vals.push(self.expr_as(&a.value, t)?.into());
-                    }
-                    let call = self.builder.build_call(fv, &vals, "")?;
-                    if ret == Ty::Never {
-                        self.builder.build_unreachable()?;
-                        self.terminate();
-                        return Ok(self.unit());
-                    }
-                    return match call.try_as_basic_value() {
-                        ValueKind::Basic(v) => Ok(v),
-                        ValueKind::Instruction(_) => Ok(self.unit()),
-                    };
+                    let key = name.clone();
+                    return self.call_fn(&key, name, None, args);
+                }
+                if args.iter().any(|a| a.name.is_some()) {
+                    return unsupported("named arguments here", 11);
                 }
                 if let Some((fields, true)) = self.structs.get(name.as_str()).cloned() {
                     if fields.len() != args.len() {
@@ -1471,28 +1958,49 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return self.build_struct(&Ty::Named(name.clone()), vals);
                 }
                 if self.lookup_local(name).is_some() {
-                    return unsupported("calling a function value / closure", 11);
+                    return unsupported("calling a function value / closure", 12);
                 }
                 Err(CgErr(format!("unknown function `{}` (standard-library functions arrive with the prelude in Phase 16)", name)))
             }
             Expr::Path(path) => {
-                if let [_, variant] = path.as_slice() {
+                if let [tn, fname] = path.as_slice() {
                     let ty = self.ty_of(whole)?;
-                    if let Some(idx) = self.variant_index(variant, &ty) {
-                        let ftys = self.variants_of(&ty).unwrap()[idx].1.clone();
-                        if ftys.len() != args.len() {
-                            return Err(CgErr(format!("`{}` takes {} field(s), found {}", path.join("::"), ftys.len(), args.len())));
+                    // enum variant constructor `Enum::Variant(..)`
+                    let enum_ty = if tn == "Self" { self.cur_self.clone().unwrap_or_else(|| ty.clone()) } else { ty.clone() };
+                    if let Some(idx) = self.variant_index(fname, &enum_ty) {
+                        if matches!(&enum_ty, Ty::Named(n) if n == tn || tn == "Self") {
+                            let ftys = self.variants_of(&enum_ty).unwrap()[idx].1.clone();
+                            if ftys.len() != args.len() {
+                                return Err(CgErr(format!("`{}` takes {} field(s), found {}", path.join("::"), ftys.len(), args.len())));
+                            }
+                            let mut vals = Vec::new();
+                            for (a, t) in args.iter().zip(ftys.iter()) {
+                                vals.push(self.expr_as(&a.value, t)?);
+                            }
+                            return self.make_enum(&enum_ty, idx, vals);
                         }
-                        let mut vals = Vec::new();
-                        for (a, t) in args.iter().zip(ftys.iter()) {
-                            vals.push(self.expr_as(&a.value, t)?);
-                        }
-                        return self.make_enum(&ty, idx, vals);
                     }
+                    // associated function `Type::name(..)` / `Self::name(..)`
+                    let tystr = if tn == "Self" {
+                        self.cur_self.as_ref().map(|t| t.to_string()).ok_or_else(|| CgErr("`Self` used outside an `impl` block".into()))?
+                    } else {
+                        resolve_type(&Type::Primitive(tn.clone())).to_string()
+                    };
+                    if let Some(key) = self.find_method(&tystr, fname) {
+                        if self.fns[&key].self_kind.is_some() {
+                            return Err(CgErr(format!("`{}::{}` takes `self`: call it as `value.{}(..)`", tystr, fname, fname)));
+                        }
+                        let display = format!("{}::{}", tystr, fname);
+                        return self.call_fn(&key, &display, None, args);
+                    }
+                    if matches!(tn.as_str(), "Box" | "Rc" | "Arc" | "Weak") {
+                        return unsupported(&format!("`{}::{}` (heap / shared-ownership types)", tn, fname), 11);
+                    }
+                    return Err(CgErr(format!("no associated function `{}::{}` found", tn, fname)));
                 }
-                unsupported("calling a path (modules / associated functions)", 14)
+                unsupported("calling a path (modules)", 14)
             }
-            _ => unsupported("calling a computed function value", 11),
+            _ => unsupported("calling a computed function value", 12),
         }
     }
 

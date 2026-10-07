@@ -132,7 +132,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 call_args.push(self.c_str(&fmt).into());
                 call_args.push(s.into());
             }
-            Ty::StringTy => {
+            Ty::StringTy | Ty::Ref(_, _) if matches!(&ty, Ty::StringTy) || matches!(&ty, Ty::Ref(_, i) if **i == Ty::Str) => {
                 let sv = v.into_struct_value();
                 let p = self.builder.build_extract_value(sv, 0, "")?;
                 let n = self.builder.build_extract_value(sv, 1, "")?.into_int_value();
