@@ -40,7 +40,7 @@ enum ChildMut<'a> {
     B(&'a mut Block),
 }
 
-enum Child<'a> {
+pub(crate) enum Child<'a> {
     E(&'a Expr),
     B(&'a Block),
 }
@@ -95,7 +95,7 @@ fn block_children_mut(b: &mut Block) -> Vec<ChildMut<'_>> {
     out
 }
 
-fn block_children(b: &Block) -> Vec<Child<'_>> {
+pub(crate) fn block_children(b: &Block) -> Vec<Child<'_>> {
     let mut out = Vec::new();
     for s in b.stmts.iter() {
         match s {
@@ -213,7 +213,7 @@ fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
     out
 }
 
-fn expr_children(e: &Expr) -> Vec<Child<'_>> {
+pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
     let mut out = Vec::new();
     match e {
         Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) => out.push(Child::E(x)),
@@ -553,6 +553,8 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
         Ty::OptionTy(i) => Type::Option(Box::new(ty_to_type(i)?)),
         Ty::ResultTy(o, e) => Type::Result(Box::new(ty_to_type(o)?), Box::new(ty_to_type(e)?)),
         Ty::Ref(m, i) => Type::Ref { lifetime: None, mutable: *m, inner: Box::new(ty_to_type(i)?) },
+        Ty::Array(i) => Type::Array(Box::new(ty_to_type(i)?), None),
+        Ty::Fixed(i, n) => Type::Array(Box::new(ty_to_type(i)?), Some(Box::new(Expr::Literal(Literal::Int(n.to_string()))))),
         _ => return None,
     })
 }
@@ -757,4 +759,97 @@ pub fn desugar_try(program: &mut Program, tc: &TypeChecker) -> Result<(), Vec<St
     } else {
         Err(ctx.errors)
     }
+}
+
+/// Every item of `program`: the top-level ones and (hoisted, recursively) the
+/// items declared inside function bodies (Phase 11a, Doc 25 §2.5 "nested
+/// items inside functions"). Order: an item, then the items nested in its
+/// bodies, then the next item.
+pub fn all_items(program: &Program) -> Vec<&Item> {
+    fn in_block<'a>(b: &'a Block, out: &mut Vec<&'a Item>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Item(i) => push_item(i, out),
+                Stmt::TargetBlock(_, blk) => in_block(blk, out),
+                _ => {}
+            }
+        }
+        for c in block_children(b) {
+            match c {
+                Child::E(e) => in_expr(e, out),
+                Child::B(bb) => in_block(bb, out),
+            }
+        }
+    }
+    fn in_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Item>) {
+        for c in expr_children(e) {
+            match c {
+                Child::E(x) => in_expr(x, out),
+                Child::B(bb) => in_block(bb, out),
+            }
+        }
+    }
+    fn push_item<'a>(it: &'a Item, out: &mut Vec<&'a Item>) {
+        out.push(it);
+        match &it.kind {
+            ItemKind::Fn(f) => {
+                if let Some(b) = &f.body {
+                    in_block(b, out);
+                }
+            }
+            ItemKind::Impl(im) => {
+                for ii in &im.items {
+                    if let ImplItem::Fn(f) = ii {
+                        if let Some(b) = &f.body {
+                            in_block(b, out);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for it in &program.items {
+        push_item(it, &mut out);
+    }
+    out
+}
+
+/// Copies every trait default method (Document 7 §4.3) that an `impl Trait for
+/// Type` does not override into that impl, so each implementing type gets its own
+/// statically-dispatched copy, type-checked with `Self` = that type (Phase 11a;
+/// the checker does not check trait default bodies themselves). Returns whether
+/// anything changed (the caller then re-checks the program).
+pub fn inline_default_methods(program: &mut Program) -> bool {
+    use std::collections::HashMap;
+    let mut defaults: HashMap<String, Vec<FnDecl>> = HashMap::new();
+    for it in &program.items {
+        if let ItemKind::Trait(t) = &it.kind {
+            let fs: Vec<FnDecl> = t
+                .items
+                .iter()
+                .filter_map(|ti| match ti {
+                    TraitItem::Fn(f) if f.body.is_some() => Some(f.clone()),
+                    _ => None,
+                })
+                .collect();
+            defaults.insert(t.name.clone(), fs);
+        }
+    }
+    let mut changed = false;
+    for it in program.items.iter_mut() {
+        if let ItemKind::Impl(im) = &mut it.kind {
+            let Some(tr) = &im.trait_ref else { continue };
+            let Some(fs) = defaults.get(&tr.name) else { continue };
+            for f in fs {
+                let overridden = im.items.iter().any(|ii| matches!(ii, ImplItem::Fn(g) if g.name == f.name));
+                if !overridden {
+                    im.items.push(ImplItem::Fn(f.clone()));
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }

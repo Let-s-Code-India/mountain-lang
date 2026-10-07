@@ -63,25 +63,32 @@ fn machine(release: bool) -> Result<TargetMachine, String> {
         .ok_or_else(|| "could not create an LLVM target machine for this host".to_string())
 }
 
+fn recheck(program: &Program, what: &str) -> Result<TypeChecker, Vec<String>> {
+    let mut tc2 = TypeChecker::new();
+    tc2.check_program(program);
+    if !tc2.errors.is_empty() {
+        let mut e = vec![format!("internal error: the program failed to type-check after {}", what)];
+        e.extend(tc2.errors.iter().map(|x| x.to_string()));
+        return Err(e);
+    }
+    Ok(tc2)
+}
+
 /// Front end + desugaring + IR generation, then `f` is given the finished
 /// (verified) module. Everything LLVM-related lives inside this call.
 fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Module, &TargetMachine) -> Result<T, Vec<String>>) -> Result<T, Vec<String>> {
     let Checked { mut program, tc } = check_source(src)?;
-    let tc = if desugar::contains_try(&program) {
+    let mut tc = tc;
+    // Lowering passes that rewrite the AST; after each, the program is checked
+    // again (the synthesized code is ordinary source, and the typed table is
+    // keyed by node address, so it must be rebuilt for the new tree).
+    if desugar::inline_default_methods(&mut program) {
+        tc = recheck(&program, "inlining trait default methods")?;
+    }
+    if desugar::contains_try(&program) {
         desugar::desugar_try(&mut program, &tc)?;
-        // The synthesized wrappers are ordinary source: check the lowered
-        // program again, so codegen sees types for every new node.
-        let mut tc2 = TypeChecker::new();
-        tc2.check_program(&program);
-        if !tc2.errors.is_empty() {
-            let mut e = vec!["internal error: the desugared `try`/`catch` program failed to type-check".to_string()];
-            e.extend(tc2.errors.iter().map(|x| x.to_string()));
-            return Err(e);
-        }
-        tc2
-    } else {
-        tc
-    };
+        tc = recheck(&program, "desugaring `try`/`catch`")?;
+    }
     let tm = machine(opts.release).map_err(|e| vec![e])?;
     let context = Context::create();
     let mut cg = Codegen::new(&context, "mountain", tm.get_target_data(), &tc.expr_types, opts.clone());

@@ -49,6 +49,11 @@ pub enum Ty {
     Unit,
     Never,
     Array(Box<Ty>),
+    /// Phase 11a (Document 5 §3.1): the fixed-size array `[T; N]`, size is part
+    /// of the type. Produced only when `N` is an integer literal or a `const`
+    /// item; any other size expression (e.g. a const-generic `ROWS * COLS`,
+    /// Document 8 §8) still resolves to the unsized `Array` as before.
+    Fixed(Box<Ty>, u64),
     Tuple(Vec<Ty>),
     Ref(bool, Box<Ty>),
     /// A user-declared struct or enum with no generic parameters, by
@@ -117,6 +122,7 @@ impl std::fmt::Display for Ty {
             Ty::StringTy => write!(f, "String"), Ty::Str => write!(f, "str"),
             Ty::Unit => write!(f, "()"), Ty::Never => write!(f, "!"),
             Ty::Array(t) => write!(f, "[{}]", t),
+            Ty::Fixed(t, n) => write!(f, "[{}; {}]", t, n),
             Ty::Tuple(ts) => write!(f, "({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Ref(m, t) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Ty::Named(n) => write!(f, "{}", n),
@@ -188,6 +194,18 @@ fn expr_diverges(e: &Expr) -> bool {
     }
 }
 
+/// The type a CALLER's argument must have for `p` (Phase 11a): a `borrow x: T` /
+/// `borrow mut x: T` parameter is passed as the reference `borrow x`, i.e. `&T` /
+/// `&mut T` (inside the function the parameter name is used as a plain `T`,
+/// Document 6 §3 / Document 10 §2).
+fn arg_ty(p: &Param, base: Ty) -> Ty {
+    match p.ownership {
+        OwnershipMod::Borrow if !p.is_variadic => Ty::Ref(false, Box::new(base)),
+        OwnershipMod::BorrowMut if !p.is_variadic => Ty::Ref(true, Box::new(base)),
+        _ => base,
+    }
+}
+
 fn ty_is_integer(t: &Ty) -> bool {
     matches!(t, Ty::I8|Ty::I16|Ty::I32|Ty::I64|Ty::I128|Ty::Isize|Ty::U8|Ty::U16|Ty::U32|Ty::U64|Ty::U128|Ty::Usize)
 }
@@ -205,6 +223,77 @@ fn ty_is_numeric(t: &Ty) -> bool {
 /// rather than failing here — this function is pure syntax-to-shape
 /// translation, not validation.
 pub fn resolve_type(t: &Type) -> Ty {
+    resolve_type_depth(t, 0)
+}
+
+thread_local! {
+    /// Phase 11a: `type Name = ...;` aliases of the program being compiled
+    /// (Document 3 Category A `type`: "purely a compile-time naming
+    /// convenience"). `resolve_type` is a free function without access to the
+    /// checker, so the item context is kept per thread; it is (re)filled by
+    /// `register_item_context` at the start of every check/codegen.
+    static ALIASES: std::cell::RefCell<HashMap<String, Type>> = std::cell::RefCell::new(HashMap::new());
+    /// Phase 11a: integer-valued `const` items, so `[T; N]` with a named
+    /// constant `N` resolves to a fixed array.
+    static CONSTS: std::cell::RefCell<HashMap<String, i128>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Integer constant folding for array sizes / `const` items (literals, other
+/// consts, parentheses, unary minus, `+ - * / % <<`).
+pub fn eval_const_int(e: &Expr, consts: &HashMap<String, i128>) -> Option<i128> {
+    match e {
+        Expr::Literal(Literal::Int(t)) => t.replace('_', "").parse::<i128>().ok(),
+        Expr::Literal(Literal::IntHex(t)) => i128::from_str_radix(t.replace('_', "").trim_start_matches("0x"), 16).ok(),
+        Expr::Literal(Literal::IntOct(t)) => i128::from_str_radix(t.replace('_', "").trim_start_matches("0o"), 8).ok(),
+        Expr::Literal(Literal::IntBin(t)) => i128::from_str_radix(t.replace('_', "").trim_start_matches("0b"), 2).ok(),
+        Expr::Paren(i) => eval_const_int(i, consts),
+        Expr::Ident(n) => consts.get(n).copied(),
+        Expr::Unary { op: UnaryOp::Neg, expr } => eval_const_int(expr, consts)?.checked_neg(),
+        Expr::Binary { op, lhs, rhs } => {
+            let (a, b) = (eval_const_int(lhs, consts)?, eval_const_int(rhs, consts)?);
+            match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Sub => a.checked_sub(b),
+                BinaryOp::Mul => a.checked_mul(b),
+                BinaryOp::Div => a.checked_div(b),
+                BinaryOp::Mod => a.checked_rem(b),
+                BinaryOp::Shl => u32::try_from(b).ok().and_then(|s| a.checked_shl(s)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Fills the per-thread alias / constant tables from `items` (top-level and
+/// hoisted nested items). Idempotent.
+pub fn register_item_context(items: &[&Item]) {
+    let mut aliases = HashMap::new();
+    for it in items {
+        if let ItemKind::TypeAlias(a) = &it.kind {
+            if a.generics.0.is_empty() {
+                aliases.insert(a.name.clone(), a.ty.clone());
+            }
+        }
+    }
+    ALIASES.with(|c| *c.borrow_mut() = aliases);
+    let mut consts: HashMap<String, i128> = HashMap::new();
+    for _ in 0..8 {
+        for it in items {
+            if let ItemKind::Const(c) = &it.kind {
+                if !consts.contains_key(&c.name) {
+                    if let Some(v) = eval_const_int(&c.value, &consts) {
+                        consts.insert(c.name.clone(), v);
+                    }
+                }
+            }
+        }
+    }
+    CONSTS.with(|c| *c.borrow_mut() = consts);
+}
+
+fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
+    let alias = |name: &str| -> Option<Type> { ALIASES.with(|a| a.borrow().get(name).cloned()) };
     match t {
         Type::Primitive(s) => match s.as_str() {
             "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "i64" => Ty::I64,
@@ -214,16 +303,33 @@ pub fn resolve_type(t: &Type) -> Ty {
             "f32" => Ty::F32, "f64" => Ty::F64,
             "bool" => Ty::Bool, "char" => Ty::Char,
             "String" => Ty::StringTy, "str" => Ty::Str,
-            other => Ty::Named(other.to_string()),
+            other => match alias(other) {
+                Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
+                _ => Ty::Named(other.to_string()),
+            },
         },
-        Type::Named(n, _args) => Ty::Named(n.clone()),
-        Type::Array(inner, _size) => Ty::Array(Box::new(resolve_type(inner))),
-        Type::Tuple(ts) => Ty::Tuple(ts.iter().map(resolve_type).collect()),
-        Type::Ref { mutable, inner, .. } => Ty::Ref(*mutable, Box::new(resolve_type(inner))),
+        Type::Named(n, _args) => match alias(n) {
+            Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
+            _ => Ty::Named(n.clone()),
+        },
+        Type::Array(inner, size) => {
+            let elem = resolve_type_depth(inner, depth);
+            if let Some(sz) = size {
+                let n = CONSTS.with(|c| eval_const_int(sz, &c.borrow()));
+                if let Some(n) = n {
+                    if (0..=u32::MAX as i128).contains(&n) {
+                        return Ty::Fixed(Box::new(elem), n as u64);
+                    }
+                }
+            }
+            Ty::Array(Box::new(elem))
+        }
+        Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|x| resolve_type_depth(x, depth)).collect()),
+        Type::Ref { mutable, inner, .. } => Ty::Ref(*mutable, Box::new(resolve_type_depth(inner, depth))),
         Type::Dyn(n, _) => Ty::DynTrait(n.clone()),
-        Type::Fn(ps, r) => Ty::Fn(ps.iter().map(resolve_type).collect(), Box::new(resolve_type(r))),
-        Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type(inner))),
-        Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type(o)), Box::new(resolve_type(e))),
+        Type::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| resolve_type_depth(x, depth)).collect(), Box::new(resolve_type_depth(r, depth))),
+        Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type_depth(inner, depth))),
+        Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type_depth(o, depth)), Box::new(resolve_type_depth(e, depth))),
         Type::Unit => Ty::Unit,
         Type::Never => Ty::Never,
         Type::ConstArg(_) => Ty::Unit, // not a real type position; see const_int_value below for the Phase 5 handling
@@ -255,6 +361,7 @@ fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Array(inner) => Ty::Array(Box::new(substitute_type_params(inner, subst))),
+        Ty::Fixed(inner, n) => Ty::Fixed(Box::new(substitute_type_params(inner, subst)), *n),
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute_type_params(t, subst)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(*m, Box::new(substitute_type_params(inner, subst))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(substitute_type_params(inner, subst))),
@@ -288,6 +395,7 @@ fn unify_infer(param_ty: &Ty, arg_ty: &Ty, out: &mut HashMap<String, Ty>) {
             out.entry(n.clone()).or_insert_with(|| t.clone());
         }
         (Ty::Array(p), Ty::Array(a)) => unify_infer(p, a, out),
+        (Ty::Array(p), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) => unify_infer(p, a, out),
         (Ty::Ref(_, p), Ty::Ref(_, a)) => unify_infer(p, a, out),
         (Ty::Tuple(ps), Ty::Tuple(as_)) if ps.len() == as_.len() => {
             for (p, a) in ps.iter().zip(as_.iter()) {
@@ -362,6 +470,7 @@ fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
     match ty {
         Ty::Named(n) if param_names.contains(&n) => Ty::TypeParam(n),
         Ty::Array(inner) => Ty::Array(Box::new(mark_type_params(*inner, param_names))),
+        Ty::Fixed(inner, n) => Ty::Fixed(Box::new(mark_type_params(*inner, param_names)), n),
         Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|t| mark_type_params(t, param_names)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(m, Box::new(mark_type_params(*inner, param_names))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(mark_type_params(*inner, param_names))),
@@ -431,6 +540,12 @@ pub struct TypeChecker {
     functions: HashMap<String, FunctionShape>,
     traits: HashMap<String, TraitShape>,
     impls_by_type: HashMap<String, Vec<ImplRecord>>,
+    /// Phase 11a: `const`/`static` items (name -> declared type); an identifier
+    /// that is not a local resolves here.
+    globals: HashMap<String, Ty>,
+    /// Phase 11a: the concrete type of the `impl` whose method is being checked
+    /// (what `Self` means in expressions: `Self { .. }`, `Self::new()`).
+    self_type: Option<Ty>,
     /// Stack of currently-enclosing loops (Phase 8, Document 9 §3.5),
     /// innermost last. Replaces an earlier draft that walked each
     /// `loop`'s body twice (once to collect `break <value>;` types,
@@ -593,6 +708,8 @@ impl TypeChecker {
             propagations: Vec::new(),
             expr_types: HashMap::new(),
             try_info: HashMap::new(),
+            globals: HashMap::new(),
+            self_type: None,
             errors: Vec::new(),
         }
     }
@@ -684,11 +801,16 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, program: &Program) {
+        // Phase 11a: items declared inside function bodies are hoisted (they
+        // are checked and registered like top-level items; same-named nested
+        // items of different functions are rejected by codegen).
+        let items = crate::desugar::all_items(program);
+        register_item_context(&items);
         // Pass 1: register all struct/enum/trait data shapes and fn
         // signatures first, so forward references (a function defined
         // before a struct it uses, or mutual struct references) resolve
         // regardless of declaration order.
-        for item in &program.items {
+        for item in &items {
             self.register_item(item);
         }
         // Pass 2: register and validate every `impl` block -- run only
@@ -696,18 +818,24 @@ impl TypeChecker {
         // still resolves correctly, and so the orphan-rule / required-
         // method-completeness checks have the full struct/enum/trait
         // picture available regardless of declaration order.
-        for item in &program.items {
+        for item in &items {
             self.register_impls(item);
         }
         // Pass 3: type-check every function body (can now resolve
         // method calls via `impls_by_type`/`traits`).
-        for item in &program.items {
+        for item in &items {
             self.check_item(item);
         }
     }
 
     fn register_item(&mut self, item: &Item) {
         match &item.kind {
+            ItemKind::Const(c) => {
+                self.globals.insert(c.name.clone(), resolve_type(&c.ty));
+            }
+            ItemKind::Static(c) => {
+                self.globals.insert(c.name.clone(), resolve_type(&c.ty));
+            }
             ItemKind::Struct(s) => {
                 let generics = s.generics.0.clone();
                 let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
@@ -746,7 +874,7 @@ impl TypeChecker {
                 }).collect();
                 let params = f.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| mark_type_params(resolve_type(&p.ty), &type_param_names))
+                    .map(|p| arg_ty(p, mark_type_params(resolve_type(&p.ty), &type_param_names)))
                     .collect();
                 let ret = f.return_type.as_ref()
                     .map(|t| mark_type_params(resolve_type(t), &type_param_names))
@@ -800,7 +928,7 @@ impl TypeChecker {
             // consult `impl_decl.generics` anywhere), so this is exactly
             // as simplified as the rest of the impl-checking pipeline
             // already is, not a new gap introduced here.
-            let self_ty = Ty::Named(target_name.clone());
+            let self_ty = resolve_type(&Type::Primitive(target_name.clone()));
             let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), self_ty)).collect();
             let resolve_with_self = |ty: &Type| -> Ty {
                 substitute_type_params(&mark_type_params(resolve_type(ty), &["Self".to_string()]), &self_subst)
@@ -810,7 +938,7 @@ impl TypeChecker {
                 ImplItem::Fn(f) => {
                     let params = f.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| resolve_with_self(&p.ty))
+                        .map(|p| arg_ty(p, resolve_with_self(&p.ty)))
                         .collect();
                     let ret = f.return_type.as_ref().map(|t| resolve_with_self(t)).unwrap_or(Ty::Unit);
                     Some((f.name.clone(), FnSig { params, ret, has_default_body: true }))
@@ -875,7 +1003,7 @@ impl TypeChecker {
         match &item.kind {
             ItemKind::Fn(f) => self.check_fn(f, None),
             ItemKind::Impl(impl_decl) => {
-                let self_ty = Ty::Named(impl_decl.target.name.clone());
+                let self_ty = resolve_type(&Type::Primitive(impl_decl.target.name.clone()));
                 for ii in &impl_decl.items {
                     if let ImplItem::Fn(f) = ii {
                         self.check_fn(f, Some(&self_ty));
@@ -887,8 +1015,18 @@ impl TypeChecker {
                     self.check_item(inner);
                 }
             }
+            ItemKind::Const(c) => self.check_global_init(&c.name, &c.ty, &c.value),
+            ItemKind::Static(c) => self.check_global_init(&c.name, &c.ty, &c.value),
             _ => {}
         }
+    }
+
+    /// Phase 11a: a `const`/`static` initializer must have the declared type.
+    fn check_global_init(&mut self, name: &str, ty: &Type, value: &Expr) {
+        let declared = resolve_type(ty);
+        let mut env = Env::new();
+        // `check_expr` reports a mismatch against `declared` itself.
+        self.check_expr(value, Some(&declared), &mut env, name);
     }
 
     fn check_fn(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
@@ -921,6 +1059,8 @@ impl TypeChecker {
                 raw
             }
         };
+        let saved_self_type = self.self_type.take();
+        self.self_type = self_ty.cloned();
         for p in &f.params {
             if p.name == "self" {
                 if let Some(t) = self_ty {
@@ -928,7 +1068,26 @@ impl TypeChecker {
                 }
                 continue;
             }
-            env.insert(p.name.clone(), resolve_with_self(&p.ty));
+            let pty = resolve_with_self(&p.ty);
+            if let Some(d) = &p.default {
+                // Document 10 §2.1: the default value must have the parameter's type.
+                let mut denv = Env::new();
+                let dt = self.check_expr(d, Some(&pty), &mut denv, &f.name);
+                if dt != pty && dt != Ty::Never {
+                    self.errors.push(TypeError {
+                        message: format!("default value of parameter `{}` has type `{}`, expected `{}`", p.name, dt, pty),
+                        context: f.name.clone(),
+                    });
+                }
+            }
+            if p.is_variadic {
+                // Document 10 §2.3: inside the function a variadic parameter
+                // is the sequence of the extra arguments; Phase 11a passes it
+                // as a (stack-backed) slice view `&[T]`.
+                env.insert(p.name.clone(), Ty::Ref(false, Box::new(Ty::Array(Box::new(pty)))));
+            } else {
+                env.insert(p.name.clone(), pty);
+            }
         }
         let expected_ret = f.return_type.as_ref().map(|t| resolve_with_self(t));
         // Phase 9: `?`/`return` inside this body propagate to this
@@ -936,6 +1095,7 @@ impl TypeChecker {
         self.prop_targets.push(PropTarget::FnRet(expected_ret.clone().unwrap_or(Ty::Unit)));
         self.check_block(body, &mut env, expected_ret.as_ref(), &f.name);
         self.prop_targets.pop();
+        self.self_type = saved_self_type;
     }
 
     fn check_block(&mut self, block: &Block, env: &mut Env, expected_tail: Option<&Ty>, ctx: &str) -> Option<Ty> {
@@ -1174,6 +1334,8 @@ impl TypeChecker {
                 }
                 if let Some(t) = env.get(name) {
                     t.clone()
+                } else if let Some(t) = self.globals.get(name) {
+                    t.clone()
                 } else {
                     self.errors.push(TypeError {
                         message: format!("undefined variable `{}`", name),
@@ -1226,16 +1388,31 @@ impl TypeChecker {
 
             Expr::Array(items) => {
                 let elem_expected = match expected {
-                    Some(Ty::Array(inner)) => Some((**inner).clone()),
+                    Some(Ty::Array(inner)) | Some(Ty::Fixed(inner, _)) => Some((**inner).clone()),
                     _ => None,
                 };
+                let fixed_len = match expected {
+                    Some(Ty::Fixed(_, n)) => Some(*n),
+                    _ => None,
+                };
+                if let Some(n) = fixed_len {
+                    if items.len() as u64 != n {
+                        self.errors.push(TypeError {
+                            message: format!("array literal has {} element(s) but the type requires {}", items.len(), n),
+                            context: ctx.into(),
+                        });
+                    }
+                }
                 if items.is_empty() {
                     // Document 5 §4 rule 6, §7's own explicit example:
                     // `let empty = [];` with no further usage is a
                     // compile error requiring an explicit annotation,
                     // not a silent default to `[i32]`.
                     match elem_expected {
-                        Some(t) => Ty::Array(Box::new(t)),
+                        Some(t) => match fixed_len {
+                            Some(n) => Ty::Fixed(Box::new(t), n),
+                            None => Ty::Array(Box::new(t)),
+                        },
                         None => {
                             self.errors.push(TypeError {
                                 message: "cannot infer type of empty array literal `[]` -- add an explicit type annotation".into(),
@@ -1255,7 +1432,10 @@ impl TypeChecker {
                             });
                         }
                     }
-                    Ty::Array(Box::new(first))
+                    match fixed_len {
+                        Some(n) => Ty::Fixed(Box::new(first), n),
+                        None => Ty::Array(Box::new(first)),
+                    }
                 }
             }
 
@@ -1334,7 +1514,15 @@ impl TypeChecker {
             }
 
             Expr::Range { lo, hi, .. } => {
-                let lt = self.check_expr(lo, None, env, ctx);
+                // `1..n` with a bare literal start takes its type from the other
+                // bound (`n: usize` makes the whole range `usize`), Document 5 rule 3.
+                let lo_is_literal = matches!(lo.as_ref(), Expr::Literal(Literal::Int(_)));
+                if lo_is_literal && expected.is_none() {
+                    let ht = self.check_expr(hi, None, env, ctx);
+                    self.check_expr(lo, Some(&ht), env, ctx);
+                    return ht;
+                }
+                let lt = self.check_expr(lo, expected, env, ctx);
                 self.check_expr(hi, Some(&lt), env, ctx);
                 lt
             }
@@ -1348,9 +1536,22 @@ impl TypeChecker {
 
             Expr::Index { expr: inner, index } => {
                 let t = strip_refs(self.check_expr(inner, None, env, ctx));
-                self.check_expr(index, None, env, ctx);
+                let mut idx_inner: &Expr = index;
+                while let Expr::Paren(i) = idx_inner {
+                    idx_inner = i;
+                }
+                let is_range = matches!(idx_inner, Expr::Range { .. });
+                if is_range {
+                    self.check_expr(index, None, env, ctx);
+                } else {
+                    // Any integer type may index (Document 5 gives no index type; codegen converts).
+                    self.check_expr(index, None, env, ctx);
+                }
                 match t {
-                    Ty::Array(elem) => *elem,
+                    // `a[lo..hi]` is the unsized slice place `[T]` (Document 5
+                    // §3.1's `&list[1..3]`); `a[i]` is one element.
+                    Ty::Array(elem) | Ty::Fixed(elem, _) if is_range => Ty::Array(elem),
+                    Ty::Array(elem) | Ty::Fixed(elem, _) => *elem,
                     other => {
                         self.errors.push(TypeError {
                             message: format!("cannot index into type `{}`", other),
@@ -1431,6 +1632,21 @@ impl TypeChecker {
                     }
                 }
                 if let Expr::Path(path) = callee.as_ref() {
+                    // Phase 11a: associated function `Type::name(args)` /
+                    // `Self::name(args)` (Document 7 §2.3's `User::newUser`).
+                    if let [tn, fname] = path.as_slice() {
+                        let type_name = if tn == "Self" { self.self_type.as_ref().map(|t| t.to_string()) } else { Some(tn.clone()) };
+                        let is_variant = self.enums.get(tn).map(|e| e.variants.iter().any(|(n, _)| n == fname)).unwrap_or(false);
+                        if let (Some(type_name), false) = (type_name, is_variant) {
+                            let sig = self.resolve_method(&Ty::Named(type_name), fname);
+                            if let Some(sig) = sig {
+                                for (i, arg) in args.iter().enumerate() {
+                                    self.check_expr(&arg.value, sig.params.get(i), env, ctx);
+                                }
+                                return sig.ret;
+                            }
+                        }
+                    }
                     if let [enum_name, variant_name] = path.as_slice() {
                         if let Some(shape) = self.enums.get(enum_name).cloned() {
                             match shape.variants.iter().find(|(n, _)| n == variant_name) {
@@ -1523,10 +1739,21 @@ impl TypeChecker {
 
             Expr::Borrow { expr: inner, mutable } => {
                 let inner_expected = match expected {
-                    Some(Ty::Ref(_, t)) => Some((**t).clone()),
+                    // a slice target `&[T]` is reached by unsizing a fixed array, so the
+                    // operand itself is NOT expected to be an unsized `[T]`
+                    Some(Ty::Ref(_, t)) if !matches!(**t, Ty::Array(_)) => Some((**t).clone()),
                     _ => None,
                 };
                 let t = self.check_expr(inner, inner_expected.as_ref(), env, ctx);
+                // Phase 11a: borrowing a fixed array where a slice `&[T]` is
+                // expected is the (only) unsizing coercion, the array-to-slice view.
+                if let (Some(Ty::Ref(_, want)), Ty::Fixed(have, _)) = (expected, &t) {
+                    if let Ty::Array(w) = want.as_ref() {
+                        if w == have {
+                            return Ty::Ref(*mutable, want.clone());
+                        }
+                    }
+                }
                 Ty::Ref(*mutable, Box::new(t))
             }
 
@@ -1917,6 +2144,18 @@ impl TypeChecker {
             return;
         }
         if let Some(exp) = expected {
+            // A string literal is a `&str` (Document 5 §2.4: `str`/`&str` is the borrowed view).
+            if let (Ty::StringTy, Ty::Ref(false, e)) = (actual, exp) {
+                if **e == Ty::Str {
+                    return;
+                }
+            }
+            // `borrow mut x` may be passed where a shared `borrow x` is expected.
+            if let (Ty::Ref(true, a), Ty::Ref(false, e)) = (actual, exp) {
+                if a == e {
+                    return;
+                }
+            }
             if actual != exp {
                 self.errors.push(TypeError {
                     message: format!("expected `{}`, found `{}` (Document 5 §6: no implicit coercion, use `as`)", exp, actual),
@@ -2081,6 +2320,8 @@ impl TypeChecker {
     }
 
     fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], has_spread: bool, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let self_name = self.self_type.as_ref().map(|t| t.to_string());
+        let name: &str = if name == "Self" { self_name.as_deref().unwrap_or(name) } else { name };
         let Some(shape) = self.structs.get(name).cloned() else {
             self.errors.push(TypeError {
                 message: format!("undefined struct `{}`", name),
@@ -2671,7 +2912,16 @@ impl TypeChecker {
 
     fn resolve_method(&self, recv_ty: &Ty, name: &str) -> Option<FnSig> {
         match recv_ty {
-            Ty::Named(type_name) | Ty::Generic(type_name, _) => {
+            Ty::DynTrait(trait_name) => {
+                self.traits.get(trait_name)?.methods.get(name).cloned()
+            }
+            // Phase 11a: impls on primitive types (`impl Trait for i32`) are keyed by
+            // the primitive's name, so `i32`, `bool`, ... resolve like named types.
+            other => {
+                let type_name: &String = &match other {
+                    Ty::Named(n) | Ty::Generic(n, _) => n.clone(),
+                    o => o.to_string(),
+                };
                 let impls = self.impls_by_type.get(type_name)?;
                 // Inherent methods (`impl Type { ... }`, no trait) take
                 // precedence over trait-provided methods of the same
@@ -2684,11 +2934,21 @@ impl TypeChecker {
                 impls.iter().find(|r| r.trait_name.is_none())
                     .and_then(|r| r.methods.get(name).cloned())
                     .or_else(|| impls.iter().find_map(|r| r.methods.get(name).cloned()))
+                    // Phase 11a: a trait's default method (Document 7 §4.3) that
+                    // the impl did not override, with `Self` = the impl's type.
+                    .or_else(|| {
+                        let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), Ty::Named(type_name.clone()))).collect();
+                        impls.iter().find_map(|r| {
+                            let tn = r.trait_name.as_ref()?;
+                            let sig = self.traits.get(tn)?.methods.get(name)?;
+                            if !sig.has_default_body {
+                                return None;
+                            }
+                            let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
+                            Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true })
+                        })
+                    })
             }
-            Ty::DynTrait(trait_name) => {
-                self.traits.get(trait_name)?.methods.get(name).cloned()
-            }
-            _ => None,
         }
     }
 

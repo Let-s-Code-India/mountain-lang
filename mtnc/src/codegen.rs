@@ -67,10 +67,40 @@ fn unsupported<T>(what: &str, phase: u32) -> R<T> {
     Err(CgErr(format!("{} is not yet supported by codegen — Phase {}", what, phase)))
 }
 
-struct FnInfo<'ctx> {
+/// How a parameter is passed (Document 10 §2, Document 6 §3).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum PMode {
+    /// By value (also `move`): the callee owns the value.
+    Value,
+    /// `borrow` (false) / `borrow mut` (true): an opaque pointer to the caller's value.
+    Ref(bool),
+    /// `...name: T` (Document 10 §2.3): a stack-backed slice view `&[T]` of the extra arguments.
+    Variadic,
+}
+
+#[derive(Clone)]
+pub(crate) struct ParamInfo<'a> {
+    pub name: String,
+    /// The declared type; for `Ref` the pointee, for `Variadic` the element type.
+    pub ty: Ty,
+    pub mode: PMode,
+    pub default: Option<&'a Expr>,
+}
+
+pub(crate) struct FnInfo<'ctx, 'a> {
     val: FunctionValue<'ctx>,
-    params: Vec<Ty>,
+    /// Parameters excluding `self`.
+    params: Vec<ParamInfo<'a>>,
     ret: Ty,
+    /// `Some` for methods: how `self` is passed (`Value`, or `Ref(mutable)`).
+    self_kind: Option<PMode>,
+}
+
+/// One function body to generate (free function or `impl` method).
+struct FnWork<'a> {
+    key: String,
+    decl: &'a FnDecl,
+    self_ty: Option<Ty>,
 }
 
 struct EnumLayout<'ctx> {
@@ -103,7 +133,14 @@ pub struct Codegen<'ctx, 'a> {
 
     structs: HashMap<String, (Vec<(String, Ty)>, bool)>,
     enums: HashMap<String, Vec<(String, Vec<Ty>)>>,
-    fns: HashMap<String, FnInfo<'ctx>>,
+    fns: HashMap<String, FnInfo<'ctx, 'a>>,
+    /// (type name, method name) -> function keys, inherent methods first.
+    methods: HashMap<(String, String), Vec<String>>,
+    consts: HashMap<String, (&'a Expr, Ty)>,
+    statics: HashMap<String, (PointerValue<'ctx>, Ty)>,
+    const_depth: u32,
+    /// The concrete type `Self` stands for while generating an `impl` method.
+    cur_self: Option<Ty>,
     enum_layouts: HashMap<String, EnumLayout<'ctx>>,
     strings: HashMap<Vec<u8>, PointerValue<'ctx>>,
 
@@ -204,6 +241,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             structs: HashMap::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
+            methods: HashMap::new(),
+            consts: HashMap::new(),
+            statics: HashMap::new(),
+            const_depth: 0,
+            cur_self: None,
             enum_layouts: HashMap::new(),
             strings: HashMap::new(),
             cur_fn: None,
@@ -286,10 +328,21 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
             }
             Ty::OptionTy(_) | Ty::ResultTy(..) => self.enum_layout(ty)?.llty.into(),
-            Ty::Str => return unsupported("the unsized `str` type", 11),
-            Ty::Ref(..) => return unsupported("references (`borrow`/`&`)", 11),
-            Ty::Array(_) => return unsupported("arrays / growable `[T]`", 11),
-            Ty::Fn(..) => return unsupported("function values / closures", 11),
+            Ty::Fixed(t, n) => {
+                let et = self.llty(t)?;
+                let n = u32::try_from(*n).map_err(|_| CgErr(format!("array length {} is too large", n)))?;
+                et.array_type(n).into()
+            }
+            Ty::Ref(_, inner) => match inner.as_ref() {
+                // `&[T]`: a slice view, `{ data pointer, length }` (Document 13 §1 point 3 style fat pointer).
+                Ty::Array(_) => self.str_ty().into(),
+                // `&str` has the same `{ptr, len}` shape as a string value.
+                Ty::Str => self.str_ty().into(),
+                _ => self.context.ptr_type(AddressSpace::default()).into(),
+            },
+            Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
+            Ty::Array(_) => return unsupported("growable `[T]` arrays", 11),
+            Ty::Fn(..) => return unsupported("function values / closures", 12),
             Ty::Generic(..) | Ty::TypeParam(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
             Ty::Null => return unsupported("`null`", 11),
@@ -487,26 +540,57 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // Items
     // ------------------------------------------------------------------
 
-    pub fn generate(&mut self, program: &Program) -> Result<(), Vec<String>> {
+    /// `Self` -> the current impl type, inside a resolved type.
+    fn subst_self(&self, t: Ty) -> Ty {
+        let Some(selfty) = &self.cur_self else { return t };
+        fn go(t: Ty, s: &Ty) -> Ty {
+            match t {
+                Ty::Named(n) if n == "Self" => s.clone(),
+                Ty::Array(i) => Ty::Array(Box::new(go(*i, s))),
+                Ty::Fixed(i, n) => Ty::Fixed(Box::new(go(*i, s)), n),
+                Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|x| go(x, s)).collect()),
+                Ty::Ref(m, i) => Ty::Ref(m, Box::new(go(*i, s))),
+                Ty::OptionTy(i) => Ty::OptionTy(Box::new(go(*i, s))),
+                Ty::ResultTy(o, e) => Ty::ResultTy(Box::new(go(*o, s)), Box::new(go(*e, s))),
+                other => other,
+            }
+        }
+        go(t, selfty)
+    }
+
+    /// A written type, with aliases expanded and `Self` resolved.
+    pub(crate) fn rty(&self, t: &Type) -> Ty {
+        self.subst_self(resolve_type(t))
+    }
+
+    pub fn generate(&mut self, program: &'a Program) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
-        let mut fn_items: Vec<&FnDecl> = Vec::new();
-        self.register_items(&program.items, &mut fn_items, &mut errors);
+        let items = crate::desugar::all_items(program);
+        crate::types::register_item_context(&items);
+        let mut work: Vec<FnWork<'a>> = Vec::new();
+        let mut statics: Vec<&'a StaticDecl> = Vec::new();
+        self.register_items(&items, &mut work, &mut statics, &mut errors);
         if !errors.is_empty() {
             return Err(errors);
         }
+        for st in &statics {
+            if let Err(e) = self.declare_static(st) {
+                errors.push(format!("in static `{}`: {}", st.name, e.0));
+            }
+        }
         // Pass 1: declare every function so bodies can call in any order.
-        for f in &fn_items {
-            if let Err(e) = self.declare_fn(f) {
-                errors.push(format!("in `{}`: {}", f.name, e.0));
+        for w in &work {
+            if let Err(e) = self.declare_fn(w) {
+                errors.push(format!("in `{}`: {}", w.key, e.0));
             }
         }
         if !errors.is_empty() {
             return Err(errors);
         }
         // Pass 2: bodies.
-        for f in &fn_items {
-            if let Err(e) = self.gen_fn(f) {
-                errors.push(format!("in `{}`: {}", f.name, e.0));
+        for w in &work {
+            if let Err(e) = self.gen_fn(w) {
+                errors.push(format!("in `{}`: {}", w.key, e.0));
             }
         }
         if errors.is_empty() {
@@ -521,13 +605,24 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
     }
 
-    fn register_items<'p>(&mut self, items: &'p [Item], fns: &mut Vec<&'p FnDecl>, errors: &mut Vec<String>) {
+    fn register_items(&mut self, items: &[&'a Item], work: &mut Vec<FnWork<'a>>, statics: &mut Vec<&'a StaticDecl>, errors: &mut Vec<String>) {
         for item in items {
+            let item: &'a Item = item;
             match &item.kind {
-                ItemKind::Fn(f) => fns.push(f),
+                ItemKind::Fn(f) => {
+                    if work.iter().any(|w| w.key == f.name) {
+                        errors.push(format!("function `{}` is defined more than once (items nested in functions share one namespace)", f.name));
+                        continue;
+                    }
+                    work.push(FnWork { key: f.name.clone(), decl: f, self_ty: None });
+                }
                 ItemKind::Struct(s) => {
                     if !s.generics.0.is_empty() {
                         errors.push(format!("generic struct `{}`: generics (monomorphization) are not yet supported by codegen — Phase 11", s.name));
+                        continue;
+                    }
+                    if self.structs.contains_key(&s.name) || self.enums.contains_key(&s.name) {
+                        errors.push(format!("type `{}` is defined more than once", s.name));
                         continue;
                     }
                     let (fields, is_tuple) = match &s.body {
@@ -542,19 +637,72 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         errors.push(format!("generic enum `{}`: generics (monomorphization) are not yet supported by codegen — Phase 11", en.name));
                         continue;
                     }
+                    if self.structs.contains_key(&en.name) || self.enums.contains_key(&en.name) {
+                        errors.push(format!("type `{}` is defined more than once", en.name));
+                        continue;
+                    }
                     let vs = en.variants.iter().map(|v| (v.name.clone(), v.data.iter().map(resolve_type).collect())).collect();
                     self.enums.insert(en.name.clone(), vs);
                 }
                 ItemKind::TargetBlock(kind, inner) => {
                     // Document 2 §8: a native build includes `native` and `all` blocks only.
                     if matches!(kind, TargetKind::Native | TargetKind::All) {
-                        self.register_items(inner, fns, errors);
+                        let refs: Vec<&'a Item> = inner.iter().collect();
+                        self.register_items(&refs, work, statics, errors);
                     }
                 }
-                ItemKind::Impl(_) | ItemKind::Trait(_) => errors.push("`impl`/`trait` items are not yet supported by codegen — Phase 11".into()),
+                ItemKind::Impl(im) => {
+                    if !im.generics.0.is_empty() {
+                        errors.push("generic `impl` blocks are not yet supported by codegen — Phase 11".into());
+                        continue;
+                    }
+                    if !im.target.args.is_empty() || im.trait_ref.as_ref().map(|t| !t.args.is_empty()).unwrap_or(false) {
+                        errors.push("`impl` of a generic type or trait (e.g. `impl From<E> for T`) is not yet supported by codegen — Phase 11".into());
+                        continue;
+                    }
+                    let target_ty = resolve_type(&Type::Primitive(im.target.name.clone()));
+                    let tystr = target_ty.to_string();
+                    let trait_name = im.trait_ref.as_ref().map(|t| t.name.clone());
+                    for ii in &im.items {
+                        let ImplItem::Fn(f) = ii else { continue };
+                        let key = match &trait_name {
+                            Some(t) => format!("{}::{}::{}", tystr, t, f.name),
+                            None => format!("{}::{}", tystr, f.name),
+                        };
+                        if work.iter().any(|w| w.key == key) {
+                            errors.push(format!("method `{}` is defined more than once", key));
+                            continue;
+                        }
+                        let entry = self.methods.entry((tystr.clone(), f.name.clone())).or_default();
+                        if trait_name.is_none() {
+                            entry.insert(0, key.clone());
+                        } else {
+                            entry.push(key.clone());
+                        }
+                        work.push(FnWork { key, decl: f, self_ty: Some(target_ty.clone()) });
+                    }
+                }
+                ItemKind::Trait(t) => {
+                    // Default method bodies are copied into every implementing `impl`
+                    // before type checking (`desugar::inline_default_methods`), so a
+                    // trait item itself generates no code (static dispatch only).
+                    if !t.generics.0.is_empty() {
+                        errors.push(format!("generic trait `{}` is not yet supported by codegen — Phase 11", t.name));
+                    }
+                }
+                ItemKind::Const(c) => {
+                    let ty = resolve_type(&c.ty);
+                    if self.consts.insert(c.name.clone(), (&c.value, ty)).is_some() {
+                        errors.push(format!("constant `{}` is defined more than once", c.name));
+                    }
+                }
+                ItemKind::Static(st) => statics.push(st),
+                ItemKind::TypeAlias(a) => {
+                    if !a.generics.0.is_empty() {
+                        errors.push(format!("generic type alias `{}` is not yet supported by codegen — Phase 11", a.name));
+                    }
+                }
                 ItemKind::Mod(_) | ItemKind::Use(_) | ItemKind::Import(_) => errors.push("modules / `use` / `import` are not yet supported by codegen — Phase 14".into()),
-                ItemKind::Const(_) | ItemKind::Static(_) => errors.push("`const`/`static` items are not yet supported by codegen — Phase 11".into()),
-                ItemKind::TypeAlias(_) => errors.push("`type` aliases are not yet supported by codegen — Phase 11".into()),
                 ItemKind::Table(_) | ItemKind::Index(_) | ItemKind::Schema(_) => errors.push("`table`/`index`/`schema` are not yet supported by codegen — Phase 18".into()),
                 ItemKind::Ui(_) | ItemKind::Component(_) => errors.push("`ui`/`component` are not yet supported by codegen — Phase 19".into()),
                 ItemKind::Server(_) => errors.push("`server` is not yet supported by codegen — Phase 17".into()),
@@ -563,11 +711,100 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
     }
 
-    fn fn_symbol(name: &str) -> String {
-        format!("mtn_{}", name)
+    fn fn_symbol(key: &str) -> String {
+        format!("mtn_{}", key)
     }
 
-    fn declare_fn(&mut self, f: &FnDecl) -> R<()> {
+    /// A `static` (Document 3 Category A): one fixed global with a constant
+    /// initializer. Statics are read-only in this phase (the AST has no
+    /// `static mut`; interior mutability needs `Atomic<T>`, Phase 13).
+    fn declare_static(&mut self, st: &StaticDecl) -> R<()> {
+        let ty = resolve_type(&st.ty);
+        let init = self.const_val(&st.value, &ty)?;
+        let lt = self.llty(&ty)?;
+        let g = self.module.add_global(lt, None, &format!("mtn_static_{}", st.name));
+        g.set_initializer(&init);
+        g.set_constant(true);
+        if self.statics.insert(st.name.clone(), (g.as_pointer_value(), ty)).is_some() {
+            return Err(CgErr(format!("static `{}` is defined more than once", st.name)));
+        }
+        Ok(())
+    }
+
+    /// Constant folding for `static` initializers: literals, tuples, arrays,
+    /// struct literals, other constants.
+    fn const_val(&mut self, e: &Expr, ty: &Ty) -> R<V<'ctx>> {
+        self.const_depth += 1;
+        if self.const_depth > 64 {
+            self.const_depth -= 1;
+            return Err(CgErr("constants refer to each other in a cycle".into()));
+        }
+        let r = self.const_val_inner(e, ty);
+        self.const_depth -= 1;
+        r
+    }
+
+    fn const_val_inner(&mut self, e: &Expr, ty: &Ty) -> R<V<'ctx>> {
+        let bad = || CgErr("a `static` initializer must be a constant literal expression (literals, tuples, arrays, struct literals, other constants)".into());
+        match e {
+            Expr::Paren(i) => self.const_val(i, ty),
+            Expr::Literal(l) => self.literal(l, ty, false),
+            Expr::Unary { op: UnaryOp::Neg, expr } => match expr.as_ref() {
+                Expr::Literal(l @ (Literal::Int(_) | Literal::IntHex(_) | Literal::IntOct(_) | Literal::IntBin(_) | Literal::Float(_))) => self.literal(l, ty, true),
+                _ => Err(bad()),
+            },
+            Expr::Ident(n) => match self.consts.get(n.as_str()).cloned() {
+                Some((ce, cty)) => self.const_val(ce, &cty),
+                None => Err(bad()),
+            },
+            Expr::Tuple(items) if !items.is_empty() => {
+                let Ty::Tuple(tys) = ty else { return Err(bad()) };
+                let tys = tys.clone();
+                let mut vals = Vec::new();
+                for (it, t) in items.iter().zip(tys.iter()) {
+                    vals.push(self.const_val(it, t)?);
+                }
+                Ok(self.context.const_struct(&vals, false).into())
+            }
+            Expr::Array(items) => {
+                let Ty::Fixed(et, n) = ty else { return Err(bad()) };
+                if items.len() as u64 != *n {
+                    return Err(CgErr("array initializer length does not match the array type".into()));
+                }
+                let et = (**et).clone();
+                let mut vals = Vec::new();
+                for it in items {
+                    vals.push(self.const_val(it, &et)?);
+                }
+                self.const_array(&et, &vals)
+            }
+            Expr::StructLit { name, fields, spread: None } => {
+                let Some((decl, _)) = self.structs.get(name).cloned() else { return Err(bad()) };
+                let mut vals = Vec::new();
+                for (fname, fty) in &decl {
+                    let Some((_, fe)) = fields.iter().find(|(n, _)| n == fname) else { return Err(bad()) };
+                    vals.push(self.const_val(fe, fty)?);
+                }
+                Ok(self.context.const_struct(&vals, false).into())
+            }
+            _ => Err(bad()),
+        }
+    }
+
+    fn const_array(&mut self, et: &Ty, vals: &[V<'ctx>]) -> R<V<'ctx>> {
+        let lt = self.llty(et)?;
+        Ok(match lt {
+            BasicTypeEnum::IntType(t) => t.const_array(&vals.iter().map(|v| v.into_int_value()).collect::<Vec<_>>()).into(),
+            BasicTypeEnum::FloatType(t) => t.const_array(&vals.iter().map(|v| v.into_float_value()).collect::<Vec<_>>()).into(),
+            BasicTypeEnum::StructType(t) => t.const_array(&vals.iter().map(|v| v.into_struct_value()).collect::<Vec<_>>()).into(),
+            BasicTypeEnum::ArrayType(t) => t.const_array(&vals.iter().map(|v| v.into_array_value()).collect::<Vec<_>>()).into(),
+            BasicTypeEnum::PointerType(t) => t.const_array(&vals.iter().map(|v| v.into_pointer_value()).collect::<Vec<_>>()).into(),
+            _ => return Err(CgErr("unsupported element type in a constant array".into())),
+        })
+    }
+
+    fn declare_fn(&mut self, w: &FnWork<'a>) -> R<()> {
+        let f = w.decl;
         if f.is_async {
             return unsupported("`async fn`", 12);
         }
@@ -575,43 +812,86 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return unsupported("generic functions", 11);
         }
         let Some(_) = &f.body else { return Err(CgErr("function without a body".into())) };
-        let mut ptys = Vec::new();
+        self.cur_self = w.self_ty.clone();
+        let r = self.declare_fn_inner(w);
+        self.cur_self = None;
+        r
+    }
+
+    fn declare_fn_inner(&mut self, w: &FnWork<'a>) -> R<()> {
+        let f = w.decl;
+        let ptr = self.context.ptr_type(AddressSpace::default());
         let mut lls: Vec<BasicMetadataTypeEnum> = Vec::new();
-        for p in &f.params {
-            if p.is_variadic {
-                return unsupported("variadic parameters", 11);
+        let mut params: Vec<ParamInfo<'a>> = Vec::new();
+        let mut self_kind = None;
+        for (i, p) in f.params.iter().enumerate() {
+            if p.name == "self" {
+                let Some(sty) = &w.self_ty else { return Err(CgErr("`self` parameter outside of an `impl` block".into())) };
+                if i != 0 {
+                    return Err(CgErr("`self` must be the first parameter".into()));
+                }
+                let kind = match p.ownership {
+                    OwnershipMod::Borrow => PMode::Ref(false),
+                    OwnershipMod::BorrowMut => PMode::Ref(true),
+                    _ => PMode::Value,
+                };
+                lls.push(match kind {
+                    PMode::Value => self.llty(sty)?.into(),
+                    _ => ptr.into(),
+                });
+                self_kind = Some(kind);
+                continue;
             }
-            if p.default.is_some() {
-                return unsupported("default parameter values", 11);
+            let t = self.rty(&p.ty);
+            let mode = if p.is_variadic {
+                PMode::Variadic
+            } else {
+                match p.ownership {
+                    OwnershipMod::Borrow => PMode::Ref(false),
+                    OwnershipMod::BorrowMut => PMode::Ref(true),
+                    _ => PMode::Value,
+                }
+            };
+            if p.default.is_some() && mode != PMode::Value {
+                return Err(CgErr(format!("parameter `{}`: only by-value parameters can have a default value", p.name)));
             }
-            if p.ownership == OwnershipMod::Borrow || p.ownership == OwnershipMod::BorrowMut || p.name == "self" {
-                return unsupported("`borrow` parameters / methods", 11);
+            match mode {
+                PMode::Value => lls.push(self.llty(&t)?.into()),
+                PMode::Ref(_) => {
+                    // the pointee must be a type we can represent
+                    self.llty(&t)?;
+                    lls.push(ptr.into());
+                }
+                PMode::Variadic => {
+                    self.llty(&t)?;
+                    lls.push(self.str_ty().into());
+                }
             }
-            let t = resolve_type(&p.ty);
-            lls.push(self.llty(&t)?.into());
-            ptys.push(t);
+            params.push(ParamInfo { name: p.name.clone(), ty: t, mode, default: p.default.as_ref() });
         }
-        let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+        if params.iter().enumerate().any(|(i, p)| p.mode == PMode::Variadic && i + 1 != params.len()) {
+            return Err(CgErr("a variadic parameter must be the last parameter".into()));
+        }
+        let ret = f.return_type.as_ref().map(|t| self.rty(t)).unwrap_or(Ty::Unit);
         let ft = if is_unit_like(&ret) {
             self.context.void_type().fn_type(&lls, false)
         } else {
             self.llty(&ret)?.fn_type(&lls, false)
         };
-        if self.fns.contains_key(&f.name) {
-            return Err(CgErr(format!("function `{}` is defined more than once", f.name)));
-        }
-        let val = self.module.add_function(&Self::fn_symbol(&f.name), ft, None);
-        self.fns.insert(f.name.clone(), FnInfo { val, params: ptys, ret });
+        let val = self.module.add_function(&Self::fn_symbol(&w.key), ft, None);
+        self.fns.insert(w.key.clone(), FnInfo { val, params, ret, self_kind });
         Ok(())
     }
 
-    fn gen_fn(&mut self, f: &FnDecl) -> R<()> {
-        let (val, ptys, ret) = {
-            let i = &self.fns[&f.name];
-            (i.val, i.params.clone(), i.ret.clone())
+    fn gen_fn(&mut self, w: &FnWork<'a>) -> R<()> {
+        let f = w.decl;
+        let (val, params, ret, self_kind) = {
+            let i = &self.fns[&w.key];
+            (i.val, i.params.clone(), i.ret.clone(), i.self_kind)
         };
         let body = f.body.as_ref().unwrap();
         self.cur_fn = Some(val);
+        self.cur_self = w.self_ty.clone();
         self.ret_ty = ret.clone();
         self.locals = vec![HashMap::new()];
         self.loops.clear();
@@ -620,9 +900,40 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.alloca_bb = Some(alloca_bb);
         let body_bb = self.context.append_basic_block(val, "body");
         self.position(body_bb);
-        for (i, p) in f.params.iter().enumerate() {
-            let slot = self.declare_local(&p.name, &ptys[i])?;
-            self.builder.build_store(slot, val.get_nth_param(i as u32).unwrap())?;
+        let mut llidx = 0u32;
+        if let Some(kind) = self_kind {
+            let sty = w.self_ty.clone().unwrap();
+            let pv = val.get_nth_param(llidx).unwrap();
+            llidx += 1;
+            match kind {
+                // `borrow self` / `borrow mut self`: the local IS the caller's value
+                // (reads and writes go through the pointer, Document 6 §3).
+                PMode::Ref(_) => {
+                    self.locals.last_mut().unwrap().insert("self".to_string(), (pv.into_pointer_value(), sty));
+                }
+                _ => {
+                    let slot = self.declare_local("self", &sty)?;
+                    self.builder.build_store(slot, pv)?;
+                }
+            }
+        }
+        for p in &params {
+            let pv = val.get_nth_param(llidx).unwrap();
+            llidx += 1;
+            match p.mode {
+                PMode::Ref(_) => {
+                    self.locals.last_mut().unwrap().insert(p.name.clone(), (pv.into_pointer_value(), p.ty.clone()));
+                }
+                PMode::Value => {
+                    let slot = self.declare_local(&p.name, &p.ty)?;
+                    self.builder.build_store(slot, pv)?;
+                }
+                PMode::Variadic => {
+                    let sl = Ty::Ref(false, Box::new(Ty::Array(Box::new(p.ty.clone()))));
+                    let slot = self.declare_local(&p.name, &sl)?;
+                    self.builder.build_store(slot, pv)?;
+                }
+            }
         }
         let (v, bty) = self.gen_block(body)?;
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -637,6 +948,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.alloca_builder.position_at_end(alloca_bb);
         self.alloca_builder.build_unconditional_branch(body_bb)?;
         self.cur_fn = None;
+        self.cur_self = None;
         Ok(())
     }
 

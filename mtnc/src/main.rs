@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         "build" => cmd_build(&args[2..], false),
         "run" => cmd_build(&args[2..], true),
         "--version" | "-V" => {
-            println!("mtnc 0.1.0 (Phase 10 — LLVM IR codegen + native backend)");
+            println!("mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)");
             ExitCode::SUCCESS
         }
         "test" | "bench" | "doc" | "fmt" => {
