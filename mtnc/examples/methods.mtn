@@ -1,0 +1,70 @@
+// impl blocks: associated functions, methods, trait impls and default methods (Document 7).
+struct Account {
+    id: u64,
+    balance: i64,
+}
+
+impl Account {
+    fn new(id: u64) -> Account {
+        Account { id: id, balance: 0 }
+    }
+
+    fn with_balance(id: u64, balance: i64) -> Self {
+        Self { id: id, balance: balance }
+    }
+
+    fn deposit(borrow mut self, amount: i64) {
+        self.balance += amount;
+    }
+
+    fn balance(borrow self) -> i64 {
+        self.balance
+    }
+
+    fn into_balance(self) -> i64 {
+        self.balance
+    }
+}
+
+trait Describe {
+    fn name(borrow self) -> i64;
+
+    fn describe(borrow self) -> i64 {
+        self.name() * 2
+    }
+}
+
+impl Describe for Account {
+    fn name(borrow self) -> i64 {
+        self.balance
+    }
+}
+
+struct Plain {
+    n: i64,
+}
+
+impl Describe for Plain {
+    fn name(borrow self) -> i64 {
+        self.n
+    }
+
+    fn describe(borrow self) -> i64 {
+        -1
+    }
+}
+
+fn main() {
+    let mut a = Account::new(7);
+    a.deposit(50);
+    a.deposit(25);
+    println(a.balance());
+    println(a.describe());
+    let b = Account::with_balance(9, 1000);
+    println(b.id);
+    println(b.describe());
+    println(b.into_balance());
+    let p = Plain { n: 5 };
+    println(p.name());
+    println(p.describe());
+}
