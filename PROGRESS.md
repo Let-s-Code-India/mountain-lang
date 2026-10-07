@@ -17,7 +17,7 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 
 **The loop.** Manager prompt → coding assistant builds the phase → owner uploads the zip to GitHub (`Let-s-Code-India/mountain-lang`) → GitHub Actions CI runs (`.github/workflows/ci.yml`) → the owner brings the CI log to the manager → the manager approves (phase becomes 🟢) or sends fixes. **Nothing is 🟢 until the manager has seen a real CI log.**
 
-**Historical constraint.** Through Phase 9 the coding assistant had no Rust/LLVM toolchain and delivered one zip per phase after hand-checking its logic 2–3 times. (In Phase 10 the assistant's sandbox happened to allow `apt install rustc-1.91 cargo-1.91 llvm-18-dev`, so the Phase 10 tests were actually run — see the Phase 10 entry — but CI is still the authority.)
+**Testing.** Through Phase 9 the coding assistant had no Rust/LLVM toolchain. From Phase 10 on its sandbox can install one (`apt install rustc-1.91 cargo-1.91 llvm-18-dev libpolly-18-dev libzstd-dev zlib1g-dev libffi-dev`, then `export PATH=/usr/lib/rust-1.91/bin:$PATH LLVM_SYS_181_PREFIX=/usr/lib/llvm-18`), so the assistant now **runs the complete test suite before every delivery** and reports real numbers; CI is still the final authority.
 
 **Standing rules for the coding assistant.**
 1. Follow the plan (the 25 documents + the phase prompt) exactly. No invented features, no restructuring. Any deviation, however small, is **asked for and approved first**, stating what, why and the alternative; deviations that were already made are listed as "flagged" and need sign-off.
@@ -2139,7 +2139,7 @@ Every existing test that uses `return X;` (types_doc5, generics ×6, traits_impl
 Push the whole tree (keep the `mtnc/` layout). In GitHub → Actions → the run for this push → job `build-and-test` → step **Run test suite** → download the raw log. Check: (a) per-target `test result:` lines — `error_handling` should say `57 passed`; (b) grand total 243; (c) no `warning:` lines from `rustc`; (d) with `--no-fail-fast` a red run lists **all** failing tests at once, so send that whole log rather than fixing one at a time.
 
 ## Phase 10 — LLVM IR codegen + native backend
-**Status: 🟡 Implemented and tested locally (278 tests pass in the assistant's sandbox) — ⏳ NOT yet confirmed by a real CI run.** Do not mark 🟢 until the Actions log for the push is read.
+**Status: 🟢 Confirmed by a real CI log (reviewed by the manager): 278 tests passed, 0 failed, 0 warnings** (243 earlier + 35 e2e); smoke tests passed (`hello.mtn` prints `Hello, Mountain!`). **The seven "flagged for sign-off" items in §5 below are APPROVED and now authoritative** (recorded in Doc 17 §10 and Doc 11 §8.9).
 
 ### 0. Housekeeping done first
 - Phase 9 marked 🟢 above (243 passed, from the confirmed CI log).
@@ -2202,7 +2202,38 @@ Job `build-and-test` (runs on `ubuntu-24.04`):
 > A real `.mtn` program using only Phase 1–9 features compiles to a native binary and produces correct output when executed.
 Met locally: `mtnc run examples/hello.mtn` and the other 9 examples compile to native executables and print the asserted output. ⏳ pending the real CI run.
 
-## Phases 11–25
+## Phase 11 — Memory management internals + codegen foundations (delivered in three parts: 11a, 11b, 11c)
+The owner/manager split Phase 11 (it is too large for one delivery) into **11a** (foundations A), **11b** (generics and calls) and **11c** (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind CI step, arena benchmark). **Phase 11 stays 🟡 until 11c has a green CI log.** Each part is a separate zip + CI run + manager review.
+
+### Phase 11a — references, arrays/slices, impl blocks, const/static/type, nested items, named/default/variadic arguments
+**Status: 🟡 Implemented; 308 tests pass in the assistant's sandbox (278 earlier + 15 `tests/phase11a.rs` + 15 new e2e), 0 warnings — ⏳ NOT yet confirmed by a real CI run.**
+
+**Housekeeping done:** Phase 10 marked 🟢 (above). Version label `1.0.0-dev` in `Cargo.toml` and the banner `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)` (the `"0.1.0"` strings in `src/manifest.rs` tests and `tests/integration.rs` are sample `mountain.toml` data and were left alone). "Not yet supported — Phase N" messages audited against Doc 25 §2.5 (corrected: closures/generators/`await`/`spawn`/function values/`actor` → 12, `select` → 13, struct update `..base` → 16; the rest already matched: generics/`dyn`/growable `[T]`/raw pointers/`null`/`?`-with-`From`/heap types/`try` capture → 11 (11b/11c), modules → 14, `for` over iterables/string match/i128 printing/`str` → 16, `server` 17, `table` 18, `ui` 19).
+
+**What 11a delivers (all with positive tests):**
+1. **References.** `borrow x: T` / `borrow mut x: T` parameters are an opaque `ptr`; inside the function the parameter name IS the caller's value (its local slot is the incoming pointer, no copy), so `n += 1` on a `borrow mut n: i32` writes the caller's variable. Call sites write `borrow x` / `borrow mut x` (Doc 6 §3); anything else for a borrow parameter is a clear error. Locals of reference type (`let r = borrow c;`) hold the pointer and auto-dereference for field access and method calls. Method receivers `borrow self` / `borrow mut self` / `self` (Doc 7 §2.3).
+2. **Arrays and slices.** `[T; N]` is an LLVM `[N x T]` value; slices `&[T]` are `{ptr, len}`. Bounds-checked indexing for reads, writes and compound assignment (`a[i] = v`, `a[i] += v`, `grid[1][0]`), element index may be any integer type (a negative signed index fails the check). Out-of-bounds prints `thread 'main' panicked: index out of bounds: the length is L but the index is I` and exits 101 (Doc 22 §8 wording). `borrow a` where a slice is expected unsizes a fixed array; `borrow a[lo..hi]` / `a[lo..=hi]` make sub-slices with a range check (`slice range out of bounds`). Arrays work as parameters, return values, struct fields, nested arrays, arrays of structs.
+3. **`impl` blocks (static dispatch).** Inherent methods, associated functions (`Type::new`, `Self::new`, `Self { .. }`), trait methods, impls on primitive types (`impl Trait for i32`). Symbols are `mtn_<Type>::<method>` / `mtn_<Type>::<Trait>::<method>`. **Default trait methods** are copied into each implementing `impl` before codegen (`desugar::inline_default_methods`, then the program is re-checked) so each type gets its own copy checked with `Self` = that type (the checker never checked trait default bodies themselves).
+4. **`const` / `static` / `type` items, nested items.** `const` is inlined at every use (Doc 3). `static` is one LLVM global with a *constant* initializer (literals, tuples, arrays, struct literals, other consts; anything else is a clear error); statics are read-only (the AST has no `static mut`; `Atomic<T>` is Phase 13). `type` aliases are expanded wherever a type is written. Items declared inside function bodies (fn, struct, enum, impl, const, ...) are hoisted to one shared namespace (`desugar::all_items`).
+5. **Named, default and variadic arguments (Doc 10 §2.1–2.3).** Positional then named (any order); defaults evaluated at the call site; unknown/duplicate/missing/extra/positional-after-named are compile errors. A variadic parameter (`fn f(...values: i32)`, Doc 23 syntax) is passed as a stack-allocated array viewed as a slice `&[T]` (no heap), so inside the function it is indexable (`values[0]`); `.len()` and `for` over it are Phase 16.
+
+**Type-checker changes (needed by the above; all 278 earlier tests still pass):** new `Ty::Fixed(T, N)` (size is a literal, a `const`, or constant arithmetic of those; any other size expression such as a const-generic one still resolves to the unsized `Array` as before); array literal checked against `[T; N]` (length mismatch is an error); `a[lo..hi]` types as the unsized slice place; `borrow` of a fixed array where `&[T]` is expected is the one unsizing coercion; `&mut T` accepted where `&T` is expected; a string literal is accepted as `&str`; `borrow` parameters have type `&T`/`&mut T` for *callers* (but plain `T` inside the function); variadic parameter is `&[T]` inside; parameter default values are type-checked; `const`/`static` are globals and their initializers are checked; type aliases expanded; associated-function calls `Type::f(..)`/`Self::f(..)` resolve; `Self { .. }` literals; trait default methods and primitive-type impls resolve in `resolve_method`; the range `1..n` takes its type from `n`. Type aliases and constant sizes live in per-thread tables filled by `register_item_context` (because `resolve_type` is a free function) — flagged below.
+
+**Flagged interpretations / approvals needed (11a):**
+1. **Per-thread alias/const tables** behind `resolve_type` (see above). Alternative: thread an environment through every `resolve_type` caller (large change).
+2. **Nested items share one namespace**; two functions that each declare a nested item with the same name are rejected ("defined more than once") instead of scoping them per function.
+3. **Default trait methods are inlined into top-level `impl` blocks only** (an `impl` nested inside a function does not get its defaults).
+4. **`&[T]` of a growable `[T]`, growable `[T]` literals, `String` operations** stay "not yet supported — Phase 11" (11c: they need drop glue). An unannotated array literal `[1,2,3]` is the growable `[i32]` per Doc 5 §1, so in 11a write `let a: [i32; 3] = [1, 2, 3];`.
+5. **Doc 10 §2.3 vs Doc 23 §3 variadic spelling:** Doc 10 shows `values: ...i32`; the parser follows the ground-truth Doc 23 (`...values: i32`). Doc 10's example could be corrected.
+6. `static` initializers are limited to constant literals (no calls, no arithmetic) — Doc 3 only requires a `const`-evaluable initializer; richer constant folding can come later.
+
+**Known gaps / not in 11a:** generics, `dyn`, `?` with `From`, tail-call guarantee, `unsafe`/raw pointers, `try` blocks that assign outer locals (→ 11b); growable `[T]`/`String`, drop glue, `Box`/`Rc`/`Arc`/`Weak`, `Allocator`/arena, `@pack`/`@align(N)`, valgrind CI step, arena benchmark (→ 11c). Default allocator = system `malloc`/`free` behind one internal interface (no allocation exists yet in 11a); Doc 13 §3.1's size-class allocator is now scheduled in Phase 15 (Doc 25 §2.5) — known gap against Doc 13 §3.1.
+
+**Files changed (11a):** new `src/desugar.rs` additions (`all_items`, `inline_default_methods`), `tests/phase11a.rs`, `examples/{refs,arrays,methods,items,args,combined}.mtn`; changed `src/codegen.rs`, `src/codegen/expr.rs`, `src/codegen/print.rs`, `src/types.rs`, `src/driver.rs`, `src/main.rs`, `Cargo.toml`, `tests/e2e.rs`, `PROGRESS.md`.
+
+**What the manager should read in the CI log (11a):** job `build-and-test` as in Phase 10 (CI file unchanged). Expected `test result:` lines: lib 60, borrow_checks 19, closures 10, control_flow 10, **e2e 50**, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, **phase11a 15**, parser_doc24 6, traits_impls 15, types_doc5 26 → **grand total 308, 0 failed, 0 warnings**. Smoke step output: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → `checked 17 file(s), 0 errors`; hello.mtn → `Hello, Mountain!`.
+
+## Phases 11b–25
 **Status: ⚪ Not started**
 
 (Full phase table: see Document 25 §2.3.)
