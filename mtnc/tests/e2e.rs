@@ -140,6 +140,121 @@ fn block_like_statement_ends_the_statement() {
     assert_eq!(r.stdout, "-1\n");
 }
 
+// ------------------------------------------------------------ Phase 11a
+
+#[test]
+fn refs_borrow_and_borrow_mut_parameters() {
+    let r = run_file(&example("refs"), &[]);
+    assert_eq!(r.stdout, "13\n12\n112\n3\n12\n15\n");
+    assert_eq!(r.code, 0);
+}
+
+#[test]
+fn arrays_slices_and_the_bounds_check_panic() {
+    let r = run_file(&example("arrays"), &[]);
+    assert_eq!(r.stdout, "50\n110\n11\n2636\n3\nc\n36\n41\n");
+    assert_eq!(r.code, 101);
+    assert!(r.stderr.contains("index out of bounds: the length is 4 but the index is 7"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn slice_range_out_of_bounds_panics() {
+    let src = "fn main() { let a: [i32; 3] = [1, 2, 3]; let hi: usize = 5; let s = borrow a[1..hi]; println(s[0]); }\n";
+    let r = run_src(src, &[]);
+    assert_eq!(r.code, 101);
+    assert!(r.stderr.contains("slice range out of bounds"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn negative_index_panics_instead_of_reading_memory() {
+    let r = run_src("fn main() { let a: [i32; 2] = [1, 2]; let i: i32 = -1; println(a[i]); }\n", &[]);
+    assert_eq!(r.code, 101);
+}
+
+#[test]
+fn impl_blocks_methods_assoc_fns_traits_and_default_methods() {
+    let r = run_file(&example("methods"), &[]);
+    assert_eq!(r.stdout, "75\n150\n9\n2000\n1000\n5\n-1\n");
+}
+
+#[test]
+fn const_static_type_and_nested_items() {
+    let r = run_file(&example("items"), &[]);
+    assert_eq!(r.stdout, "10\n20\nstatic string\n5\n-1\n42\n40\n10\n");
+}
+
+#[test]
+fn named_default_and_variadic_arguments() {
+    let r = run_file(&example("args"), &[]);
+    assert_eq!(r.stdout, "10\n15\n150\n8\n24\n28\n6\n90\n");
+}
+
+#[test]
+fn combined_11a_features() {
+    let r = run_file(&example("combined"), &[]);
+    assert_eq!(r.stdout, "54\n3\n8\n16\n5\n99\n5\n42\n84\n6\n7\n3\n");
+}
+
+#[test]
+fn argument_errors_are_compile_errors() {
+    let base = "fn f(a: i32, b: i32 = 1) -> i32 { a + b }\n";
+    for (body, needle) in [
+        ("fn main() { println(f(b: 2)); }\n", "missing the argument"),
+        ("fn main() { println(f(1, c: 2)); }\n", "no parameter named"),
+        ("fn main() { println(f(1, a: 2)); }\n", "given twice"),
+        ("fn main() { println(f(a: 1, 2)); }\n", "positional argument cannot follow"),
+        ("fn main() { println(f(1, 2, 3)); }\n", "more were given"),
+    ] {
+        let err = build_must_fail(&format!("{}{}", base, body));
+        assert!(err.contains(needle), "expected {:?} in: {}", needle, err);
+    }
+}
+
+#[test]
+fn borrow_argument_must_be_written_borrow() {
+    let err = build_must_fail("fn f(borrow n: i32) {}\nfn main() { let x = 1; f(x); }\n");
+    assert!(err.contains("expected `&i32`") || err.contains("must be written `borrow"), "stderr: {}", err);
+}
+
+#[test]
+fn assigning_to_a_static_is_rejected() {
+    let err = build_must_fail("static S: i32 = 1;\nfn main() { S = 2; }\n");
+    assert!(err.contains("static"), "stderr: {}", err);
+}
+
+#[test]
+fn static_initializer_must_be_constant() {
+    let err = build_must_fail("fn one() -> i32 { 1 }\nstatic S: i32 = one();\nfn main() { println(S); }\n");
+    assert!(err.contains("constant"), "stderr: {}", err);
+}
+
+#[test]
+fn duplicate_nested_function_names_are_rejected() {
+    let err = build_must_fail("fn a() -> i32 { fn h() -> i32 { 1 } h() }\nfn b() -> i32 { fn h() -> i32 { 2 } h() }\nfn main() { println(a() + b()); }\n");
+    assert!(err.contains("more than once"), "stderr: {}", err);
+}
+
+#[test]
+fn ir_bounds_check_methods_and_defaults() {
+    let text = ir(&std::fs::read_to_string(example("methods")).unwrap(), false);
+    // methods and associated functions are real functions named Type::method
+    assert!(text.contains("@\"mtn_Account::deposit\""), "{}", text);
+    assert!(text.contains("@\"mtn_Account::new\""));
+    // the trait default method is instantiated for the implementing type, not for the one that overrides it twice
+    assert!(text.contains("@\"mtn_Account::Describe::describe\""));
+    assert!(text.contains("@\"mtn_Plain::Describe::describe\""));
+    let arr = ir("fn main() { let a: [i32; 4] = [1, 2, 3, 4]; let i: usize = 2; println(a[i]); }\n", false);
+    assert!(arr.contains("__mtn_oob"), "{}", arr);
+    assert!(arr.contains("[4 x i32]"));
+}
+
+#[test]
+fn ir_const_is_inlined_and_static_is_one_global() {
+    let text = ir("const C: i32 = 7;\nstatic S: i32 = 9;\nfn main() { println(C + C); println(S); }\n", false);
+    assert!(!text.contains("mtn_static_C"));
+    assert_eq!(text.matches("@mtn_static_S = ").count(), 1, "{}", text);
+}
+
 // ------------------------------------------------------------- panic / exit
 
 #[test]
