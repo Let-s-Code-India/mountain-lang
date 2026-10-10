@@ -1493,7 +1493,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, env, ctx),
+            Expr::Binary { op, lhs, rhs } => self.check_binary_expected(*op, lhs, rhs, expected, env, ctx),
 
             Expr::Assign { lhs, rhs, .. } => {
                 let lt = self.check_expr(lhs, None, env, ctx);
@@ -1638,6 +1638,22 @@ impl TypeChecker {
                         let type_name = if tn == "Self" { self.self_type.as_ref().map(|t| t.to_string()) } else { Some(tn.clone()) };
                         let is_variant = self.enums.get(tn).map(|e| e.variants.iter().any(|(n, _)| n == fname)).unwrap_or(false);
                         if let (Some(type_name), false) = (type_name, is_variant) {
+                            // Several impls of one generic trait (`From<A>`, `From<B>` for the same
+                            // type, Document 11 §2): choose the one whose first parameter fits.
+                            let cands: Vec<FnSig> = self
+                                .impls_by_type
+                                .get(&type_name)
+                                .map(|v| v.iter().filter_map(|r| r.methods.get(fname.as_str()).cloned()).collect())
+                                .unwrap_or_default();
+                            if cands.len() > 1 && !args.is_empty() {
+                                let at = self.check_expr(&args[0].value, None, env, ctx);
+                                if let Some(sig) = cands.iter().find(|c| c.params.first() == Some(&at)).cloned() {
+                                    for (i, arg) in args.iter().enumerate().skip(1) {
+                                        self.check_expr(&arg.value, sig.params.get(i), env, ctx);
+                                    }
+                                    return sig.ret;
+                                }
+                            }
                             let sig = self.resolve_method(&Ty::Named(type_name), fname);
                             if let Some(sig) = sig {
                                 for (i, arg) in args.iter().enumerate() {
@@ -1983,8 +1999,16 @@ impl TypeChecker {
         }
     }
 
-    fn check_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, env: &mut Env, ctx: &str) -> Ty {
-        let lt = self.check_expr(lhs, None, env, ctx);
+    /// `expected` (Phase 11b-1, Document 5 rule 3): for arithmetic / bitwise operators
+    /// the surrounding type flows into the left operand, so `let x: u8 = 200 + 55;`
+    /// types the literals as `u8` instead of the default `i32`.
+    fn check_binary_expected(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let arith = matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Pow);
+        let lhs_hint = match expected {
+            Some(t) if arith && (ty_is_integer(t) || ty_is_float(t)) => Some(t),
+            _ => None,
+        };
+        let lt = self.check_expr(lhs, lhs_hint, env, ctx);
         // For most arithmetic, passing `Some(&lt)` as rhs's expected
         // type lets a literal rhs (`x + 5`) adopt lt's type (rule 3).
         // But for generic-struct operands, a differently-shaped-but-

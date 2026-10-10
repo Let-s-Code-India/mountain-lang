@@ -15,5 +15,6 @@ pub mod generator;
 pub mod lexer;
 pub mod manifest;
 pub mod parser;
+pub mod scope;
 pub mod token;
 pub mod types;

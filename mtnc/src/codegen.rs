@@ -96,6 +96,15 @@ pub(crate) struct FnInfo<'ctx, 'a> {
     self_kind: Option<PMode>,
 }
 
+/// Where a tail call stores a re-bound argument (Doc 10 §6): the parameter's
+/// stack slot, or (for `borrow` parameters, whose local IS the caller's pointer)
+/// the pointer itself, which can only be passed through unchanged.
+#[derive(Clone)]
+pub(crate) enum TailSlot<'ctx> {
+    Slot(PointerValue<'ctx>),
+    Ref(PointerValue<'ctx>),
+}
+
 /// One function body to generate (free function or `impl` method).
 struct FnWork<'a> {
     key: String,
@@ -137,6 +146,8 @@ pub struct Codegen<'ctx, 'a> {
     /// (type name, method name) -> function keys, inherent methods first.
     methods: HashMap<(String, String), Vec<String>>,
     consts: HashMap<String, (&'a Expr, Ty)>,
+    /// (target type, source type) -> function key of `impl From<source> for target` (Document 11 §2).
+    from_impls: HashMap<(String, String), String>,
     statics: HashMap<String, (PointerValue<'ctx>, Ty)>,
     const_depth: u32,
     /// The concrete type `Self` stands for while generating an `impl` method.
@@ -152,6 +163,11 @@ pub struct Codegen<'ctx, 'a> {
     loops: Vec<LoopCtx<'ctx>>,
     dead: bool,
     block_counter: usize,
+    /// Tail-call state of the function being generated (Document 10 §6).
+    cur_key: String,
+    tail_calls: std::collections::HashSet<usize>,
+    tail_loop: Option<BasicBlock<'ctx>>,
+    tail_params: Vec<TailSlot<'ctx>>,
 }
 
 fn is_signed(t: &Ty) -> bool {
@@ -243,6 +259,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             fns: HashMap::new(),
             methods: HashMap::new(),
             consts: HashMap::new(),
+            from_impls: HashMap::new(),
             statics: HashMap::new(),
             const_depth: 0,
             cur_self: None,
@@ -255,6 +272,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             loops: Vec::new(),
             dead: false,
             block_counter: 0,
+            cur_key: String::new(),
+            tail_calls: std::collections::HashSet::new(),
+            tail_loop: None,
+            tail_params: Vec::new(),
         }
     }
 
@@ -656,8 +677,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         errors.push("generic `impl` blocks are not yet supported by codegen — Phase 11".into());
                         continue;
                     }
-                    if !im.target.args.is_empty() || im.trait_ref.as_ref().map(|t| !t.args.is_empty()).unwrap_or(false) {
-                        errors.push("`impl` of a generic type or trait (e.g. `impl From<E> for T`) is not yet supported by codegen — Phase 11".into());
+                    // `impl From<Src> for Target` (Document 11 §2) is the one trait with a type
+                    // argument supported here; other generic traits are monomorphized later (11b-2).
+                    let from_src: Option<Ty> = match &im.trait_ref {
+                        Some(t) if t.name == "From" && t.args.len() == 1 => Some(resolve_type(&t.args[0])),
+                        _ => None,
+                    };
+                    if !im.target.args.is_empty() || (im.trait_ref.as_ref().map(|t| !t.args.is_empty()).unwrap_or(false) && from_src.is_none()) {
+                        errors.push("`impl` of a generic type or generic trait is not yet supported by codegen — Phase 11".into());
                         continue;
                     }
                     let target_ty = resolve_type(&Type::Primitive(im.target.name.clone()));
@@ -665,10 +692,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     let trait_name = im.trait_ref.as_ref().map(|t| t.name.clone());
                     for ii in &im.items {
                         let ImplItem::Fn(f) = ii else { continue };
-                        let key = match &trait_name {
-                            Some(t) => format!("{}::{}::{}", tystr, t, f.name),
-                            None => format!("{}::{}", tystr, f.name),
+                        let key = match (&trait_name, &from_src) {
+                            (Some(t), Some(src)) => format!("{}::{}<{}>::{}", tystr, t, src, f.name),
+                            (Some(t), None) => format!("{}::{}::{}", tystr, t, f.name),
+                            _ => format!("{}::{}", tystr, f.name),
                         };
+                        if let (Some(src), "from") = (&from_src, f.name.as_str()) {
+                            if self.from_impls.insert((tystr.clone(), src.to_string()), key.clone()).is_some() {
+                                errors.push(format!("`impl From<{}> for {}` is defined more than once", src, tystr));
+                            }
+                        }
                         if work.iter().any(|w| w.key == key) {
                             errors.push(format!("method `{}` is defined more than once", key));
                             continue;
@@ -745,6 +778,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     fn const_val_inner(&mut self, e: &Expr, ty: &Ty) -> R<V<'ctx>> {
+        // Constant arithmetic / comparisons of literals and consts are folded here.
+        if is_int(ty) || is_float(ty) || matches!(ty, Ty::Bool | Ty::Char) {
+            if let Some(cv) = self.fold(e)? {
+                return self.cv_to_value(cv, ty);
+            }
+        }
         let bad = || CgErr("a `static` initializer must be a constant literal expression (literals, tuples, arrays, struct literals, other constants)".into());
         match e {
             Expr::Paren(i) => self.const_val(i, ty),
@@ -892,6 +931,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let body = f.body.as_ref().unwrap();
         self.cur_fn = Some(val);
         self.cur_self = w.self_ty.clone();
+        self.cur_key = w.key.clone();
+        self.tail_calls = crate::codegen::tail::tail_calls_of(body, is_unit_like(&ret));
+        self.tail_params = Vec::new();
         self.ret_ty = ret.clone();
         self.locals = vec![HashMap::new()];
         self.loops.clear();
@@ -909,11 +951,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 // `borrow self` / `borrow mut self`: the local IS the caller's value
                 // (reads and writes go through the pointer, Document 6 §3).
                 PMode::Ref(_) => {
+                    self.tail_params.push(TailSlot::Ref(pv.into_pointer_value()));
                     self.locals.last_mut().unwrap().insert("self".to_string(), (pv.into_pointer_value(), sty));
                 }
                 _ => {
                     let slot = self.declare_local("self", &sty)?;
                     self.builder.build_store(slot, pv)?;
+                    self.tail_params.push(TailSlot::Slot(slot));
                 }
             }
         }
@@ -922,19 +966,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             llidx += 1;
             match p.mode {
                 PMode::Ref(_) => {
+                    self.tail_params.push(TailSlot::Ref(pv.into_pointer_value()));
                     self.locals.last_mut().unwrap().insert(p.name.clone(), (pv.into_pointer_value(), p.ty.clone()));
                 }
                 PMode::Value => {
                     let slot = self.declare_local(&p.name, &p.ty)?;
                     self.builder.build_store(slot, pv)?;
+                    self.tail_params.push(TailSlot::Slot(slot));
                 }
                 PMode::Variadic => {
                     let sl = Ty::Ref(false, Box::new(Ty::Array(Box::new(p.ty.clone()))));
                     let slot = self.declare_local(&p.name, &sl)?;
                     self.builder.build_store(slot, pv)?;
+                    self.tail_params.push(TailSlot::Slot(slot));
                 }
             }
         }
+        // A self-recursive call in tail position jumps back here (Document 10 §6).
+        let loop_bb = self.new_block("tail_loop");
+        self.builder.build_unconditional_branch(loop_bb)?;
+        self.position(loop_bb);
+        self.tail_loop = Some(loop_bb);
         let (v, bty) = self.gen_block(body)?;
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
             if self.dead || bty == Ty::Never {
@@ -949,6 +1001,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.alloca_builder.build_unconditional_branch(body_bb)?;
         self.cur_fn = None;
         self.cur_self = None;
+        self.tail_loop = None;
+        self.tail_calls.clear();
         Ok(())
     }
 
@@ -995,3 +1049,4 @@ pub struct EnumLayoutRef<'ctx> {
 
 mod expr;
 mod print;
+pub(crate) mod tail;

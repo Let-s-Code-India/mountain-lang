@@ -30,10 +30,12 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     if !lex_errs.is_empty() {
         return Err(lex_errs.iter().map(|d| d.to_string()).collect());
     }
-    let (program, parse_errs) = parse_program(tokens);
+    let (mut program, parse_errs) = parse_program(tokens);
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| format!("error: {} --> {}", e.message, e.span)).collect());
     }
+    // Same-named nested items of different functions get distinct names first.
+    crate::scope::scope_nested_items(&mut program);
     let mut tc = TypeChecker::new();
     tc.check_program(&program);
     let mut errors: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();

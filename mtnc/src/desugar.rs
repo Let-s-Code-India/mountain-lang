@@ -26,16 +26,16 @@
 //! program that spells out the same wrapper under that name, in that position,
 //! produces byte-identical LLVM IR.
 //!
-//! Limits (reported as "not yet supported by codegen" errors, never
-//! miscompiled): assigning to / mutably borrowing an outer local inside a
-//! `try` block (needs by-reference capture, Phase 11), and `break`/`continue`
-//! that leave the `try` block (they cannot cross the wrapper function).
+//! A local the block assigns to or mutably borrows is passed as a `borrow mut`
+//! parameter (Document 11 §8.9, Phase 11b-1). Limit (reported as a "not yet
+//! supported by codegen" error, never miscompiled): `break`/`continue` that
+//! leave the `try` block (they cannot cross the wrapper function).
 
 use crate::ast::*;
 use crate::types::{Ty, TypeChecker};
 use std::collections::HashSet;
 
-enum ChildMut<'a> {
+pub(crate) enum ChildMut<'a> {
     E(&'a mut Expr),
     B(&'a mut Block),
 }
@@ -128,7 +128,7 @@ pub(crate) fn block_children(b: &Block) -> Vec<Child<'_>> {
 /// Direct sub-expressions / sub-blocks of `e`. Constructs the compiler cannot
 /// lower yet (closures, spawn, ui, ...) report no children: codegen rejects
 /// them with its own error, so nothing inside them needs rewriting.
-fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
+pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
     let mut out = Vec::new();
     match e {
         Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) => out.push(ChildMut::E(x)),
@@ -647,22 +647,19 @@ impl Ctx<'_> {
         }
         self.errors.append(&mut free.errors);
         let mut params = Vec::new();
-        let mut cap_names = Vec::new();
+        let mut cap_names: Vec<(String, bool)> = Vec::new();
         for (name, ptr) in &free.captured {
-            if free.assigned.contains(name) {
-                self.errors.push(format!(
-                    "assigning to (or mutably borrowing) the outer variable `{}` inside a `try` block is not yet supported by codegen — Phase 11 (needs by-reference capture)",
-                    name
-                ));
-                continue;
-            }
+            // A local the block assigns or mutably borrows is passed as a `borrow mut`
+            // parameter (Document 11 §8.9); a local it only reads is passed by value.
+            let by_ref = free.assigned.contains(name);
             // SAFETY-free lookup: the address is only used as a map key.
             let ty = self.tc.expr_types.get(&(*ptr as usize)).cloned();
             let ast_ty = ty.as_ref().and_then(ty_to_type);
             match ast_ty {
                 Some(t) => {
-                    params.push(Param { ownership: OwnershipMod::None, name: name.clone(), is_variadic: false, ty: t, default: None });
-                    cap_names.push(name.clone());
+                    let ownership = if by_ref { OwnershipMod::BorrowMut } else { OwnershipMod::None };
+                    params.push(Param { ownership, name: name.clone(), is_variadic: false, ty: t, default: None });
+                    cap_names.push((name.clone(), by_ref));
                 }
                 None => self.errors.push(format!("cannot pass `{}` into the desugared `try` wrapper: its type is not supported by codegen yet", name)),
             }
@@ -728,7 +725,13 @@ impl Ctx<'_> {
         };
         let ok_pat = if unit_valued || never_valued { Pattern::Wildcard } else { Pattern::Ident("__v".into()) };
         *e = Expr::Match(Box::new(MatchExpr {
-            scrutinee: call(&name, cap_names.iter().map(|c| Expr::Ident(c.clone())).collect()),
+            scrutinee: call(
+                &name,
+                cap_names
+                    .iter()
+                    .map(|(c, by_ref)| if *by_ref { Expr::Borrow { mutable: true, expr: Box::new(Expr::Ident(c.clone())) } } else { Expr::Ident(c.clone()) })
+                    .collect(),
+            ),
             arms: vec![
                 MatchArm { patterns: vec![Pattern::TupleStruct("Ok".into(), vec![ok_pat])], guard: None, body: ok_arm_body },
                 MatchArm { patterns: vec![Pattern::TupleStruct("Err".into(), vec![Pattern::Ident(catch_var)])], guard: None, body: MatchArmBody::Block(catch_block) },
@@ -823,8 +826,10 @@ pub fn all_items(program: &Program) -> Vec<&Item> {
 /// anything changed (the caller then re-checks the program).
 pub fn inline_default_methods(program: &mut Program) -> bool {
     use std::collections::HashMap;
+    // Traits and impls may be nested in function bodies (Phase 11b-1), so
+    // both are collected / patched over the whole item tree.
     let mut defaults: HashMap<String, Vec<FnDecl>> = HashMap::new();
-    for it in &program.items {
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
         if let ItemKind::Trait(t) = &it.kind {
             let fs: Vec<FnDecl> = t
                 .items
@@ -836,12 +841,12 @@ pub fn inline_default_methods(program: &mut Program) -> bool {
                 .collect();
             defaults.insert(t.name.clone(), fs);
         }
-    }
+    });
     let mut changed = false;
-    for it in program.items.iter_mut() {
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
         if let ItemKind::Impl(im) = &mut it.kind {
-            let Some(tr) = &im.trait_ref else { continue };
-            let Some(fs) = defaults.get(&tr.name) else { continue };
+            let Some(tr) = &im.trait_ref else { return };
+            let Some(fs) = defaults.get(&tr.name) else { return };
             for f in fs {
                 let overridden = im.items.iter().any(|ii| matches!(ii, ImplItem::Fn(g) if g.name == f.name));
                 if !overridden {
@@ -850,6 +855,6 @@ pub fn inline_default_methods(program: &mut Program) -> bool {
                 }
             }
         }
-    }
+    });
     changed
 }
