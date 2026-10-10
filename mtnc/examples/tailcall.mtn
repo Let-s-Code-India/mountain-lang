@@ -1,0 +1,66 @@
+// Guaranteed self tail-call (Document 10 §6): depth 1,000,000 in a debug build.
+fn sum_to(n: u64, acc: u64) -> u64 {
+    if n == 0 {
+        acc
+    } else {
+        sum_to(n - 1, acc + n)
+    }
+}
+
+fn count_down(n: u64) -> u64 {
+    if n == 0 {
+        return 7;
+    }
+    return count_down(n - 1);
+}
+
+fn parity(n: u64, even: bool) -> bool {
+    match n {
+        0 => even,
+        _ => parity(n - 1, !even),
+    }
+}
+
+fn tick(borrow mut counter: u64, n: u64) {
+    if n > 0 {
+        counter += 1;
+        tick(borrow mut counter, n - 1);
+    }
+}
+
+struct Walker {
+    steps: u64,
+}
+
+impl Walker {
+    fn walk(borrow mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.steps += 2;
+        self.walk(n - 1);
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+// NOT a tail call (the multiplication happens after the call returns): normal recursion.
+fn factorial(n: u64) -> u64 {
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+
+fn main() {
+    println(sum_to(1000000, 0));
+    println(count_down(1000000));
+    println(parity(1000001, true));
+    let mut c: u64 = 0;
+    tick(borrow mut c, 1000000);
+    println(c);
+    let mut w = Walker { steps: 0 };
+    w.walk(1000000);
+    println(w.steps);
+    println(gcd(1071, 462));
+    println(factorial(10));
+}

@@ -1,0 +1,23 @@
+// Same-named nested items in different functions, and default trait methods in nested impls.
+trait Show { fn val(borrow self) -> i32; fn twice(borrow self) -> i32 { self.val() * 2 } }
+fn a() -> i32 {
+    fn helper() -> i32 { 1 }
+    struct Local { n: i32 }
+    impl Show for Local { fn val(borrow self) -> i32 { self.n } }
+    let l = Local { n: 10 };
+    helper() + l.twice()
+}
+fn b() -> i32 {
+    fn helper() -> i32 { 2 }
+    struct Local { n: i32, m: i32 }
+    impl Show for Local { fn val(borrow self) -> i32 { self.n + self.m } }
+    let l = Local { n: 1, m: 2 };
+    let helper2 = helper();
+    helper2 + l.twice()
+}
+fn helper() -> i32 { 1000 }
+fn main() {
+    println(a());
+    println(b());
+    println(helper());
+}
