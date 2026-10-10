@@ -229,12 +229,6 @@ fn static_initializer_must_be_constant() {
 }
 
 #[test]
-fn duplicate_nested_function_names_are_rejected() {
-    let err = build_must_fail("fn a() -> i32 { fn h() -> i32 { 1 } h() }\nfn b() -> i32 { fn h() -> i32 { 2 } h() }\nfn main() { println(a() + b()); }\n");
-    assert!(err.contains("more than once"), "stderr: {}", err);
-}
-
-#[test]
 fn ir_bounds_check_methods_and_defaults() {
     let text = ir(&std::fs::read_to_string(example("methods")).unwrap(), false);
     // methods and associated functions are real functions named Type::method
@@ -253,6 +247,133 @@ fn ir_const_is_inlined_and_static_is_one_global() {
     let text = ir("const C: i32 = 7;\nstatic S: i32 = 9;\nfn main() { println(C + C); println(S); }\n", false);
     assert!(!text.contains("mtn_static_C"));
     assert_eq!(text.matches("@mtn_static_S = ").count(), 1, "{}", text);
+}
+
+// ----------------------------------------------------------- Phase 11b-1
+
+#[test]
+fn same_named_nested_items_in_different_functions_are_scoped() {
+    let r = run_file(&example("nested_scope"), &[]);
+    assert_eq!(r.stdout, "21\n8\n1000\n");
+}
+
+#[test]
+fn nested_impl_gets_default_trait_methods() {
+    // `twice` is a default method used on impls nested inside functions (see nested_scope).
+    let src = "trait T { fn a(borrow self) -> i32; fn b(borrow self) -> i32 { self.a() + 1 } }\nfn main() { struct S { n: i32 } impl T for S { fn a(borrow self) -> i32 { self.n } } let s = S { n: 4 }; println(s.b()); }\n";
+    assert_eq!(run_src(src, &[]).stdout, "5\n");
+}
+
+#[test]
+fn duplicate_nested_names_inside_one_function_are_still_rejected() {
+    let err = build_must_fail("fn main() { fn h() -> i32 { 1 } fn h() -> i32 { 2 } println(h()); }\n");
+    assert!(err.contains("more than once"), "stderr: {}", err);
+}
+
+#[test]
+fn a_nested_item_may_share_its_name_with_a_top_level_item() {
+    let src = "fn h() -> i32 { 100 }\nfn f() -> i32 { fn h() -> i32 { 1 } h() }\nfn main() { println(f() + h()); }\n";
+    assert_eq!(run_src(src, &[]).stdout, "101\n");
+}
+
+#[test]
+fn a_local_variable_shadows_a_renamed_nested_item() {
+    let src = "fn a() -> i32 { fn h() -> i32 { 1 } let h = 5; h }\nfn b() -> i32 { fn h() -> i32 { 2 } h() }\nfn main() { println(a() + b()); }\n";
+    assert_eq!(run_src(src, &[]).stdout, "7\n");
+}
+
+#[test]
+fn static_initializers_may_use_constant_arithmetic_and_comparisons() {
+    let r = run_file(&example("const_fold"), &[]);
+    assert_eq!(r.stdout, "40\n255\ntrue\n6.5\n1099511627781\n21\n-6\n19\n2\nfalse\n");
+}
+
+#[test]
+fn static_constant_overflow_and_calls_are_compile_errors() {
+    let err = build_must_fail("static B: u8 = 200 + 56;\nfn main() { println(B); }\n");
+    assert!(err.contains("overflows"), "stderr: {}", err);
+    let err = build_must_fail("static D: i32 = 1 / 0;\nfn main() { println(D); }\n");
+    assert!(err.contains("zero"), "stderr: {}", err);
+    let err = build_must_fail("fn one() -> i32 { 1 }\nstatic S: i32 = one() + 1;\nfn main() { println(S); }\n");
+    assert!(err.contains("constant"), "stderr: {}", err);
+    // a `static` is not a `const`: it cannot feed another static's arithmetic
+    let err = build_must_fail("static A: i32 = 1;\nstatic B: i32 = A + 1;\nfn main() { println(B); }\n");
+    assert!(err.contains("constant"), "stderr: {}", err);
+}
+
+#[test]
+fn question_mark_converts_errors_through_from_impls() {
+    let r = run_file(&example("from_conv"), &[]);
+    assert_eq!(r.stdout, "31\n1000\n993\n2200\n21\n497\n1100\n3\n-1\n2004\n");
+}
+
+#[test]
+fn question_mark_without_a_from_impl_is_a_compile_error() {
+    let src = "enum A { X }\nenum B { Y }\nfn f() -> Result<i32, A> { Err(A::X) }\nfn g() -> Result<i32, B> { let v = f()?; Ok(v) }\nfn main() { }\n";
+    let err = build_must_fail(src);
+    assert!(err.contains("From"), "stderr: {}", err);
+}
+
+#[test]
+fn ir_question_mark_calls_the_from_function() {
+    let text = ir(&std::fs::read_to_string(example("from_conv")).unwrap(), false);
+    assert!(text.contains("call %") || text.contains("call {"), "{}", text);
+    assert!(text.contains("@\"mtn_AppError::From<IoError>::from\""), "{}", text);
+    assert!(text.contains("@\"mtn_AppError::From<ParseError>::from\""), "{}", text);
+}
+
+#[test]
+fn tail_calls_run_a_million_deep_in_a_debug_build() {
+    let r = run_file(&example("tailcall"), &[]);
+    assert_eq!(r.stdout, "500000500000\n7\nfalse\n1000000\n2000000\n21\n3628800\n");
+    assert_eq!(r.code, 0);
+    let r = run_file(&example("tailcall"), &["--release"]);
+    assert_eq!(r.stdout, "500000500000\n7\nfalse\n1000000\n2000000\n21\n3628800\n");
+}
+
+#[test]
+fn tail_recursive_function_has_no_self_call_left_in_the_ir() {
+    let text = ir(&std::fs::read_to_string(example("tailcall")).unwrap(), false);
+    let body_of = |name: &str| -> String {
+        let start = text.find(&format!("@mtn_{}(", name)).unwrap_or_else(|| panic!("no function {}", name));
+        let start = text[..start].rfind("define").unwrap();
+        let end = start + text[start..].find("\n}\n").unwrap();
+        text[start..end].to_string()
+    };
+    for f in ["sum_to", "count_down", "parity", "gcd"] {
+        let b = body_of(f);
+        // the only mention of `@mtn_<f>(` in its own body is the `define` line itself
+        assert_eq!(b.matches(&format!("@mtn_{}(", f)).count(), 1, "{} still calls itself:\n{}", f, b);
+        assert!(b.contains("tail_loop"), "{} has no tail loop", f);
+    }
+    // non-tail recursion is an ordinary call
+    assert!(body_of("factorial").matches("call i64 @mtn_factorial(").count() >= 1);
+}
+
+#[test]
+fn non_tail_recursion_still_works_deeply_enough() {
+    let src = "fn depth(n: u64) -> u64 { if n == 0 { 0 } else { 1 + depth(n - 1) } }\nfn main() { println(depth(10000)); }\n";
+    assert_eq!(run_src(src, &[]).stdout, "10000\n");
+}
+
+#[test]
+fn try_blocks_may_assign_and_mutably_borrow_outer_locals() {
+    let r = run_file(&example("trymut"), &[]);
+    assert_eq!(r.stdout, "-6\n3\n3\n20\n2\n");
+}
+
+#[test]
+fn break_leaving_a_try_block_is_still_a_clear_error() {
+    let src = "enum E { Bad }\nfn chk(n: i32) -> Result<i32, E> { Ok(n) }\nfn main() { let mut i = 0; while i < 3 { try { chk(i)?; break; } catch (e) { } i += 1; } }\n";
+    let err = build_must_fail(src);
+    assert!(err.contains("not yet supported by codegen"), "stderr: {}", err);
+}
+
+#[test]
+fn return_inside_try_is_a_compile_error() {
+    let src = "enum E { Bad }\nfn chk(n: i32) -> Result<i32, E> { Ok(n) }\nfn f() -> i32 { try { chk(1)?; return 5; } catch (e) { } 0 }\nfn main() { println(f()); }\n";
+    let err = build_must_fail(src);
+    assert!(err.contains("return"), "stderr: {}", err);
 }
 
 // ------------------------------------------------------------- panic / exit
@@ -500,13 +621,6 @@ fn try_block_reading_outer_locals_gets_them_as_wrapper_parameters() {
     let src = "enum E { Bad }\nfn chk(n: i32) -> Result<i32, E> { if n > 5 { return Err(E::Bad); } Ok(n) }\nfn main() { let limit = 3; let r = try { chk(limit + 1)? } catch (e) { -1 }; println(r); let r2 = try { chk(limit + 9)? } catch (e) { -1 }; println(r2); }\n";
     let r = run_src(src, &[]);
     assert_eq!(r.stdout, "4\n-1\n");
-}
-
-#[test]
-fn try_block_assigning_an_outer_local_is_a_clear_unsupported_error() {
-    let src = "enum E { Bad }\nfn chk(n: i32) -> Result<i32, E> { Ok(n) }\nfn main() { let mut total = 0; try { total = chk(1)?; } catch (e) { println(0); } println(total); }\n";
-    let err = build_must_fail(src);
-    assert!(err.contains("not yet supported by codegen"), "stderr: {}", err);
 }
 
 #[test]
