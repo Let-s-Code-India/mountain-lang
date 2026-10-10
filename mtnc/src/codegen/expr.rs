@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// A folded constant scalar (Phase 11b-1).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ConstVal {
+    I(i128),
+    F(f64),
+    B(bool),
+}
+
 enum SwKind {
     Const(u64),
     CatchAll,
@@ -287,7 +295,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let ty = self.ty_of(e)?;
                 self.gen_borrow(&ty, inner)
             }
-            Expr::MethodCall { receiver, name, args } => self.method_call(receiver, name, args),
+            Expr::MethodCall { receiver, name, args } => self.method_call(receiver, name, args, e as *const Expr as usize),
             Expr::If(i) => {
                 let ty = self.ty_of(e)?;
                 self.gen_if(i, &ty)
@@ -367,7 +375,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     // ---- literals ------------------------------------------------------
 
-    fn int_const(&mut self, ty: &Ty, v: u128, neg: bool) -> R<V<'ctx>> {
+    pub(super) fn int_const(&mut self, ty: &Ty, v: u128, neg: bool) -> R<V<'ctx>> {
         let lt = self.llty(ty)?.into_int_type();
         let bits = lt.get_bit_width();
         let ok = if is_signed(ty) {
@@ -898,7 +906,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.build_slice(slot, len)
     }
 
-    fn call_fn(&mut self, key: &str, display: &str, recv: Option<V<'ctx>>, args: &[Arg]) -> R<V<'ctx>> {
+    fn call_fn(&mut self, key: &str, display: &str, recv: Option<V<'ctx>>, args: &[Arg], call_addr: usize) -> R<V<'ctx>> {
         let (fv, params, ret) = {
             let i = &self.fns[key];
             (i.val, i.params.clone(), i.ret.clone())
@@ -909,6 +917,32 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         for v in self.resolve_args(display, &params, args)? {
             vals.push(v.into());
+        }
+        // Guaranteed self tail-call (Document 10 §6): re-bind the parameters and jump.
+        if key == self.cur_key && self.tail_calls.contains(&call_addr) && !self.dead && self.tail_params.len() == vals.len() {
+            let slots = self.tail_params.clone();
+            let mut ok = true;
+            for (slot, v) in slots.iter().zip(vals.iter()) {
+                if let TailSlot::Ref(p) = slot {
+                    // a `borrow` parameter can only be passed through unchanged
+                    match v {
+                        BasicMetadataValueEnum::PointerValue(pv) if pv == p => {}
+                        _ => ok = false,
+                    }
+                }
+            }
+            if ok {
+                for (slot, v) in slots.iter().zip(vals.iter()) {
+                    if let TailSlot::Slot(p) = slot {
+                        let bv: V<'ctx> = (*v).try_into().map_err(|_| CgErr("internal: tail-call argument".into()))?;
+                        self.builder.build_store(*p, bv)?;
+                    }
+                }
+                let target = self.tail_loop.unwrap();
+                self.builder.build_unconditional_branch(target)?;
+                self.terminate();
+                return self.zero_of(&ret);
+            }
         }
         let call = self.builder.build_call(fv, &vals, "")?;
         if ret == Ty::Never {
@@ -926,7 +960,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.methods.get(&(tystr.to_string(), name.to_string())).and_then(|v| v.first().cloned())
     }
 
-    fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+    fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Arg], call_addr: usize) -> R<V<'ctx>> {
         let rty = self.ty_of(receiver)?;
         let mut base = rty.clone();
         while let Ty::Ref(_, i) = base {
@@ -971,7 +1005,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         };
         let display = format!("{}::{}", tystr, name);
-        self.call_fn(&key, &display, Some(recv), args)
+        self.call_fn(&key, &display, Some(recv), args, call_addr)
     }
 
     fn assign(&mut self, op: AssignOp, lhs: &Expr, rhs: &Expr) -> R<()> {
@@ -1377,6 +1411,215 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         }
         Err(CgErr(format!("casting `{}` to `{}` with `as` is not supported", from, to)))
+    }
+
+
+    // ---- constant folding (static initializers) --------------------------------
+
+    fn int_bits(&self, ty: &Ty) -> u32 {
+        match ty {
+            Ty::I8 | Ty::U8 => 8,
+            Ty::I16 | Ty::U16 => 16,
+            Ty::I32 | Ty::U32 | Ty::Char => 32,
+            Ty::I64 | Ty::U64 => 64,
+            Ty::I128 | Ty::U128 => 128,
+            Ty::Isize | Ty::Usize => self.ptr_bits(),
+            _ => 0,
+        }
+    }
+
+    fn cv_fits(&self, ty: &Ty, v: i128) -> bool {
+        let bits = self.int_bits(ty);
+        if bits == 0 {
+            return false;
+        }
+        if is_signed(ty) {
+            bits == 128 || (v >= -(1i128 << (bits - 1)) && v < (1i128 << (bits - 1)))
+        } else {
+            v >= 0 && (bits >= 127 || v < (1i128 << bits))
+        }
+    }
+
+    /// Wraps `v` to the range of the integer type `ty` (the `as` cast semantics).
+    fn cv_wrap(&self, ty: &Ty, v: i128) -> i128 {
+        let bits = self.int_bits(ty);
+        if bits >= 128 || bits == 0 {
+            return v;
+        }
+        let m = (v as u128) & ((1u128 << bits) - 1);
+        if is_signed(ty) && m >> (bits - 1) == 1 {
+            (m as i128) - (1i128 << bits)
+        } else {
+            m as i128
+        }
+    }
+
+    /// Folds a constant scalar expression (Phase 11b-1: `static` initializers
+    /// may use constant arithmetic and comparisons of literals and consts).
+    /// `Ok(None)` means "not a foldable constant"; `Err` is a genuine error
+    /// (constant overflow, division by zero).
+    pub(super) fn fold(&mut self, e: &Expr) -> R<Option<ConstVal>> {
+        self.const_depth += 1;
+        if self.const_depth > 64 {
+            self.const_depth -= 1;
+            return Err(CgErr("constants refer to each other in a cycle".into()));
+        }
+        let r = self.fold_inner(e);
+        self.const_depth -= 1;
+        r
+    }
+
+    fn fold_inner(&mut self, e: &Expr) -> R<Option<ConstVal>> {
+        match e {
+            Expr::Paren(i) => self.fold(i),
+            Expr::Literal(l) => Ok(match l {
+                Literal::Int(t) => parse_int_text(t, None).and_then(|v| i128::try_from(v).ok()).map(ConstVal::I),
+                Literal::IntHex(t) => parse_int_text(t, Some(("0x", 16))).and_then(|v| i128::try_from(v).ok()).map(ConstVal::I),
+                Literal::IntOct(t) => parse_int_text(t, Some(("0o", 8))).and_then(|v| i128::try_from(v).ok()).map(ConstVal::I),
+                Literal::IntBin(t) => parse_int_text(t, Some(("0b", 2))).and_then(|v| i128::try_from(v).ok()).map(ConstVal::I),
+                Literal::Float(t) => {
+                    let b: String = t.chars().filter(|c| *c != '_').collect();
+                    b.trim_end_matches("f32").trim_end_matches("f64").parse::<f64>().ok().map(ConstVal::F)
+                }
+                Literal::Bool(b) => Some(ConstVal::B(*b)),
+                Literal::Char(t) => {
+                    let inner = t.strip_prefix('\'').and_then(|s| s.strip_suffix('\''));
+                    inner.and_then(|i| unescape_char(&mut i.chars().peekable())).map(|c| ConstVal::I(c as i128))
+                }
+                _ => None,
+            }),
+            Expr::Ident(n) => match self.consts.get(n.as_str()).cloned() {
+                Some((ce, _)) => self.fold(ce),
+                None => Ok(None),
+            },
+            Expr::Unary { op, expr } => {
+                let ty = self.ty_of(e)?;
+                let Some(v) = self.fold(expr)? else { return Ok(None) };
+                Ok(match (op, v) {
+                    (UnaryOp::Neg, ConstVal::I(i)) => {
+                        let r = i.checked_neg().ok_or_else(|| CgErr("constant negation overflows".into()))?;
+                        if !self.cv_fits(&ty, r) {
+                            return Err(CgErr(format!("constant `-{}` overflows `{}`", i, ty)));
+                        }
+                        Some(ConstVal::I(r))
+                    }
+                    (UnaryOp::Neg, ConstVal::F(f)) => Some(ConstVal::F(-f)),
+                    (UnaryOp::Not, ConstVal::B(b)) => Some(ConstVal::B(!b)),
+                    (UnaryOp::BitNot, ConstVal::I(i)) => Some(ConstVal::I(self.cv_wrap(&ty, !i))),
+                    _ => None,
+                })
+            }
+            Expr::Cast { expr, .. } => {
+                let to = self.ty_of(e)?;
+                let from = self.ty_of(expr)?;
+                let Some(v) = self.fold(expr)? else { return Ok(None) };
+                Ok(match (v, is_int(&to) || to == Ty::Char, is_float(&to)) {
+                    (ConstVal::I(i), true, _) => Some(ConstVal::I(self.cv_wrap(&to, i))),
+                    (ConstVal::I(i), _, true) => Some(ConstVal::F(i as f64)),
+                    (ConstVal::B(b), true, _) => Some(ConstVal::I(b as i128)),
+                    (ConstVal::F(f), true, _) if is_int(&to) => {
+                        let _ = from;
+                        let bits = self.int_bits(&to);
+                        let (lo, hi) = if is_signed(&to) { (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1) - 1.0) } else { (0.0, 2f64.powi(bits.min(127) as i32) - 1.0) };
+                        Some(ConstVal::I(if f.is_nan() { 0 } else { f.clamp(lo, hi) as i128 }))
+                    }
+                    (ConstVal::F(f), _, true) => Some(ConstVal::F(if to == Ty::F32 { (f as f32) as f64 } else { f })),
+                    _ => None,
+                })
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let lt = self.ty_of(lhs)?;
+                let Some(a) = self.fold(lhs)? else { return Ok(None) };
+                let Some(b) = self.fold(rhs)? else { return Ok(None) };
+                let ovf = |what: &str| CgErr(format!("constant {} overflows `{}`", what, lt));
+                Ok(match (a, b) {
+                    (ConstVal::I(x), ConstVal::I(y)) => {
+                        let arith = |r: Option<i128>, what: &str| -> R<Option<ConstVal>> {
+                            let v = r.ok_or_else(|| ovf(what))?;
+                            if !self.cv_fits(&lt, v) {
+                                return Err(ovf(what));
+                            }
+                            Ok(Some(ConstVal::I(v)))
+                        };
+                        match op {
+                            BinaryOp::Add => return arith(x.checked_add(y), "addition"),
+                            BinaryOp::Sub => return arith(x.checked_sub(y), "subtraction"),
+                            BinaryOp::Mul => return arith(x.checked_mul(y), "multiplication"),
+                            BinaryOp::Div | BinaryOp::Mod => {
+                                if y == 0 {
+                                    return Err(CgErr("division or remainder by zero in a constant expression".into()));
+                                }
+                                return arith(if *op == BinaryOp::Div { x.checked_div(y) } else { x.checked_rem(y) }, "division");
+                            }
+                            BinaryOp::BitAnd => Some(ConstVal::I(x & y)),
+                            BinaryOp::BitOr => Some(ConstVal::I(x | y)),
+                            BinaryOp::BitXor => Some(ConstVal::I(x ^ y)),
+                            BinaryOp::Shl | BinaryOp::Shr => {
+                                let bits = self.int_bits(&lt) as i128;
+                                if y < 0 || y >= bits {
+                                    return Err(CgErr("shift amount out of range in a constant expression".into()));
+                                }
+                                if *op == BinaryOp::Shl {
+                                    return arith(Some(self.cv_wrap(&lt, ((x as u128) << y) as i128)), "shift").map(|o| o);
+                                }
+                                Some(ConstVal::I(x >> y))
+                            }
+                            BinaryOp::Pow => {
+                                if y < 0 {
+                                    return Err(CgErr("negative exponent in a constant expression".into()));
+                                }
+                                return arith(u32::try_from(y).ok().and_then(|p| x.checked_pow(p)), "exponentiation");
+                            }
+                            BinaryOp::EqEq => Some(ConstVal::B(x == y)),
+                            BinaryOp::NotEq => Some(ConstVal::B(x != y)),
+                            BinaryOp::Lt => Some(ConstVal::B(x < y)),
+                            BinaryOp::Gt => Some(ConstVal::B(x > y)),
+                            BinaryOp::LtEq => Some(ConstVal::B(x <= y)),
+                            BinaryOp::GtEq => Some(ConstVal::B(x >= y)),
+                            _ => None,
+                        }
+                    }
+                    (ConstVal::F(x), ConstVal::F(y)) => {
+                        let round = |r: f64| if lt == Ty::F32 { (r as f32) as f64 } else { r };
+                        match op {
+                            BinaryOp::Add => Some(ConstVal::F(round(x + y))),
+                            BinaryOp::Sub => Some(ConstVal::F(round(x - y))),
+                            BinaryOp::Mul => Some(ConstVal::F(round(x * y))),
+                            BinaryOp::Div => Some(ConstVal::F(round(x / y))),
+                            BinaryOp::EqEq => Some(ConstVal::B(x == y)),
+                            BinaryOp::NotEq => Some(ConstVal::B(x != y)),
+                            BinaryOp::Lt => Some(ConstVal::B(x < y)),
+                            BinaryOp::Gt => Some(ConstVal::B(x > y)),
+                            BinaryOp::LtEq => Some(ConstVal::B(x <= y)),
+                            BinaryOp::GtEq => Some(ConstVal::B(x >= y)),
+                            _ => None,
+                        }
+                    }
+                    (ConstVal::B(x), ConstVal::B(y)) => match op {
+                        BinaryOp::AndAnd | BinaryOp::BitAnd => Some(ConstVal::B(x && y)),
+                        BinaryOp::OrOr | BinaryOp::BitOr => Some(ConstVal::B(x || y)),
+                        BinaryOp::BitXor | BinaryOp::NotEq => Some(ConstVal::B(x != y)),
+                        BinaryOp::EqEq => Some(ConstVal::B(x == y)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn cv_to_value(&mut self, cv: ConstVal, ty: &Ty) -> R<V<'ctx>> {
+        match cv {
+            ConstVal::I(v) if is_int(ty) => {
+                if v < 0 { self.int_const(ty, v.unsigned_abs(), true) } else { self.int_const(ty, v as u128, false) }
+            }
+            ConstVal::I(v) if *ty == Ty::Char => Ok(self.int_ty(32).const_int(v as u64, false).into()),
+            ConstVal::I(v) if is_float(ty) => Ok(self.llty(ty)?.into_float_type().const_float(v as f64).into()),
+            ConstVal::F(f) if is_float(ty) => Ok(self.llty(ty)?.into_float_type().const_float(f).into()),
+            ConstVal::B(b) if *ty == Ty::Bool => Ok(self.int_ty(1).const_int(b as u64, false).into()),
+            _ => Err(CgErr(format!("a constant of this kind cannot have type `{}`", ty))),
+        }
     }
 
     // ---- control flow ------------------------------------------------------
@@ -1902,11 +2145,28 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let Ty::ResultTy(_, tgt_err) = &ret else {
                 return Err(CgErr(format!("`?` on a `Result` needs the function to return `Result<_, E>`, it returns `{}`", ret)));
             };
-            if src_err != tgt_err {
-                return unsupported(&format!("converting the error type `{}` into `{}` with `?` (a `From` impl call)", src_err, tgt_err), 11);
-            }
+            // Document 11 §2: a different error type is converted through a real `impl From<Src> for Target`.
+            let converter = if src_err != tgt_err {
+                match self.from_impls.get(&(tgt_err.to_string(), src_err.to_string())).cloned() {
+                    Some(k) => Some(k),
+                    None => {
+                        return Err(CgErr(format!(
+                            "`?` cannot convert the error type `{}` into `{}`: there is no `impl From<{}> for {}`",
+                            src_err, tgt_err, src_err, tgt_err
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
             let ep = self.payload_ptr(&oty, place, 1, 0)?;
-            let ev = self.load(ep, src_err)?;
+            let mut ev = self.load(ep, src_err)?;
+            if let Some(k) = converter {
+                let fv = self.fns[&k].val;
+                let call = self.builder.build_call(fv, &[ev.into()], "from")?;
+                let ValueKind::Basic(v) = call.try_as_basic_value() else { return Err(CgErr("internal: `from` returned no value".into())) };
+                ev = v;
+            }
             let out = self.make_enum(&ret, 1, vec![ev])?;
             self.builder.build_return(Some(&out))?;
         } else {
@@ -1942,7 +2202,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 if user_fn {
                     let key = name.clone();
-                    return self.call_fn(&key, name, None, args);
+                    return self.call_fn(&key, name, None, args, whole as *const Expr as usize);
                 }
                 if args.iter().any(|a| a.name.is_some()) {
                     return unsupported("named arguments here", 11);
@@ -1986,12 +2246,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     } else {
                         resolve_type(&Type::Primitive(tn.clone())).to_string()
                     };
-                    if let Some(key) = self.find_method(&tystr, fname) {
+                    let mut chosen = self.find_method(&tystr, fname);
+                    // several impls of one generic trait (`From<A>`, `From<B>`): pick by the first argument's type
+                    if let Some(cands) = self.methods.get(&(tystr.clone(), fname.clone())).cloned() {
+                        if cands.len() > 1 && !args.is_empty() {
+                            let at = self.ty_of(&args[0].value)?;
+                            if let Some(k) = cands.iter().find(|k| self.fns.get(k.as_str()).map(|i| i.params.first().map(|p| p.ty == at).unwrap_or(false)).unwrap_or(false)) {
+                                chosen = Some(k.clone());
+                            }
+                        }
+                    }
+                    if let Some(key) = chosen {
                         if self.fns[&key].self_kind.is_some() {
                             return Err(CgErr(format!("`{}::{}` takes `self`: call it as `value.{}(..)`", tystr, fname, fname)));
                         }
                         let display = format!("{}::{}", tystr, fname);
-                        return self.call_fn(&key, &display, None, args);
+                        return self.call_fn(&key, &display, None, args, whole as *const Expr as usize);
                     }
                     if matches!(tn.as_str(), "Box" | "Rc" | "Arc" | "Weak") {
                         return unsupported(&format!("`{}::{}` (heap / shared-ownership types)", tn, fname), 11);
