@@ -222,6 +222,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Paren(inner) => self.expr(inner),
             Expr::Ident(name) => self.ident(e, name),
+            Expr::TurbofishPath { .. } => unsupported("unresolved generic path (internal: monomorphization should have removed it)", 11),
             Expr::Path(path) => {
                 let ty = self.ty_of(e)?;
                 if let [_, variant] = path.as_slice() {
