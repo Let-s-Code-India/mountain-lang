@@ -1605,26 +1605,32 @@ impl Parser {
                 self.expect_word()?
             };
             let mut path = vec![name.clone()];
-            path.extend(self.parse_further_path_segments()?);
-            let base = if path.len() > 1 {
+            // Doc 23 §17.2: turbofish `::<..>` is valid after ANY path segment.
+            let mut gens: Vec<(usize, Vec<Type>)> = Vec::new();
+            loop {
+                if !self.check_op(Op::ColonColon) { break; }
+                let save = self.pos;
+                self.advance();
+                if self.check_op(Op::Lt) {
+                    let args = self.parse_generic_args_opt()?;
+                    gens.push((path.len() - 1, args));
+                    continue;
+                }
+                let w = self.expect_word();
+                match w {
+                    Ok(w) => path.push(w),
+                    Err(e) => { if gens.is_empty() { return Err(e); } self.pos = save; break; }
+                }
+            }
+            let base = if !gens.is_empty() {
+                Expr::TurbofishPath { path, gens }
+            } else if path.len() > 1 {
                 Expr::Path(path)
             } else {
                 Expr::Ident(name)
             };
-            // Optional turbofish `::<T, U>` (Document 8 §2's
-            // `largest::<i32>(nums)`). Parsed and discarded for now —
-            // Phase 2 produces an untyped AST (Document 17 §3); explicit
-            // generic-argument tracking at call sites is Phase 5
-            // (Generics) territory. This only needs to not choke on the
-            // syntax, which it now doesn't.
-            if self.check_op(Op::ColonColon) {
-                let save = self.pos;
-                self.advance();
-                if self.check_op(Op::Lt) {
-                    let _ = self.parse_generic_args_opt()?;
-                } else {
-                    self.pos = save;
-                }
+            if matches!(base, Expr::TurbofishPath { .. }) {
+                return Ok(base);
             }
             if self.check_delim(Delim::LBrace) && self.struct_lit_allowed {
                 if self.looks_like_struct_lit_fields() {

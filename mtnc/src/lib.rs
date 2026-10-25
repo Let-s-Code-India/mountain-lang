@@ -14,6 +14,7 @@ pub mod exhaustive;
 pub mod generator;
 pub mod lexer;
 pub mod manifest;
+pub mod mono;
 pub mod parser;
 pub mod scope;
 pub mod token;

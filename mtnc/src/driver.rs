@@ -43,6 +43,39 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     bc.check_program(&program);
     errors.extend(bc.errors.iter().map(|e| e.to_string()));
     if errors.is_empty() {
+        // Phase 11b-2: monomorphize to a fixpoint (Document 17 §5), then
+        // re-check the concrete program; the borrow checker also sees the
+        // specialized copies.
+        let mut made = std::collections::HashSet::new();
+        let mut depth = 0usize;
+        let mut changed_any = false;
+        loop {
+            if !crate::mono::round(&mut program, &tc, &mut made)? {
+                break;
+            }
+            changed_any = true;
+            depth += 1;
+            if depth > crate::mono::MAX_DEPTH {
+                return Err(vec![format!("error: generic instantiation nests deeper than {} levels -- a generic function seems to instantiate itself infinitely (Document 8)", crate::mono::MAX_DEPTH)]);
+            }
+            tc = TypeChecker::new();
+            tc.check_program(&program);
+            if !tc.errors.is_empty() {
+                return Err(tc.errors.iter().map(|e| e.to_string()).collect());
+            }
+        }
+        if changed_any {
+            crate::mono::strip_generics(&mut program);
+            tc = TypeChecker::new();
+            tc.check_program(&program);
+            let mut e2: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();
+            let mut bc2 = BorrowChecker::new();
+            bc2.check_program(&program);
+            e2.extend(bc2.errors.iter().map(|e| e.to_string()));
+            if !e2.is_empty() {
+                return Err(e2);
+            }
+        }
         Ok(Checked { program, tc })
     } else {
         Err(errors)

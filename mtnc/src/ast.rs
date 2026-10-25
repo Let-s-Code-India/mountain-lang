@@ -539,6 +539,10 @@ pub enum Expr {
     Literal(Literal),
     Ident(String),
     Path(Vec<String>),
+    /// Phase 11b-2 (Doc 23 §17.2): a path with explicit generic arguments,
+    /// `f::<i32>` / `Stack::<i32>::new`; `gens` = (segment index, args).
+    /// Only produced when a turbofish is present; removed by monomorphization.
+    TurbofishPath { path: Vec<String>, gens: Vec<(usize, Vec<Type>)> },
     Paren(Box<Expr>),
     Tuple(Vec<Expr>),
     Array(Vec<Expr>),

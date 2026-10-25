@@ -579,6 +579,12 @@ pub struct TypeChecker {
     /// `desugar` pass.
     pub try_info: HashMap<usize, (Ty, Ty)>,
     pub errors: Vec<TypeError>,
+    /// Phase 11b-2: generic-call instantiations, keyed by the callee
+    /// expression's identity: (generic fn name, concrete type arguments in
+    /// declaration order). Consumed by `mono`.
+    pub instances: HashMap<usize, (String, Vec<Ty>)>,
+    /// Type/const parameter names of the function currently being checked.
+    cur_tparams: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -707,6 +713,8 @@ impl TypeChecker {
             saw_unresolved: false,
             propagations: Vec::new(),
             expr_types: HashMap::new(),
+            instances: HashMap::new(),
+            cur_tparams: Vec::new(),
             try_info: HashMap::new(),
             globals: HashMap::new(),
             self_type: None,
@@ -1030,6 +1038,26 @@ impl TypeChecker {
     }
 
     fn check_fn(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
+        let tp: Vec<String> = f.generics.0.iter().filter_map(|g| match g {
+            GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
+        }).collect();
+        let saved = std::mem::replace(&mut self.cur_tparams, tp);
+        self.check_fn_inner(f, self_ty);
+        self.cur_tparams = saved;
+    }
+
+    /// True if `t` mentions a type parameter of the function being checked
+    /// (generic bodies are checked generically; such types are not concrete).
+    fn mentions_tparam(&self, t: &Ty) -> bool {
+        if format!("{:?}", t).contains("TypeParam") {
+            return true;
+        }
+        format!("{}", t)
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|tok| self.cur_tparams.iter().any(|p| p == tok))
+    }
+
+    fn check_fn_inner(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
         let Some(body) = &f.body else { return };
         let mut env = Env::new();
         // When checking a method body (`self_ty` is `Some`), any
@@ -1325,6 +1353,16 @@ impl TypeChecker {
         match expr {
             Expr::Literal(lit) => self.check_literal(lit, expected, ctx),
 
+            Expr::TurbofishPath { path, .. } => {
+                // Only a direct call `f::<T>(..)` is handled (in the Call
+                // arm); any other use of a turbofish path is not supported yet.
+                self.errors.push(TypeError {
+                    message: format!("a generic path `{}::<..>` is only supported as the callee of a call (not yet supported by codegen -- Phase 11)", path.join("::")),
+                    context: ctx.into(),
+                });
+                Ty::Unit
+            }
+
             Expr::Ident(name) => {
                 // Phase 9: `None` (Document 11 §1.2) is a keyword, so it
                 // can never be a local variable -- it is always the
@@ -1580,7 +1618,12 @@ impl TypeChecker {
                         _ => {}
                     }
                 }
-                if let Expr::Ident(name) = callee.as_ref() {
+                let (callee_name, explicit_targs): (Option<&String>, Vec<Type>) = match callee.as_ref() {
+                    Expr::Ident(n) => (Some(n), Vec::new()),
+                    Expr::TurbofishPath { path, gens } if path.len() == 1 && gens.len() == 1 => (Some(&path[0]), gens[0].1.clone()),
+                    _ => (None, Vec::new()),
+                };
+                if let Some(name) = callee_name {
                     if let Some(shape) = self.functions.get(name).cloned() {
                         if shape.generics.is_empty() {
                             for (i, arg) in args.iter().enumerate() {
@@ -1610,6 +1653,15 @@ impl TypeChecker {
                             .map(|a| self.check_expr(&a.value, None, env, ctx))
                             .collect();
                         let mut subst: HashMap<String, Ty> = HashMap::new();
+                        // Explicit `f::<T, ..>(..)` (Doc 23 §17.2) seeds the
+                        // substitution, in declaration order of the type params.
+                        let tparam_names: Vec<String> = shape.generics.iter()
+                            .filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None })
+                            .collect();
+                        for (pn, ta) in tparam_names.iter().zip(explicit_targs.iter()) {
+                            let t = resolve_type(ta);
+                            subst.insert(pn.clone(), t);
+                        }
                         for (p, a) in shape.params.iter().zip(arg_tys.iter()) {
                             unify_infer(p, a, &mut subst);
                         }
@@ -1627,6 +1679,15 @@ impl TypeChecker {
                                     }
                                 }
                             }
+                        }
+                        let tys: Vec<Option<Ty>> = tparam_names.iter().map(|n| subst.get(n).cloned()).collect();
+                        if tys.iter().all(|t| t.as_ref().map(|t| !self.mentions_tparam(t)).unwrap_or(false)) {
+                            self.instances.insert(callee.as_ref() as *const Expr as usize, (name.clone(), tys.into_iter().flatten().collect()));
+                        } else if !tparam_names.is_empty() && tys.iter().any(|t| t.is_none()) {
+                            self.errors.push(TypeError {
+                                message: format!("cannot infer all type parameters of generic function `{}`; add an explicit annotation or turbofish, e.g. `{}::<..>(..)` (Document 5 rule 6)", name, name),
+                                context: ctx.into(),
+                            });
                         }
                         return substitute_type_params(&shape.ret, &subst);
                     }

@@ -922,7 +922,7 @@ impl<'a> FnChecker<'a> {
         match expr {
             Expr::Ident(name) => self.use_ident(name),
             Expr::Literal(_) => {}
-            Expr::Path(_) => {}
+            Expr::Path(_) | Expr::TurbofishPath { .. } => {}
             Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
             | Expr::Unary { expr: e, .. } | Expr::Yield(e) => self.check_expr(e, block, idx),
             Expr::Tuple(items) | Expr::Array(items) => {
@@ -1256,7 +1256,7 @@ fn block_reads_ident(block: &Block, name: &str) -> bool {
 fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Ident(n) => n == name,
-        Expr::Literal(_) | Expr::Path(_) => false,
+        Expr::Literal(_) | Expr::Path(_) | Expr::TurbofishPath { .. } => false,
         Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
         | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Field { expr: e, .. }
         | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } => expr_reads_ident(e, name),
