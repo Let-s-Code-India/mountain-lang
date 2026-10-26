@@ -13,7 +13,7 @@
 
 use crate::ast::*;
 use crate::desugar::{expr_children_mut, ty_to_type, ChildMut};
-use crate::types::{Ty, TypeChecker};
+use crate::types::{resolve_type, GenericArg, Ty, TypeChecker};
 use std::collections::{HashMap, HashSet};
 
 /// Maximum number of instantiation rounds (nesting depth of
@@ -110,7 +110,17 @@ fn subst_expr(e: &mut Expr, m: &HashMap<String, Type>) {
     }
 }
 
-fn rewrite_block(b: &mut Block, calls: &HashMap<usize, String>) {
+/// Everything the rewrite walk needs (all keyed by expression identity).
+#[derive(Default)]
+struct Rw {
+    calls: HashMap<usize, String>,
+    type_calls: HashMap<usize, String>,
+    struct_lits: HashMap<usize, String>,
+    /// match scrutinee identity -> (generic enum base, mangled instance)
+    scrut: HashMap<usize, (String, String)>,
+}
+
+fn rewrite_block(b: &mut Block, calls: &Rw) {
     for s in b.stmts.iter_mut() {
         match s {
             Stmt::Let { value: Some(v), .. } => rewrite_expr(v, calls),
@@ -126,11 +136,58 @@ fn rewrite_block(b: &mut Block, calls: &HashMap<usize, String>) {
     }
 }
 
-fn rewrite_expr(e: &mut Expr, calls: &HashMap<usize, String>) {
+fn rename_pattern(p: &mut Pattern, base: &str, mg: &str) {
+    let fix = |n: &mut String| {
+        if let Some(rest) = n.strip_prefix(&format!("{}::", base)) {
+            *n = format!("{}::{}", mg, rest);
+        }
+    };
+    match p {
+        Pattern::TupleStruct(n, subs) => {
+            fix(n);
+            subs.iter_mut().for_each(|s| rename_pattern(s, base, mg));
+        }
+        Pattern::Ident(n) => fix(n),
+        Pattern::Tuple(subs) | Pattern::Or(subs) => subs.iter_mut().for_each(|s| rename_pattern(s, base, mg)),
+        _ => {}
+    }
+}
+
+fn rewrite_expr(e: &mut Expr, calls: &Rw) {
+    let self_key = e as *const Expr as usize;
+    if let Expr::Path(p) = e {
+        if p.len() == 2 {
+            if let Some(mg) = calls.type_calls.get(&self_key) {
+                p[0] = mg.clone();
+            }
+        }
+    }
+    if let Expr::Match(me) = e {
+        let skey = &me.scrutinee as *const Expr as usize;
+        if let Some((base, mg)) = calls.scrut.get(&skey) {
+            for arm in me.arms.iter_mut() {
+                arm.patterns.iter_mut().for_each(|p| rename_pattern(p, base, mg));
+            }
+        }
+    }
+    if let Expr::StructLit { name, .. } = e {
+        if let Some(n) = calls.struct_lits.get(&self_key) {
+            *name = n.clone();
+        }
+    }
     if let Expr::Call { callee, .. } = e {
         let key = callee.as_ref() as *const Expr as usize;
-        if let Some(n) = calls.get(&key) {
+        if let Some(n) = calls.calls.get(&key) {
             **callee = Expr::Ident(n.clone());
+        } else if let Some(tn) = calls.type_calls.get(&key) {
+            let fname = match callee.as_ref() {
+                Expr::Path(p) => p.last().cloned(),
+                Expr::TurbofishPath { path, .. } => path.last().cloned(),
+                _ => None,
+            };
+            if let Some(f) = fname {
+                **callee = Expr::Path(vec![tn.clone(), f]);
+            }
         }
     }
     for c in expr_children_mut(e) {
@@ -141,7 +198,7 @@ fn rewrite_expr(e: &mut Expr, calls: &HashMap<usize, String>) {
     }
 }
 
-fn rewrite_items(items: &mut [Item], calls: &HashMap<usize, String>) {
+fn rewrite_items(items: &mut [Item], calls: &Rw) {
     for it in items.iter_mut() {
         match &mut it.kind {
             ItemKind::Fn(f) => {
@@ -164,44 +221,232 @@ fn rewrite_items(items: &mut [Item], calls: &HashMap<usize, String>) {
     }
 }
 
+
+// ------------------------------------------------------------ type visiting
+
+type TyFn<'a> = &'a mut dyn FnMut(&mut Type) -> bool;
+
+/// Calls `f` on `t`; if it returns true, recurses into the children.
+fn walk_type(t: &mut Type, f: TyFn) {
+    if !f(t) {
+        return;
+    }
+    match t {
+        Type::Named(_, a) | Type::Tuple(a) | Type::Dyn(_, a) => a.iter_mut().for_each(|x| walk_type(x, f)),
+        Type::Array(i, _) | Type::Option(i) => walk_type(i, f),
+        Type::Ref { inner, .. } => walk_type(inner, f),
+        Type::Fn(ps, r) => {
+            ps.iter_mut().for_each(|x| walk_type(x, f));
+            walk_type(r, f);
+        }
+        Type::Result(a, b) => {
+            walk_type(a, f);
+            walk_type(b, f);
+        }
+        _ => {}
+    }
+}
+
+fn walk_block_types(b: &mut Block, f: TyFn) {
+    for s in b.stmts.iter_mut() {
+        match s {
+            Stmt::Let { ty, value, .. } => {
+                if let Some(t) = ty {
+                    walk_type(t, f);
+                }
+                if let Some(v) = value {
+                    walk_expr_types(v, f);
+                }
+            }
+            Stmt::Expr(e) | Stmt::Yield(e) => walk_expr_types(e, f),
+            Stmt::Return(Some(e)) => walk_expr_types(e, f),
+            Stmt::Break { value: Some(e), .. } => walk_expr_types(e, f),
+            Stmt::TargetBlock(_, blk) => walk_block_types(blk, f),
+            _ => {}
+        }
+    }
+    if let Some(t) = &mut b.tail {
+        walk_expr_types(t, f);
+    }
+}
+
+fn walk_expr_types(e: &mut Expr, f: TyFn) {
+    match e {
+        Expr::Cast { ty, .. } => walk_type(ty, f),
+        Expr::Closure(c) => {
+            for (_, t) in c.params.iter_mut() {
+                if let Some(t) = t {
+                    walk_type(t, f);
+                }
+            }
+            if let Some(t) = &mut c.return_type {
+                walk_type(t, f);
+            }
+        }
+        Expr::TurbofishPath { gens, .. } => {
+            for (_, args) in gens.iter_mut() {
+                args.iter_mut().for_each(|t| walk_type(t, f));
+            }
+        }
+        _ => {}
+    }
+    for c in expr_children_mut(e) {
+        match c {
+            ChildMut::E(x) => walk_expr_types(x, f),
+            ChildMut::B(b) => walk_block_types(b, f),
+        }
+    }
+}
+
+fn walk_fn_types(fd: &mut FnDecl, f: TyFn) {
+    if !fd.generics.0.is_empty() {
+        return;
+    }
+    for p in fd.params.iter_mut() {
+        walk_type(&mut p.ty, f);
+    }
+    if let Some(r) = &mut fd.return_type {
+        walk_type(r, f);
+    }
+    if let Some(b) = &mut fd.body {
+        walk_block_types(b, f);
+    }
+}
+
+/// Visits every type written in the NON-generic items (generic declarations
+/// are templates, not code).
+fn walk_items_types(items: &mut [Item], f: TyFn) {
+    for it in items.iter_mut() {
+        match &mut it.kind {
+            ItemKind::Fn(fd) => walk_fn_types(fd, f),
+            ItemKind::Struct(s) if s.generics.0.is_empty() => match &mut s.body {
+                StructBody::Named(fs) => fs.iter_mut().for_each(|x| walk_type(&mut x.ty, f)),
+                StructBody::Tuple(ts) => ts.iter_mut().for_each(|x| walk_type(x, f)),
+                StructBody::Unit => {}
+            },
+            ItemKind::Enum(en) if en.generics.0.is_empty() => {
+                for v in en.variants.iter_mut() {
+                    v.data.iter_mut().for_each(|x| walk_type(x, f));
+                }
+            }
+            ItemKind::Impl(i) if i.generics.0.is_empty() => {
+                i.target.args.iter_mut().for_each(|x| walk_type(x, f));
+                if let Some(tr) = &mut i.trait_ref {
+                    tr.args.iter_mut().for_each(|x| walk_type(x, f));
+                }
+                for ii in i.items.iter_mut() {
+                    match ii {
+                        ImplItem::Fn(fd) => walk_fn_types(fd, f),
+                        ImplItem::AssocType(_, t) => walk_type(t, f),
+                    }
+                }
+            }
+            ItemKind::Const(c) => walk_type(&mut c.ty, f),
+            ItemKind::Static(c) => walk_type(&mut c.ty, f),
+            ItemKind::Mod(m) => walk_items_types(&mut m.items, f),
+            _ => {}
+        }
+    }
+}
+
+// ------------------------------------------------------------ type discovery
+
+const PRIMS: [&str; 22] = ["i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "String", "str", "mut", "fn", "Option", "Result"];
+
+fn ty_concrete(t: &Ty, known: &HashSet<String>) -> bool {
+    t.to_string()
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .filter(|tok| !tok.is_empty() && !tok.chars().next().unwrap().is_ascii_digit())
+        .all(|tok| known.contains(tok) || PRIMS.contains(&tok))
+}
+
+fn collect_generic_tys(t: &Ty, bases: &HashSet<String>, out: &mut Vec<(String, Vec<Ty>)>) {
+    match t {
+        Ty::Generic(n, args) => {
+            let mut tys = Vec::new();
+            let mut ok = true;
+            for a in args {
+                match a {
+                    GenericArg::Type(x) => {
+                        collect_generic_tys(x, bases, out);
+                        tys.push(x.clone());
+                    }
+                    GenericArg::Const(_) => ok = false,
+                }
+            }
+            if ok && bases.contains(n) {
+                out.push((n.clone(), tys));
+            }
+        }
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::Ref(_, i) | Ty::OptionTy(i) => collect_generic_tys(i, bases, out),
+        Ty::Tuple(v) => v.iter().for_each(|x| collect_generic_tys(x, bases, out)),
+        Ty::ResultTy(a, b) => {
+            collect_generic_tys(a, bases, out);
+            collect_generic_tys(b, bases, out);
+        }
+        _ => {}
+    }
+}
+
+fn generic_param_names(g: &GenericParams) -> Vec<String> {
+    g.0.iter().filter_map(|p| if let GenericParam::Type { name, .. } = p { Some(name.clone()) } else { None }).collect()
+}
+
 /// One monomorphization round. Returns `Ok(true)` if the program changed
 /// (re-check and call again), `Ok(false)` at the fixpoint.
 pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>) -> Result<bool, Vec<String>> {
-    if tc.instances.is_empty() {
-        return Ok(false);
-    }
+    let mut changed = false;
+    let mut rw = Rw::default();
+    let mut new_items: Vec<Item> = Vec::new();
+
+    // ---- generic declarations (templates)
     let mut generic_fns: HashMap<String, (FnDecl, Item)> = HashMap::new();
+    let mut gstructs: HashMap<String, (StructDecl, Item)> = HashMap::new();
+    let mut genums: HashMap<String, (EnumDecl, Item)> = HashMap::new();
+    let mut gimpls: Vec<(ImplDecl, Item)> = Vec::new();
+    let mut known: HashSet<String> = HashSet::new();
     for it in &program.items {
-        if let ItemKind::Fn(f) = &it.kind {
-            if !f.generics.0.is_empty() {
+        match &it.kind {
+            ItemKind::Fn(f) if !f.generics.0.is_empty() => {
                 generic_fns.insert(f.name.clone(), (f.clone(), it.clone()));
             }
+            ItemKind::Struct(s) => {
+                known.insert(s.name.clone());
+                if !s.generics.0.is_empty() {
+                    gstructs.insert(s.name.clone(), (s.clone(), it.clone()));
+                }
+            }
+            ItemKind::Enum(e) => {
+                known.insert(e.name.clone());
+                if !e.generics.0.is_empty() {
+                    genums.insert(e.name.clone(), (e.clone(), it.clone()));
+                }
+            }
+            ItemKind::Impl(i) if !i.generics.0.is_empty() => gimpls.push((i.clone(), it.clone())),
+            _ => {}
         }
     }
-    let mut calls: HashMap<usize, String> = HashMap::new();
-    let mut new_items: Vec<Item> = Vec::new();
+    known.extend(made.iter().cloned());
+    let bases: HashSet<String> = gstructs.keys().chain(genums.keys()).cloned().collect();
+
+    // ---- generic function instances
     for (addr, (fname, targs)) in &tc.instances {
         let Some((decl, orig)) = generic_fns.get(fname) else { continue };
         let mangled = mangle(fname, targs);
-        calls.insert(*addr, mangled.clone());
+        rw.calls.insert(*addr, mangled.clone());
+        changed = true;
         if made.contains(&mangled) {
             continue;
         }
         if made.len() >= 4096 {
-            return Err(vec![format!("error: too many generic instantiations while instantiating `{}` -- is a generic function instantiating itself with ever-larger types? (Document 8)", fname)]);
+            return Err(vec![format!("error: too many generic instantiations while instantiating `{}` -- is a generic instantiating itself with ever-larger types? (Document 8)", fname)]);
         }
         made.insert(mangled.clone());
-        let type_params: Vec<&String> = decl
-            .generics
-            .0
-            .iter()
-            .filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name) } else { None })
-            .collect();
         let mut m: HashMap<String, Type> = HashMap::new();
-        for (p, t) in type_params.iter().zip(targs.iter()) {
+        for (p, t) in generic_param_names(&decl.generics).iter().zip(targs.iter()) {
             match ty_to_type(t) {
                 Some(ty) => {
-                    m.insert((*p).clone(), ty);
+                    m.insert(p.clone(), ty);
                 }
                 None => return Err(vec![format!("error: cannot instantiate `{}` with type `{}` (not yet supported by codegen -- Phase 11)", fname, t)]),
             }
@@ -221,13 +466,192 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         }
         new_items.push(Item { kind: ItemKind::Fn(inst), ..orig.clone() });
     }
-    rewrite_items(&mut program.items, &calls);
-    let changed = !new_items.is_empty() || !calls.is_empty();
+
+    // ---- generic type instances (struct / enum + every matching generic impl)
+    if !bases.is_empty() {
+        let mut wanted: Vec<(String, Vec<Ty>)> = Vec::new();
+        for t in tc.expr_types.values().chain(tc.type_paths.values()) {
+            collect_generic_tys(t, &bases, &mut wanted);
+        }
+        let mut ast_tys: Vec<Ty> = Vec::new();
+        walk_items_types(&mut program.items, &mut |t: &mut Type| {
+            if let Type::Named(n, args) = t {
+                if !args.is_empty() && bases.contains(n) {
+                    ast_tys.push(resolve_type(t));
+                    return false;
+                }
+            }
+            true
+        });
+        for t in &ast_tys {
+            collect_generic_tys(t, &bases, &mut wanted);
+        }
+        for (base, tys) in wanted {
+            if !tys.iter().all(|t| ty_concrete(t, &known)) {
+                continue;
+            }
+            let mangled = mangle(&base, &tys);
+            if made.contains(&mangled) {
+                continue;
+            }
+            if made.len() >= 4096 {
+                return Err(vec![format!("error: too many generic instantiations while instantiating `{}` (Document 8)", base)]);
+            }
+            let arg_types: Option<Vec<Type>> = tys.iter().map(ty_to_type).collect();
+            let Some(arg_types) = arg_types else {
+                return Err(vec![format!("error: cannot instantiate `{}` with these type arguments (not yet supported by codegen -- Phase 11)", base)]);
+            };
+            made.insert(mangled.clone());
+            changed = true;
+            if let Some((sd, orig)) = gstructs.get(&base) {
+                let m: HashMap<String, Type> = generic_param_names(&sd.generics).into_iter().zip(arg_types.iter().cloned()).collect();
+                let mut inst = sd.clone();
+                inst.name = mangled.clone();
+                inst.generics = GenericParams(Vec::new());
+                match &mut inst.body {
+                    StructBody::Named(fs) => fs.iter_mut().for_each(|x| subst_type(&mut x.ty, &m)),
+                    StructBody::Tuple(ts) => ts.iter_mut().for_each(|x| subst_type(x, &m)),
+                    StructBody::Unit => {}
+                }
+                new_items.push(Item { kind: ItemKind::Struct(inst), ..orig.clone() });
+            }
+            if let Some((ed, orig)) = genums.get(&base) {
+                let m: HashMap<String, Type> = generic_param_names(&ed.generics).into_iter().zip(arg_types.iter().cloned()).collect();
+                let mut inst = ed.clone();
+                inst.name = mangled.clone();
+                inst.generics = GenericParams(Vec::new());
+                for v in inst.variants.iter_mut() {
+                    v.data.iter_mut().for_each(|x| subst_type(x, &m));
+                }
+                new_items.push(Item { kind: ItemKind::Enum(inst), ..orig.clone() });
+            }
+            for (imp, orig) in gimpls.iter().filter(|(i, _)| i.target.name == base) {
+                let gnames = generic_param_names(&imp.generics);
+                let mut m: HashMap<String, Type> = HashMap::new();
+                let mut specialized = false;
+                for (ta, at) in imp.target.args.iter().zip(arg_types.iter()) {
+                    match ta {
+                        Type::Named(g, a) if a.is_empty() && gnames.contains(g) => {
+                            m.insert(g.clone(), at.clone());
+                        }
+                        _ => specialized = true,
+                    }
+                }
+                if specialized {
+                    return Err(vec![format!("error: `impl` for a partially specialized `{}<..>` is not yet supported by codegen -- Phase 11", base)]);
+                }
+                // Doc 8 §4: a bounded `impl` only provides its methods when the
+                // concrete arguments satisfy every bound; otherwise skip this copy.
+                let mut bound_pairs: Vec<(String, String)> = Vec::new();
+                for g in &imp.generics.0 {
+                    if let GenericParam::Type { name, bounds } = g {
+                        bounds.iter().for_each(|b| bound_pairs.push((name.clone(), b.name.clone())));
+                    }
+                }
+                for wb in &imp.where_clause.0 {
+                    wb.bounds.iter().for_each(|b| bound_pairs.push((wb.name.clone(), b.name.clone())));
+                }
+                let mut unsatisfied = false;
+                for (p, tr) in &bound_pairs {
+                    if let Some(pos) = imp.target.args.iter().position(|ta| matches!(ta, Type::Named(g, a) if a.is_empty() && g == p)) {
+                        if !tc.satisfies_bound(&tys[pos], tr) {
+                            unsatisfied = true;
+                        }
+                    }
+                }
+                if unsatisfied {
+                    continue;
+                }
+                let mut inst = imp.clone();
+                inst.generics = GenericParams(Vec::new());
+                inst.where_clause = WhereClause::default();
+                inst.target = TypeRef { name: mangled.clone(), args: Vec::new() };
+                if let Some(tr) = &mut inst.trait_ref {
+                    tr.args.iter_mut().for_each(|x| subst_type(x, &m));
+                }
+                for ii in inst.items.iter_mut() {
+                    match ii {
+                        ImplItem::Fn(f) => {
+                            for p in f.params.iter_mut() {
+                                subst_type(&mut p.ty, &m);
+                            }
+                            if let Some(r) = &mut f.return_type {
+                                subst_type(r, &m);
+                            }
+                            if let Some(b) = &mut f.body {
+                                subst_block(b, &m);
+                            }
+                        }
+                        ImplItem::AssocType(_, t) => subst_type(t, &m),
+                    }
+                }
+                new_items.push(Item { kind: ItemKind::Impl(inst), ..orig.clone() });
+            }
+        }
+        // ---- expression-level renames (struct literals, `Type::f(..)` calls)
+        for (addr, t) in tc.expr_types.iter() {
+            if let Ty::Generic(n, args) = t {
+                let tys: Vec<Ty> = args.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                if tys.len() == args.len() && bases.contains(n) {
+                    let mg = mangle(n, &tys);
+                    if made.contains(&mg) {
+                        rw.scrut.insert(*addr, (n.clone(), mg.clone()));
+                        rw.struct_lits.insert(*addr, mg);
+                    }
+                }
+            }
+        }
+        for (addr, t) in tc.type_paths.iter() {
+            if let Ty::Generic(n, args) = t {
+                let tys: Vec<Ty> = args.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                let mg = mangle(n, &tys);
+                if made.contains(&mg) {
+                    rw.type_calls.insert(*addr, mg);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    rewrite_items(&mut program.items, &rw);
     program.items.extend(new_items);
+
+    // ---- rewrite written types `Pair<i32, f64>` -> `Pair$i32_f64` (top-down; a
+    // node whose instance does not exist yet is left for the next round)
+    if !bases.is_empty() {
+        let mut renamed = false;
+        walk_items_types(&mut program.items, &mut |t: &mut Type| {
+            if let Type::Named(n, args) = t {
+                if !args.is_empty() && bases.contains(n) {
+                    if let Ty::Generic(gn, gargs) = resolve_type(t) {
+                        let tys: Vec<Ty> = gargs.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                        if tys.len() == gargs.len() {
+                            let mg = mangle(&gn, &tys);
+                            if made.contains(&mg) {
+                                *t = Type::Named(mg, Vec::new());
+                                renamed = true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+        if renamed {
+            changed = true;
+        }
+    }
     Ok(changed)
 }
 
 /// Drop the generic declarations once the fixpoint is reached.
 pub fn strip_generics(program: &mut Program) {
-    program.items.retain(|it| !matches!(&it.kind, ItemKind::Fn(f) if !f.generics.0.is_empty()));
+    program.items.retain(|it| match &it.kind {
+        ItemKind::Fn(f) => f.generics.0.is_empty(),
+        ItemKind::Struct(s) => s.generics.0.is_empty(),
+        ItemKind::Enum(e) => e.generics.0.is_empty(),
+        ItemKind::Impl(i) => i.generics.0.is_empty(),
+        _ => true,
+    });
 }

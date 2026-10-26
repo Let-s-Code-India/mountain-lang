@@ -222,11 +222,36 @@ fn ty_is_numeric(t: &Ty) -> bool {
 /// resolution pass, so an unknown name still produces `Ty::Named`
 /// rather than failing here — this function is pure syntax-to-shape
 /// translation, not validation.
+/// All declared trait bounds of a function's type parameters: inline
+/// (`<T: A + B>`) and `where` clauses, merged per parameter (Doc 8 §2/§3).
+pub fn fn_bounds(f: &FnDecl) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut add = |p: &str, names: Vec<String>| {
+        if let Some(e) = out.iter_mut().find(|(n, _)| n == p) {
+            e.1.extend(names);
+        } else {
+            out.push((p.to_string(), names));
+        }
+    };
+    for g in &f.generics.0 {
+        if let GenericParam::Type { name, bounds } = g {
+            add(name, bounds.iter().map(|b| b.name.clone()).collect());
+        }
+    }
+    for wb in &f.where_clause.0 {
+        add(&wb.name, wb.bounds.iter().map(|b| b.name.clone()).collect());
+    }
+    out
+}
+
 pub fn resolve_type(t: &Type) -> Ty {
     resolve_type_depth(t, 0)
 }
 
 thread_local! {
+    /// Phase 11b-2: names of user-declared generic structs/enums, so the
+    /// context-free `resolve_type` keeps their type arguments (`Ty::Generic`).
+    static GENERIC_TYPES: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
     /// Phase 11a: `type Name = ...;` aliases of the program being compiled
     /// (Document 3 Category A `type`: "purely a compile-time naming
     /// convenience"). `resolve_type` is a free function without access to the
@@ -277,6 +302,15 @@ pub fn register_item_context(items: &[&Item]) {
         }
     }
     ALIASES.with(|c| *c.borrow_mut() = aliases);
+    let mut gt = std::collections::HashSet::new();
+    for it in items {
+        match &it.kind {
+            ItemKind::Struct(s) if !s.generics.0.is_empty() => { gt.insert(s.name.clone()); }
+            ItemKind::Enum(e) if !e.generics.0.is_empty() => { gt.insert(e.name.clone()); }
+            _ => {}
+        }
+    }
+    GENERIC_TYPES.with(|c| *c.borrow_mut() = gt);
     let mut consts: HashMap<String, i128> = HashMap::new();
     for _ in 0..8 {
         for it in items {
@@ -308,9 +342,25 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
                 _ => Ty::Named(other.to_string()),
             },
         },
-        Type::Named(n, _args) => match alias(n) {
+        Type::Named(n, args) => match alias(n) {
             Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
-            _ => Ty::Named(n.clone()),
+            _ => {
+                if !args.is_empty() && GENERIC_TYPES.with(|g| g.borrow().contains(n)) {
+                    let mut out = Vec::new();
+                    for a in args {
+                        match a {
+                            Type::ConstArg(e) => match CONSTS.with(|c| eval_const_int(e, &c.borrow())) {
+                                Some(v) => out.push(GenericArg::Const(v as i64)),
+                                None => return Ty::Named(n.clone()),
+                            },
+                            other => out.push(GenericArg::Type(resolve_type_depth(other, depth))),
+                        }
+                    }
+                    Ty::Generic(n.clone(), out)
+                } else {
+                    Ty::Named(n.clone())
+                }
+            }
         },
         Type::Array(inner, size) => {
             let elem = resolve_type_depth(inner, depth);
@@ -360,6 +410,10 @@ fn const_int_value(expr: &Expr) -> Option<i64> {
 fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Generic(n, args) => Ty::Generic(n.clone(), args.iter().map(|a| match a {
+            GenericArg::Type(t) => GenericArg::Type(substitute_type_params(t, subst)),
+            c => c.clone(),
+        }).collect()),
         Ty::Array(inner) => Ty::Array(Box::new(substitute_type_params(inner, subst))),
         Ty::Fixed(inner, n) => Ty::Fixed(Box::new(substitute_type_params(inner, subst)), *n),
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute_type_params(t, subst)).collect()),
@@ -394,8 +448,15 @@ fn unify_infer(param_ty: &Ty, arg_ty: &Ty, out: &mut HashMap<String, Ty>) {
         (Ty::TypeParam(n), t) => {
             out.entry(n.clone()).or_insert_with(|| t.clone());
         }
+        (Ty::Generic(pn, pa), Ty::Generic(an, aa)) if pn == an && pa.len() == aa.len() => {
+            for (p, a) in pa.iter().zip(aa.iter()) {
+                if let (GenericArg::Type(p), GenericArg::Type(a)) = (p, a) {
+                    unify_infer(p, a, out);
+                }
+            }
+        }
         (Ty::Array(p), Ty::Array(a)) => unify_infer(p, a, out),
-        (Ty::Array(p), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) => unify_infer(p, a, out),
+        (Ty::Array(p), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Ref(_, p), Ty::Ref(_, a)) => unify_infer(p, a, out),
         (Ty::Tuple(ps), Ty::Tuple(as_)) if ps.len() == as_.len() => {
             for (p, a) in ps.iter().zip(as_.iter()) {
@@ -469,6 +530,10 @@ pub struct StructShape {
 fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
     match ty {
         Ty::Named(n) if param_names.contains(&n) => Ty::TypeParam(n),
+        Ty::Generic(n, args) => Ty::Generic(n, args.into_iter().map(|a| match a {
+            GenericArg::Type(t) => GenericArg::Type(mark_type_params(t, param_names)),
+            c => c,
+        }).collect()),
         Ty::Array(inner) => Ty::Array(Box::new(mark_type_params(*inner, param_names))),
         Ty::Fixed(inner, n) => Ty::Fixed(Box::new(mark_type_params(*inner, param_names)), n),
         Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|t| mark_type_params(t, param_names)).collect()),
@@ -523,6 +588,25 @@ pub struct ImplRecord {
     /// `From<IoError>` from `From<ParseError>` on the same target type.
     pub trait_args: Vec<Ty>,
     pub methods: HashMap<String, FnSig>,
+}
+
+/// A method of a generic `impl<..> Type<..>` block (Phase 11b-2): types are
+/// "marked" (`Ty::TypeParam`) in terms of the impl's own generic parameters.
+#[derive(Debug, Clone)]
+pub struct GMethod {
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+}
+
+/// A generic `impl` block. Its bodies are checked only after
+/// monomorphization (on the concrete copies); here only signatures are kept
+/// so calls and method calls on `Type<Args>` can be typed and inferred.
+#[derive(Debug, Clone)]
+pub struct GenericImpl {
+    pub generics: Vec<String>,
+    pub target_args: Vec<Ty>,
+    pub trait_name: Option<String>,
+    pub methods: HashMap<String, GMethod>,
 }
 
 pub struct TypeChecker {
@@ -585,6 +669,12 @@ pub struct TypeChecker {
     pub instances: HashMap<usize, (String, Vec<Ty>)>,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
+    /// Declared bounds of the function being checked (for T-typed arguments).
+    cur_bounds: Vec<(String, Vec<String>)>,
+    generic_impls: HashMap<String, Vec<GenericImpl>>,
+    /// Callee expression identity -> the concrete generic type an associated
+    /// call `Type::f(..)` / `Type::<A>::f(..)` was resolved against.
+    pub type_paths: HashMap<usize, Ty>,
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +805,9 @@ impl TypeChecker {
             expr_types: HashMap::new(),
             instances: HashMap::new(),
             cur_tparams: Vec::new(),
+            cur_bounds: Vec::new(),
+            generic_impls: HashMap::new(),
+            type_paths: HashMap::new(),
             try_info: HashMap::new(),
             globals: HashMap::new(),
             self_type: None,
@@ -887,9 +980,7 @@ impl TypeChecker {
                 let ret = f.return_type.as_ref()
                     .map(|t| mark_type_params(resolve_type(t), &type_param_names))
                     .unwrap_or(Ty::Unit);
-                let bounds = f.where_clause.0.iter()
-                    .map(|wb| (wb.name.clone(), wb.bounds.iter().map(|tb| tb.name.clone()).collect()))
-                    .collect();
+                let bounds = fn_bounds(f);
                 self.functions.insert(f.name.clone(), FunctionShape { params, ret, generics, bounds });
             }
             ItemKind::Trait(t) => {
@@ -923,6 +1014,32 @@ impl TypeChecker {
     /// provided).
     fn register_impls(&mut self, item: &Item) {
         if let ItemKind::Impl(impl_decl) = &item.kind {
+            if !impl_decl.generics.0.is_empty() {
+                let gnames: Vec<String> = impl_decl.generics.0.iter().map(|g| match g {
+                    GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone(),
+                }).collect();
+                let self_raw = resolve_type(&Type::Named(impl_decl.target.name.clone(), impl_decl.target.args.clone()));
+                let self_marked = mark_type_params(self_raw, &gnames);
+                let target_args: Vec<Ty> = match &self_marked {
+                    Ty::Generic(_, a) => a.iter().filter_map(|x| if let GenericArg::Type(t) = x { Some(t.clone()) } else { None }).collect(),
+                    _ => Vec::new(),
+                };
+                let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), self_marked.clone())).collect();
+                let conv = |ty: &Type| -> Ty {
+                    let r = mark_type_params(mark_type_params(resolve_type(ty), &gnames), &["Self".to_string()]);
+                    substitute_type_params(&r, &self_subst)
+                };
+                let methods: HashMap<String, GMethod> = impl_decl.items.iter().filter_map(|ii| match ii {
+                    ImplItem::Fn(f) => Some((f.name.clone(), GMethod {
+                        params: f.params.iter().filter(|p| p.name != "self").map(|p| arg_ty(p, conv(&p.ty))).collect(),
+                        ret: f.return_type.as_ref().map(|t| conv(t)).unwrap_or(Ty::Unit),
+                    })),
+                    ImplItem::AssocType(..) => None,
+                }).collect();
+                let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
+                self.generic_impls.entry(impl_decl.target.name.clone()).or_default().push(GenericImpl { generics: gnames, target_args, trait_name, methods });
+                return;
+            }
             let target_name = impl_decl.target.name.clone();
             let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
             // Same `Self`-substitution as `check_fn` (see its doc
@@ -1010,6 +1127,9 @@ impl TypeChecker {
     fn check_item(&mut self, item: &Item) {
         match &item.kind {
             ItemKind::Fn(f) => self.check_fn(f, None),
+            ItemKind::Impl(impl_decl) if !impl_decl.generics.0.is_empty() => {
+                // Generic impl: bodies are checked on the monomorphized copies.
+            }
             ItemKind::Impl(impl_decl) => {
                 let self_ty = resolve_type(&Type::Primitive(impl_decl.target.name.clone()));
                 for ii in &impl_decl.items {
@@ -1042,8 +1162,10 @@ impl TypeChecker {
             GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
         }).collect();
         let saved = std::mem::replace(&mut self.cur_tparams, tp);
+        let saved_b = std::mem::replace(&mut self.cur_bounds, fn_bounds(f));
         self.check_fn_inner(f, self_ty);
         self.cur_tparams = saved;
+        self.cur_bounds = saved_b;
     }
 
     /// True if `t` mentions a type parameter of the function being checked
@@ -1397,6 +1519,24 @@ impl TypeChecker {
                 if let [enum_name, variant_name] = path.as_slice() {
                     if let Some(shape) = self.enums.get(enum_name) {
                         match shape.variants.iter().find(|(n, _)| n == variant_name) {
+                            Some((_, data)) if data.is_empty() && !shape.generics.is_empty() => {
+                                return match expected {
+                                    Some(Ty::Generic(xn, xa)) if xn == enum_name && xa.len() == shape.generics.len() => {
+                                        let full = expected.cloned().unwrap();
+                                        if !format!("{:?}", full).contains("TypeParam") && !self.cur_tparams.iter().any(|p| format!("{}", full).split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|tok| tok == p)) {
+                                            self.type_paths.insert(expr as *const Expr as usize, full.clone());
+                                        }
+                                        full
+                                    }
+                                    _ => {
+                                        self.errors.push(TypeError {
+                                            message: format!("cannot infer the type arguments of `{}::{}`; add a type annotation (Document 5 rule 6)", enum_name, variant_name),
+                                            context: ctx.into(),
+                                        });
+                                        Ty::Named(enum_name.clone())
+                                    }
+                                };
+                            }
                             Some((_, data)) if data.is_empty() => return Ty::Named(enum_name.clone()),
                             Some((_, _)) => {
                                 self.errors.push(TypeError {
@@ -1668,7 +1808,13 @@ impl TypeChecker {
                         for (param_name, trait_names) in &shape.bounds {
                             if let Some(concrete) = subst.get(param_name) {
                                 for tn in trait_names {
-                                    if !self.satisfies_bound(concrete, tn) {
+                                    // Inside a generic body a `T`-typed argument satisfies a
+                                    // bound only if the enclosing function declares it.
+                                    let ok = match concrete {
+                                        Ty::Named(n) if self.cur_tparams.contains(n) => self.cur_bounds.iter().any(|(p, bs)| p == n && bs.contains(tn)),
+                                        _ => self.satisfies_bound(concrete, tn),
+                                    };
+                                    if !ok {
                                         self.errors.push(TypeError {
                                             message: format!(
                                                 "type `{}` does not satisfy bound `{}` required for generic parameter `{}` of `{}` (Document 8 §2/§3)",
@@ -1690,6 +1836,22 @@ impl TypeChecker {
                             });
                         }
                         return substitute_type_params(&shape.ret, &subst);
+                    }
+                }
+                {
+                    let gp: Option<(&Vec<String>, &[(usize, Vec<Type>)])> = match callee.as_ref() {
+                        Expr::Path(p) => Some((p, &[][..])),
+                        Expr::TurbofishPath { path, gens } => Some((path, &gens[..])),
+                        _ => None,
+                    };
+                    if let Some((path, gens)) = gp {
+                        if let [tn, fname] = path.as_slice() {
+                            let is_variant = self.enums.get(tn).map(|e| e.variants.iter().any(|(n, _)| n == fname)).unwrap_or(false);
+                            if self.generic_impls.contains_key(tn) && !is_variant {
+                                let (tn, fname) = (tn.clone(), fname.clone());
+                                return self.check_generic_assoc_call(callee, &tn, &fname, gens, args, expected, env, ctx);
+                            }
+                        }
                     }
                 }
                 if let Expr::Path(path) = callee.as_ref() {
@@ -1726,6 +1888,10 @@ impl TypeChecker {
                     }
                     if let [enum_name, variant_name] = path.as_slice() {
                         if let Some(shape) = self.enums.get(enum_name).cloned() {
+                            if !shape.generics.is_empty() {
+                                let (en, vn) = (enum_name.clone(), variant_name.clone());
+                                return self.check_generic_variant(callee, &en, &vn, &shape, args, expected, env, ctx);
+                            }
                             match shape.variants.iter().find(|(n, _)| n == variant_name) {
                                 Some((_, data_tys)) => {
                                     for (i, arg) in args.iter().enumerate() {
@@ -1797,14 +1963,14 @@ impl TypeChecker {
                         // Phase 3's existing field-access behavior for
                         // unknown base types.
                         let known_base = match &recv_ty {
-                            Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n),
+                            Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n) || self.cur_tparams.contains(n),
                             Ty::Generic(n, _) => self.structs.contains_key(n) || self.enums.contains_key(n),
                             Ty::DynTrait(n) => self.traits.contains_key(n),
                             _ => false,
                         };
                         if known_base {
                             self.errors.push(TypeError {
-                                message: format!("no method named `{}` found for type `{}`", name, recv_ty),
+                                message: format!("no method named `{}` found for type `{}`{}", name, recv_ty, if matches!(&recv_ty, Ty::Named(n) if self.cur_tparams.contains(n)) { " -- add a trait bound that provides it, e.g. `where T: Trait` (Document 8 §2)" } else { "" }),
                                 context: ctx.into(),
                             });
                         }
@@ -2426,6 +2592,48 @@ impl TypeChecker {
         // (that would need real unification across every field) —
         // falls back to `Ty::Named(name)`, a known, flagged
         // simplification rather than a silent wrong answer.
+        // Phase 11b-2 (Doc 5 rules 3/4/6): with no matching annotation, infer
+        // the type arguments of a generic struct from its field values.
+        let expected_matches = matches!(expected, Some(Ty::Generic(en, ea)) if en == name && ea.len() == shape.generics.len());
+        let only_type_params = shape.generics.iter().all(|g| matches!(g, GenericParam::Type { .. }));
+        if !shape.generics.is_empty() && !expected_matches && only_type_params {
+            let mut s2: HashMap<String, Ty> = HashMap::new();
+            let mut provided = std::collections::HashSet::new();
+            for (fname, fval) in fields {
+                provided.insert(fname.as_str());
+                match shape.fields.iter().find(|(n, _)| n == fname) {
+                    Some((_, ft)) => {
+                        let exp_ft = if format!("{:?}", ft).contains("TypeParam") { None } else { Some(ft) };
+                        let at = self.check_expr(fval, exp_ft, env, ctx);
+                        unify_infer(ft, &at, &mut s2);
+                    }
+                    None => self.errors.push(TypeError { message: format!("struct `{}` has no field `{}`", name, fname), context: ctx.into() }),
+                }
+            }
+            if !has_spread {
+                for (fname, _) in &shape.fields {
+                    if !provided.contains(fname.as_str()) {
+                        self.errors.push(TypeError { message: format!("missing field `{}` in struct literal for `{}`", fname, name), context: ctx.into() });
+                    }
+                }
+            }
+            let mut targs = Vec::new();
+            for g in &shape.generics {
+                if let GenericParam::Type { name: gn, .. } = g {
+                    match s2.get(gn) {
+                        Some(t) => targs.push(GenericArg::Type(t.clone())),
+                        None => {
+                            self.errors.push(TypeError {
+                                message: format!("cannot infer type parameter `{}` of `{}`; add a type annotation (Document 5 rule 6)", gn, name),
+                                context: ctx.into(),
+                            });
+                            return Ty::Named(name.to_string());
+                        }
+                    }
+                }
+            }
+            return Ty::Generic(name.to_string(), targs);
+        }
         let (subst, result_ty) = if !shape.generics.is_empty() {
             match expected {
                 Some(Ty::Generic(en, eargs)) if en == name && eargs.len() == shape.generics.len() => {
@@ -2917,6 +3125,13 @@ impl TypeChecker {
         if let Some(variants) = builtin_variants(ty) {
             return variants.into_iter().find(|(n, _)| *n == name).map(|(_, tys)| tys);
         }
+        if let Ty::Generic(tn, targs) = ty {
+            if let Some(shape) = self.enums.get(tn) {
+                let gn: Vec<String> = shape.generics.iter().filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None }).collect();
+                let subst: HashMap<String, Ty> = gn.into_iter().zip(targs.iter()).filter_map(|(g, a)| if let GenericArg::Type(t) = a { Some((g, t.clone())) } else { None }).collect();
+                return shape.variants.iter().find(|(n, _)| n.as_str() == name).map(|(_, tys)| tys.iter().map(|t| substitute_type_params(t, &subst)).collect());
+            }
+        }
         if let Ty::Named(tn) = ty {
             if let Some(shape) = self.enums.get(tn) {
                 return shape.variants.iter().find(|(n, _)| n.as_str() == name).map(|(_, tys)| tys.clone());
@@ -2988,17 +3203,148 @@ impl TypeChecker {
         }
     }
 
-    fn satisfies_bound(&self, ty: &Ty, trait_name: &str) -> bool {
+    pub fn satisfies_bound(&self, ty: &Ty, trait_name: &str) -> bool {
         let Some(key) = ty_lookup_name(ty) else { return false };
         self.impls_by_type.get(&key)
             .map(|impls| impls.iter().any(|r| r.trait_name.as_deref() == Some(trait_name)))
             .unwrap_or(false)
     }
 
+    /// `Enum::Variant(args)` for a generic enum: infers the enum's type
+    /// arguments from the expected type and the payload values.
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_variant(&mut self, callee: &Expr, en: &str, vn: &str, shape: &EnumShape, args: &[Arg], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let Some((_, data)) = shape.variants.iter().find(|(n, _)| n == vn).cloned() else {
+            self.errors.push(TypeError { message: format!("enum `{}` has no variant `{}`", en, vn), context: ctx.into() });
+            for a in args { self.check_expr(&a.value, None, env, ctx); }
+            return Ty::Named(en.to_string());
+        };
+        let gnames: Vec<String> = shape.generics.iter().filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None }).collect();
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        if let Some(Ty::Generic(xn, xa)) = expected {
+            if xn == en {
+                for (g, a) in gnames.iter().zip(xa.iter()) {
+                    if let GenericArg::Type(t) = a {
+                        subst.insert(g.clone(), t.clone());
+                    }
+                }
+            }
+        }
+        for (i, a) in args.iter().enumerate() {
+            let exp_p = data.get(i).map(|p| substitute_type_params(p, &subst)).filter(|p| !format!("{:?}", p).contains("TypeParam"));
+            let at = self.check_expr(&a.value, exp_p.as_ref(), env, ctx);
+            if let Some(p) = data.get(i) {
+                unify_infer(p, &at, &mut subst);
+            }
+        }
+        if args.len() != data.len() {
+            self.errors.push(TypeError { message: format!("`{}::{}` expects {} argument(s), found {}", en, vn, data.len(), args.len()), context: ctx.into() });
+        }
+        let missing: Vec<&String> = gnames.iter().filter(|g| !subst.contains_key(*g)).collect();
+        if !missing.is_empty() {
+            self.errors.push(TypeError {
+                message: format!("cannot infer type parameter(s) {} of `{}::{}`; add a type annotation (Document 5 rule 6)", missing.iter().map(|s| format!("`{}`", s)).collect::<Vec<_>>().join(", "), en, vn),
+                context: ctx.into(),
+            });
+            return Ty::Named(en.to_string());
+        }
+        let full = Ty::Generic(en.to_string(), gnames.iter().map(|g| GenericArg::Type(subst[g].clone())).collect());
+        if !self.mentions_tparam(&full) {
+            self.type_paths.insert(callee as *const Expr as usize, full.clone());
+        }
+        full
+    }
+
+    fn generic_method_sig(&self, gn: &str, gargs: &[GenericArg], name: &str) -> Option<FnSig> {
+        for imp in self.generic_impls.get(gn)? {
+            if let Some(m) = imp.methods.get(name) {
+                let mut subst: HashMap<String, Ty> = HashMap::new();
+                for (ta, ga) in imp.target_args.iter().zip(gargs.iter()) {
+                    if let GenericArg::Type(t) = ga {
+                        unify_infer(ta, t, &mut subst);
+                    }
+                }
+                return Some(FnSig {
+                    params: m.params.iter().map(|p| substitute_type_params(p, &subst)).collect(),
+                    ret: substitute_type_params(&m.ret, &subst),
+                    has_default_body: true,
+                });
+            }
+        }
+        None
+    }
+
+    /// `Type::f(args)` / `Type::<A>::f(args)` where `Type` has generic impls:
+    /// infers the impl's type arguments from turbofish, the expected type and
+    /// the arguments (Doc 5 rule 3/4); ambiguity is an error (rule 6).
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_assoc_call(&mut self, callee: &Expr, tn: &str, fname: &str, gens: &[(usize, Vec<Type>)], args: &[Arg], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let impls = self.generic_impls.get(tn).cloned().unwrap_or_default();
+        let Some((imp, m)) = impls.iter().find_map(|i| i.methods.get(fname).map(|m| (i.clone(), m.clone()))) else {
+            self.errors.push(TypeError { message: format!("no associated function `{}` found for generic type `{}`", fname, tn), context: ctx.into() });
+            for a in args { self.check_expr(&a.value, None, env, ctx); }
+            return Ty::Unit;
+        };
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (seg, targs) in gens {
+            if *seg == 0 {
+                for (ta, t) in imp.target_args.iter().zip(targs.iter()) {
+                    unify_infer(ta, &resolve_type(t), &mut subst);
+                }
+            }
+        }
+        if let Some(exp) = expected {
+            unify_infer(&m.ret, exp, &mut subst);
+        }
+        for (i, a) in args.iter().enumerate() {
+            let exp_p = m.params.get(i).map(|p| substitute_type_params(p, &subst)).filter(|p| !format!("{:?}", p).contains("TypeParam"));
+            let at = self.check_expr(&a.value, exp_p.as_ref(), env, ctx);
+            if let Some(p) = m.params.get(i) {
+                unify_infer(p, &at, &mut subst);
+            }
+        }
+        if args.len() != m.params.len() {
+            self.errors.push(TypeError { message: format!("`{}::{}` expects {} argument(s), found {}", tn, fname, m.params.len(), args.len()), context: ctx.into() });
+        }
+        let ret = substitute_type_params(&m.ret, &subst);
+        let missing: Vec<&String> = imp.generics.iter().filter(|g| !subst.contains_key(*g)).collect();
+        if !missing.is_empty() {
+            self.errors.push(TypeError {
+                message: format!("cannot infer type parameter(s) {} of `{}::{}`; annotate the binding or write `{}::<..>::{}(..)` (Document 5 rule 6)", missing.iter().map(|s| format!("`{}`", s)).collect::<Vec<_>>().join(", "), tn, fname, tn, fname),
+                context: ctx.into(),
+            });
+            return ret;
+        }
+        let targs: Vec<GenericArg> = imp.target_args.iter().map(|t| GenericArg::Type(substitute_type_params(t, &subst))).collect();
+        let full = Ty::Generic(tn.to_string(), targs);
+        if !self.mentions_tparam(&full) {
+            self.type_paths.insert(callee as *const Expr as usize, full);
+        }
+        ret
+    }
+
     fn resolve_method(&self, recv_ty: &Ty, name: &str) -> Option<FnSig> {
         match recv_ty {
             Ty::DynTrait(trait_name) => {
                 self.traits.get(trait_name)?.methods.get(name).cloned()
+            }
+            Ty::Generic(gn, gargs) if self.generic_impls.contains_key(gn) => self.generic_method_sig(gn, gargs, name),
+            // Phase 11b-2 (Doc 8 §2): inside a generic body a value of type `T`
+            // has exactly the methods of the traits `T` is bounded by.
+            Ty::Named(n) if self.cur_tparams.contains(n) => {
+                let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), Ty::Named(n.clone()))).collect();
+                for (p, bs) in &self.cur_bounds {
+                    if p != n {
+                        continue;
+                    }
+                    for b in bs {
+                        if let Some(sig) = self.traits.get(b).and_then(|s| s.methods.get(name)) {
+                            let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
+                            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: sig.has_default_body });
+                        }
+                    }
+                }
+                None
             }
             // Phase 11a: impls on primitive types (`impl Trait for i32`) are keyed by
             // the primitive's name, so `i32`, `bool`, ... resolve like named types.

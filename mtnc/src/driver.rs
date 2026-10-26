@@ -58,13 +58,19 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             if depth > crate::mono::MAX_DEPTH {
                 return Err(vec![format!("error: generic instantiation nests deeper than {} levels -- a generic function seems to instantiate itself infinitely (Document 8)", crate::mono::MAX_DEPTH)]);
             }
+            // Errors between rounds can be transient (a literal still named by the
+            // generic template); only the final check below reports them.
             tc = TypeChecker::new();
             tc.check_program(&program);
-            if !tc.errors.is_empty() {
-                return Err(tc.errors.iter().map(|e| e.to_string()).collect());
-            }
         }
-        if changed_any {
+        let has_generic_fn = program.items.iter().any(|it| match &it.kind {
+            crate::ast::ItemKind::Fn(f) => !f.generics.0.is_empty(),
+            crate::ast::ItemKind::Struct(s) => !s.generics.0.is_empty(),
+            crate::ast::ItemKind::Enum(e) => !e.generics.0.is_empty(),
+            crate::ast::ItemKind::Impl(i) => !i.generics.0.is_empty(),
+            _ => false,
+        });
+        if changed_any || has_generic_fn {
             crate::mono::strip_generics(&mut program);
             tc = TypeChecker::new();
             tc.check_program(&program);

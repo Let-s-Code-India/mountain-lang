@@ -549,6 +549,16 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
         Ty::Unit => Type::Unit,
         Ty::Never => Type::Never,
         Ty::Named(n) => Type::Named(n.clone(), Vec::new()),
+        Ty::Generic(n, args) => {
+            let mut v = Vec::new();
+            for a in args {
+                match a {
+                    crate::types::GenericArg::Type(t) => v.push(ty_to_type(t)?),
+                    crate::types::GenericArg::Const(c) => v.push(Type::ConstArg(Box::new(Expr::Literal(Literal::Int(c.to_string()))))),
+                }
+            }
+            Type::Named(n.clone(), v)
+        }
         Ty::Tuple(ts) => Type::Tuple(ts.iter().map(ty_to_type).collect::<Option<Vec<_>>>()?),
         Ty::OptionTy(i) => Type::Option(Box::new(ty_to_type(i)?)),
         Ty::ResultTy(o, e) => Type::Result(Box::new(ty_to_type(o)?), Box::new(ty_to_type(e)?)),

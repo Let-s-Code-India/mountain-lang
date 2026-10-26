@@ -138,7 +138,7 @@ impl<'a> Ctx<'a> {
             return Some(builtin.into_iter().map(|(n, tys)| (n.to_string(), tys)).collect());
         }
         match ty {
-            Ty::Named(name) => self.enums.get(name).map(|v| v.to_vec()),
+            Ty::Named(name) | Ty::Generic(name, _) => self.enums.get(name).map(|v| v.to_vec()),
             _ => None,
         }
     }
@@ -153,7 +153,7 @@ impl<'a> Ctx<'a> {
     /// `Pattern` variant to ever reach this at all).
     fn struct_fields(&self, ty: &Ty) -> Option<(String, Vec<Ty>)> {
         match ty {
-            Ty::Named(name) => self.structs.get(name).map(|tys| (name.clone(), tys.to_vec())),
+            Ty::Named(name) | Ty::Generic(name, _) => self.structs.get(name).map(|tys| (name.clone(), tys.to_vec())),
             _ => None,
         }
     }

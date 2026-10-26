@@ -1,0 +1,29 @@
+trait Show { fn show(borrow self) -> i32; }
+impl Show for i32 { fn show(borrow self) -> i32 { return self; } }
+impl Show for f64 { fn show(borrow self) -> i32 { return self as i32; } }
+struct Pair<A, B> { first: A, second: B }
+impl<A, B> Pair<A, B> where A: Show, B: Show {
+    fn total(borrow self) -> i32 { return self.first.show() + self.second.show(); }
+}
+struct Wrapper<T> { value: T }
+impl<T> Wrapper<T> {
+    fn get(borrow self) -> i32 { return 5; }
+}
+struct Stack<T> { items: [T; 3], n: i32 }
+impl<T> Stack<T> {
+    fn make(a: T, b: T, c: T) -> Stack<T> { return Stack { items: [a, b, c], n: 3 }; }
+    fn size(borrow self) -> i32 { return self.n; }
+}
+trait Describe { fn code(borrow self) -> i32; }
+impl<T> Describe for Wrapper<T> { fn code(borrow self) -> i32 { return 77; } }
+fn main() {
+    let p = Pair { first: 3, second: 4.9 };
+    println(p.total());
+    let nested = Pair { first: Wrapper { value: 1 }, second: 10 as i64 };
+    println(nested.first.get());
+    let s1 = Stack::make(1, 2, 3);
+    let s2 = Stack::make(1.5, 2.5, 3.5);
+    println(s1.size()); println(s2.size());
+    let w = Wrapper { value: 2.5 };
+    println(w.code());
+}
