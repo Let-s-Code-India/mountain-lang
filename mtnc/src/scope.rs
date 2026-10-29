@@ -197,6 +197,7 @@ impl Renamer<'_> {
                 }
             }
             Type::Ref { inner, .. } => self.ty(inner),
+            Type::Assoc(b, _) => self.ty(b),
             Type::Dyn(n, args) => {
                 if let Some(new) = self.rn(n) {
                     *n = new;

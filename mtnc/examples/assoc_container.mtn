@@ -1,0 +1,57 @@
+// Doc 8 §5: associated types. `Container` declares `type Item;`; the specialised
+// impl for Stack<i32> supplies it. `Self::Item` and `C::Item` resolve statically.
+struct Stack<T> { items: [T; 3], n: usize }
+
+trait Container {
+    type Item;
+    fn get(borrow self, index: usize) -> Option<borrow Self::Item>;
+    fn at(borrow self, index: usize) -> Self::Item;
+    fn count(borrow self) -> usize;
+}
+
+impl Container for Stack<i32> {
+    type Item = i32;
+    fn get(borrow self, index: usize) -> Option<borrow i32> {
+        if index < self.n { return Some(borrow self.items[index]); }
+        return None;
+    }
+    fn at(borrow self, index: usize) -> i32 { return self.items[index]; }
+    fn count(borrow self) -> usize { return self.n; }
+}
+
+impl Container for Stack<f64> {
+    type Item = f64;
+    fn get(borrow self, index: usize) -> Option<borrow f64> {
+        if index < self.n { return Some(borrow self.items[index]); }
+        return None;
+    }
+    fn at(borrow self, index: usize) -> f64 { return self.items[index]; }
+    fn count(borrow self) -> usize { return self.n; }
+}
+
+// `C::Item` in a generic signature: the return type is whatever `C` declares.
+fn second<C>(borrow c: C) -> C::Item where C: Container {
+    return c.at(1);
+}
+
+fn total<C>(borrow c: C) -> usize where C: Container {
+    return c.count();
+}
+
+fn main() {
+    let a = Stack { items: [10, 20, 30], n: 2 };
+    let b = Stack { items: [1.5, 2.5, 3.5], n: 3 };
+    println(a.count());
+    println(a.at(0));
+    println(second(borrow a));
+    println(second(borrow b));
+    println(total(borrow b));
+    match b.get(2) {
+        Some(_) => println("some"),
+        None => println("none"),
+    }
+    match b.get(7) {
+        Some(_) => println("some"),
+        None => println("none"),
+    }
+}

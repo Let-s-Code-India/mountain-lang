@@ -67,7 +67,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             crate::ast::ItemKind::Fn(f) => !f.generics.0.is_empty(),
             crate::ast::ItemKind::Struct(s) => !s.generics.0.is_empty(),
             crate::ast::ItemKind::Enum(e) => !e.generics.0.is_empty(),
-            crate::ast::ItemKind::Impl(i) => !i.generics.0.is_empty(),
+            crate::ast::ItemKind::Impl(i) => !i.generics.0.is_empty() || !i.target.args.is_empty(),
             _ => false,
         });
         if changed_any || has_generic_fn {

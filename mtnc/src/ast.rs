@@ -367,6 +367,9 @@ pub enum Type {
     /// recognizes them by text. See `parse_type` in parser.rs.
     Primitive(String),
     Named(String, Vec<Type>),
+    /// Phase 11b-2 (Doc 8 §5): an associated-type projection `Self::Item` /
+    /// `T::Item` -- the type named `Item` in the `impl` of a trait for the base type.
+    Assoc(Box<Type>, String),
     Array(Box<Type>, Option<Box<Expr>>),
     Tuple(Vec<Type>),
     Ref { lifetime: Option<String>, mutable: bool, inner: Box<Type> },

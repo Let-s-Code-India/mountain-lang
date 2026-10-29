@@ -364,7 +364,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
             Ty::Array(_) => return unsupported("growable `[T]` arrays", 11),
             Ty::Fn(..) => return unsupported("function values / closures", 12),
-            Ty::Generic(..) | Ty::TypeParam(_) => return unsupported("generics (monomorphization)", 11),
+            Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
             Ty::Null => return unsupported("`null`", 11),
         })
@@ -567,6 +567,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         fn go(t: Ty, s: &Ty) -> Ty {
             match t {
                 Ty::Named(n) if n == "Self" => s.clone(),
+                Ty::Assoc(b, n) => {
+                    let nb = go(*b, s);
+                    crate::types::lookup_assoc(&nb, &n).unwrap_or(Ty::Assoc(Box::new(nb), n))
+                }
                 Ty::Array(i) => Ty::Array(Box::new(go(*i, s))),
                 Ty::Fixed(i, n) => Ty::Fixed(Box::new(go(*i, s)), n),
                 Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|x| go(x, s)).collect()),

@@ -1050,7 +1050,18 @@ impl Parser {
         } else {
             self.expect_word()?
         };
-        for seg in self.parse_further_path_segments()? {
+        let segs = self.parse_further_path_segments()?;
+        // Doc 8 §5: `Self::Item` / `T::Item` is an associated-type projection. A
+        // two-segment path whose first segment is `Self`, a primitive or starts
+        // with an uppercase letter (a type or type parameter; module names are
+        // lowercase by convention) is read as one; anything else stays a path.
+        if segs.len() == 1
+            && (name == "Self" || is_primitive_type_name(&name) || name.chars().next().is_some_and(|c| c.is_uppercase()))
+        {
+            let base = if is_primitive_type_name(&name) { Type::Primitive(name) } else { Type::Named(name, Vec::new()) };
+            return Ok(Type::Assoc(Box::new(base), segs[0].clone()));
+        }
+        for seg in segs {
             name = format!("{}::{}", name, seg);
         }
         if is_primitive_type_name(&name) {

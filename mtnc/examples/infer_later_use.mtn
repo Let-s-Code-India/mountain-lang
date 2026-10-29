@@ -1,0 +1,40 @@
+// Doc 5 §4 rules 3/4/6: a type parameter that the call itself cannot fix is fixed by
+// a LATER use; it is an error only if nothing ever fixes it.
+struct Holder<T> { slot: Option<T> }
+
+impl<T> Holder<T> {
+    fn new() -> Holder<T> { return Holder { slot: None }; }
+    fn put(borrow mut self, v: T) { self.slot = Some(v); }
+    fn has(borrow self) -> bool {
+        match self.slot {
+            Some(_) => true,
+            None => false,
+        }
+    }
+}
+
+fn takesInt(borrow h: Holder<i32>) -> bool { return h.has(); }
+
+fn make() -> Holder<f64> {
+    let h = Holder::new();   // T fixed by the return type
+    return h;
+}
+
+fn empty<T>() -> Holder<T> { return Holder::new(); }
+
+fn main() {
+    let mut a = Holder::new();   // T unknown here ...
+    println(a.has());
+    a.put(5);                    // ... fixed to i32 by this call
+    println(a.has());
+
+    let b = Holder::new();       // fixed by passing it where Holder<i32> is expected
+    println(takesInt(borrow b));
+
+    let c = make();
+    println(c.has());
+
+    let mut d = empty();         // generic fn whose T only appears in the result
+    d.put(2.5);
+    println(d.has());
+}

@@ -549,6 +549,7 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
         Ty::Unit => Type::Unit,
         Ty::Never => Type::Never,
         Ty::Named(n) => Type::Named(n.clone(), Vec::new()),
+        Ty::Assoc(b, n) => Type::Assoc(Box::new(ty_to_type(b)?), n.clone()),
         Ty::Generic(n, args) => {
             let mut v = Vec::new();
             for a in args {

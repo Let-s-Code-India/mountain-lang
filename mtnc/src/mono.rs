@@ -43,6 +43,7 @@ fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
             }
         }
         Type::Array(i, _) => subst_type(i, m),
+        Type::Assoc(b, _) => subst_type(b, m),
         Type::Tuple(v) => v.iter_mut().for_each(|x| subst_type(x, m)),
         Type::Ref { inner, .. } => subst_type(inner, m),
         Type::Dyn(_, v) => v.iter_mut().for_each(|x| subst_type(x, m)),
@@ -234,6 +235,7 @@ fn walk_type(t: &mut Type, f: TyFn) {
     match t {
         Type::Named(_, a) | Type::Tuple(a) | Type::Dyn(_, a) => a.iter_mut().for_each(|x| walk_type(x, f)),
         Type::Array(i, _) | Type::Option(i) => walk_type(i, f),
+        Type::Assoc(b, _) => walk_type(b, f),
         Type::Ref { inner, .. } => walk_type(inner, f),
         Type::Fn(ps, r) => {
             ps.iter_mut().for_each(|x| walk_type(x, f));
@@ -354,6 +356,9 @@ fn walk_items_types(items: &mut [Item], f: TyFn) {
 const PRIMS: [&str; 22] = ["i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "String", "str", "mut", "fn", "Option", "Result"];
 
 fn ty_concrete(t: &Ty, known: &HashSet<String>) -> bool {
+    if t.to_string().contains('?') {
+        return false; // an unresolved inference variable: the final check reports it
+    }
     t.to_string()
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|tok| !tok.is_empty() && !tok.chars().next().unwrap().is_ascii_digit())
@@ -422,12 +427,14 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
                     genums.insert(e.name.clone(), (e.clone(), it.clone()));
                 }
             }
-            ItemKind::Impl(i) if !i.generics.0.is_empty() => gimpls.push((i.clone(), it.clone())),
+            ItemKind::Impl(i) => gimpls.push((i.clone(), it.clone())),
             _ => {}
         }
     }
     known.extend(made.iter().cloned());
     let bases: HashSet<String> = gstructs.keys().chain(genums.keys()).cloned().collect();
+    // Template impls: own type parameters, or a specialized impl on a generic base (`impl C for Stack<i32>`).
+    gimpls.retain(|(i, _)| !i.generics.0.is_empty() || (bases.contains(&i.target.name) && !i.target.args.is_empty()));
 
     // ---- generic function instances
     for (addr, (fname, targs)) in &tc.instances {
@@ -499,7 +506,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
             }
             let arg_types: Option<Vec<Type>> = tys.iter().map(ty_to_type).collect();
             let Some(arg_types) = arg_types else {
-                return Err(vec![format!("error: cannot instantiate `{}` with these type arguments (not yet supported by codegen -- Phase 11)", base)]);
+                return Err(vec![format!("error: cannot instantiate `{}` with type arguments ({}) (not yet supported by codegen -- Phase 11)", base, tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))]);
             };
             made.insert(mangled.clone());
             changed = true;
@@ -528,17 +535,26 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
             for (imp, orig) in gimpls.iter().filter(|(i, _)| i.target.name == base) {
                 let gnames = generic_param_names(&imp.generics);
                 let mut m: HashMap<String, Type> = HashMap::new();
-                let mut specialized = false;
-                for (ta, at) in imp.target.args.iter().zip(arg_types.iter()) {
+                let mut matches = true;
+                for ((ta, at), ty) in imp.target.args.iter().zip(arg_types.iter()).zip(tys.iter()) {
                     match ta {
                         Type::Named(g, a) if a.is_empty() && gnames.contains(g) => {
                             m.insert(g.clone(), at.clone());
                         }
-                        _ => specialized = true,
+                        _ => {
+                            // A concrete argument (`impl C for Stack<i32>`): applies only to that instance.
+                            let rt = resolve_type(ta);
+                            if gnames.iter().any(|g| rt.to_string().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|tok| tok == g)) {
+                                return Err(vec![format!("error: `impl` with a type parameter nested inside an argument of `{}<..>` is not yet supported by codegen -- Phase 11", base)]);
+                            }
+                            if rt != *ty {
+                                matches = false;
+                            }
+                        }
                     }
                 }
-                if specialized {
-                    return Err(vec![format!("error: `impl` for a partially specialized `{}<..>` is not yet supported by codegen -- Phase 11", base)]);
+                if !matches {
+                    continue;
                 }
                 // Doc 8 §4: a bounded `impl` only provides its methods when the
                 // concrete arguments satisfy every bound; otherwise skip this copy.
@@ -613,6 +629,11 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         }
     }
 
+    for (addr, inst) in tc.inst_names.iter() {
+        rw.struct_lits.insert(*addr, inst.clone());
+        rw.type_calls.insert(*addr, inst.clone());
+        changed = true;
+    }
     rewrite_items(&mut program.items, &rw);
     program.items.extend(new_items);
 
@@ -647,11 +668,16 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
 
 /// Drop the generic declarations once the fixpoint is reached.
 pub fn strip_generics(program: &mut Program) {
+    let bases: HashSet<String> = program.items.iter().filter_map(|it| match &it.kind {
+        ItemKind::Struct(s) if !s.generics.0.is_empty() => Some(s.name.clone()),
+        ItemKind::Enum(e) if !e.generics.0.is_empty() => Some(e.name.clone()),
+        _ => None,
+    }).collect();
     program.items.retain(|it| match &it.kind {
         ItemKind::Fn(f) => f.generics.0.is_empty(),
         ItemKind::Struct(s) => s.generics.0.is_empty(),
         ItemKind::Enum(e) => e.generics.0.is_empty(),
-        ItemKind::Impl(i) => i.generics.0.is_empty(),
+        ItemKind::Impl(i) => i.generics.0.is_empty() && !(bases.contains(&i.target.name) && !i.target.args.is_empty()),
         _ => true,
     });
 }

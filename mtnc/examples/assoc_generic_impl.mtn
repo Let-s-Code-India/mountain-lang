@@ -1,0 +1,24 @@
+trait Container { type Item; fn first(borrow self) -> Self::Item; }
+struct Wrapper<T> { value: T }
+impl<T> Container for Wrapper<T> {
+    type Item = T;
+    fn first(borrow self) -> T { return self.value; }
+}
+struct Stack<T> { items: [T; 2] }
+impl Stack<i32> {
+    fn sum(borrow self) -> i32 { return self.items[0] + self.items[1]; }
+}
+struct Plain { v: i64 }
+impl Container for Plain {
+    type Item = i64;
+    fn first(borrow self) -> Self::Item { return self.v; }
+}
+fn head<C>(borrow c: C) -> C::Item where C: Container { return c.first(); }
+fn main() {
+    let w = Wrapper { value: 2.5 };
+    let s = Stack { items: [4, 5] };
+    let p = Plain { v: 9 };
+    println(head(borrow w));
+    println(s.sum());
+    println(head(borrow p));
+}
