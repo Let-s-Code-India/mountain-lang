@@ -55,6 +55,12 @@ pub enum Ty {
     /// item; any other size expression (e.g. a const-generic `ROWS * COLS`,
     /// Document 8 §8) still resolves to the unsized `Array` as before.
     Fixed(Box<Ty>, u64),
+    /// Phase 11b M4 (Doc 8 §8): `[T; E]` whose length `E` mentions const generic
+    /// parameters (`[T; N]`, `[T; ROWS * COLS]`) and so is not a number yet. Becomes a
+    /// `Fixed` as soon as the parameters are substituted (monomorphization).
+    SymFixed(Box<Ty>, Box<Expr>),
+    /// The value bound to a const generic parameter in a substitution (never a real type).
+    ConstVal(i64),
     Tuple(Vec<Ty>),
     Ref(bool, Box<Ty>),
     /// A user-declared struct or enum with no generic parameters, by
@@ -133,6 +139,8 @@ impl std::fmt::Display for Ty {
             Ty::StringTy => write!(f, "String"), Ty::Str => write!(f, "str"),
             Ty::Unit => write!(f, "()"), Ty::Never => write!(f, "!"),
             Ty::Array(t) => write!(f, "[{}]", t),
+            Ty::SymFixed(t, e) => write!(f, "[{}; {}]", t, const_expr_str(e)),
+            Ty::ConstVal(n) => write!(f, "{}", n),
             Ty::Fixed(t, n) => write!(f, "[{}; {}]", t, n),
             Ty::Tuple(ts) => write!(f, "({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Ref(m, t) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
@@ -278,7 +286,7 @@ fn ty_mentions_var(t: &Ty, id: u32) -> bool {
 fn collect_unbound(t: &Ty, out: &mut Vec<u32>) {
     match t {
         Ty::Infer(i) => out.push(*i),
-        Ty::Array(i) | Ty::Fixed(i, _) | Ty::Ref(_, i) | Ty::OptionTy(i) | Ty::Assoc(i, _) => collect_unbound(i, out),
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::SymFixed(i, _) | Ty::Ref(_, i) | Ty::OptionTy(i) | Ty::Assoc(i, _) => collect_unbound(i, out),
         Ty::Tuple(v) => v.iter().for_each(|x| collect_unbound(x, out)),
         Ty::ResultTy(a, b) => {
             collect_unbound(a, out);
@@ -329,6 +337,154 @@ thread_local! {
 
 /// Integer constant folding for array sizes / `const` items (literals, other
 /// consts, parentheses, unary minus, `+ - * / % <<`).
+/// True if `e` is built only from integer literals, identifiers, parentheses and
+/// `+ - * / % <<` — the shape of a constant length expression (Doc 8 §8's `ROWS * COLS`).
+pub fn const_shaped(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Int(_)) | Expr::Literal(Literal::IntHex(_)) | Expr::Literal(Literal::IntOct(_)) | Expr::Literal(Literal::IntBin(_)) => true,
+        Expr::Ident(_) => true,
+        Expr::Paren(i) => const_shaped(i),
+        Expr::Unary { op: UnaryOp::Neg, expr } => const_shaped(expr),
+        Expr::Binary { op, lhs, rhs } => matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Shl) && const_shaped(lhs) && const_shaped(rhs),
+        _ => false,
+    }
+}
+
+/// Identifiers occurring in a constant-shaped expression that are not `const` items.
+pub fn const_expr_idents(e: &Expr) -> Vec<String> {
+    fn go(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Ident(n) => {
+                if !CONSTS.with(|c| c.borrow().contains_key(n)) && !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            Expr::Paren(i) | Expr::Unary { expr: i, .. } => go(i, out),
+            Expr::Binary { lhs, rhs, .. } => {
+                go(lhs, out);
+                go(rhs, out);
+            }
+            _ => {}
+        }
+    }
+    let mut v = Vec::new();
+    go(e, &mut v);
+    v
+}
+
+/// `N` if `e` is exactly the bare identifier `N` (possibly parenthesised).
+fn bare_const_param(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::Paren(i) => bare_const_param(i),
+        _ => None,
+    }
+}
+
+/// If `param` (a declared parameter type) and `arg` (the actual argument type) give a const
+/// generic parameter two different values under `subst`, describes the clash.
+fn const_conflict(param: &Ty, arg: &Ty, subst: &HashMap<String, Ty>) -> Option<String> {
+    match (param, arg) {
+        (Ty::Generic(pn, pa), Ty::Generic(an, aa)) if pn == an && pa.len() == aa.len() => {
+            for (p, a) in pa.iter().zip(aa.iter()) {
+                match (p, a) {
+                    (GenericArg::Type(Ty::TypeParam(n)), GenericArg::Const(v)) => {
+                        if let Some(Ty::ConstVal(b)) = subst.get(n) {
+                            if b != v {
+                                return Some(format!("const generic parameter `{}` is {} in one argument but {} in `{}` (`{}` vs `{}`)", n, b, v, arg, param, arg));
+                            }
+                        }
+                    }
+                    (GenericArg::Type(p), GenericArg::Type(a)) => {
+                        if let Some(m) = const_conflict(p, a, subst) {
+                            return Some(m);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        (Ty::SymFixed(p, e), Ty::Fixed(a, m)) => {
+            if let Some(x) = const_conflict(p, a, subst) {
+                return Some(x);
+            }
+            let ne = subst_const_expr(e, subst);
+            match CONSTS.with(|c| eval_const_int(&ne, &c.borrow())) {
+                Some(v) if v != *m as i128 => Some(format!("array length `{}` evaluates to {} but the argument has length {} (`{}` vs `{}`)", const_expr_str(e), v, m, param, arg)),
+                _ => None,
+            }
+        }
+        (Ty::Array(p), Ty::Array(a)) | (Ty::Ref(_, p), Ty::Ref(_, a)) | (Ty::OptionTy(p), Ty::OptionTy(a)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) => const_conflict(p, a, subst),
+        (Ty::Tuple(ps), Ty::Tuple(as_)) if ps.len() == as_.len() => ps.iter().zip(as_.iter()).find_map(|(p, a)| const_conflict(p, a, subst)),
+        _ => None,
+    }
+}
+
+/// A written generic argument (turbofish / annotation) as a `Ty`; a constant becomes `ConstVal`.
+fn resolve_targ(t: &Type) -> Ty {
+    match t {
+        Type::ConstArg(e) => match CONSTS.with(|c| eval_const_int(e, &c.borrow())) {
+            Some(v) => Ty::ConstVal(v as i64),
+            None => resolve_type(t),
+        },
+        _ => resolve_type(t),
+    }
+}
+
+/// A generic argument as a `Ty` (a const value becomes `Ty::ConstVal`).
+pub fn garg_ty(a: &GenericArg) -> Ty {
+    match a {
+        GenericArg::Type(t) => t.clone(),
+        GenericArg::Const(v) => Ty::ConstVal(*v),
+    }
+}
+
+/// A resolved `Ty` as a generic argument (`ConstVal` becomes a const argument).
+fn ty_garg(t: Ty) -> GenericArg {
+    match t {
+        Ty::ConstVal(v) => GenericArg::Const(v),
+        other => GenericArg::Type(other),
+    }
+}
+
+/// Parameter name -> argument, over type AND const parameters in declaration order.
+fn generic_subst(generics: &[GenericParam], args: &[GenericArg]) -> HashMap<String, Ty> {
+    generics.iter().zip(args.iter()).map(|(p, a)| {
+        let n = match p { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() };
+        (n, garg_ty(a))
+    }).collect()
+}
+
+/// `e` with every identifier bound to a `Ty::ConstVal` in `subst` replaced by its value.
+pub fn subst_const_expr(e: &Expr, subst: &HashMap<String, Ty>) -> Expr {
+    match e {
+        Expr::Ident(n) => match subst.get(n) {
+            Some(Ty::ConstVal(v)) => Expr::Literal(Literal::Int(v.to_string())),
+            Some(Ty::Named(m)) => Expr::Ident(m.clone()), // a const parameter of the enclosing generic
+            _ => e.clone(),
+        },
+        Expr::Paren(i) => Expr::Paren(Box::new(subst_const_expr(i, subst))),
+        Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(subst_const_expr(expr, subst)) },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary { op: *op, lhs: Box::new(subst_const_expr(lhs, subst)), rhs: Box::new(subst_const_expr(rhs, subst)) },
+        other => other.clone(),
+    }
+}
+
+pub fn const_expr_str(e: &Expr) -> String {
+    match e {
+        Expr::Literal(Literal::Int(s)) => s.clone(),
+        Expr::Ident(n) => n.clone(),
+        Expr::Paren(i) => format!("({})", const_expr_str(i)),
+        Expr::Unary { expr, .. } => format!("-{}", const_expr_str(expr)),
+        Expr::Binary { op, lhs, rhs } => {
+            let o = match op { BinaryOp::Add => "+", BinaryOp::Sub => "-", BinaryOp::Mul => "*", BinaryOp::Div => "/", BinaryOp::Mod => "%", BinaryOp::Shl => "<<", _ => "?" };
+            format!("{} {} {}", const_expr_str(lhs), o, const_expr_str(rhs))
+        }
+        _ => "..".into(),
+    }
+}
+
 pub fn eval_const_int(e: &Expr, consts: &HashMap<String, i128>) -> Option<i128> {
     match e {
         Expr::Literal(Literal::Int(t)) => t.replace('_', "").parse::<i128>().ok(),
@@ -449,6 +605,8 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
                     if (0..=u32::MAX as i128).contains(&n) {
                         return Ty::Fixed(Box::new(elem), n as u64);
                     }
+                } else if const_shaped(sz) && !const_expr_idents(sz).is_empty() {
+                    return Ty::SymFixed(Box::new(elem), sz.clone());
                 }
             }
             Ty::Array(Box::new(elem))
@@ -531,11 +689,22 @@ fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             lookup_assoc(&nb, n).unwrap_or_else(|| Ty::Assoc(Box::new(nb), n.clone()))
         }
         Ty::Generic(n, args) => Ty::Generic(n.clone(), args.iter().map(|a| match a {
-            GenericArg::Type(t) => GenericArg::Type(substitute_type_params(t, subst)),
+            GenericArg::Type(t) => match substitute_type_params(t, subst) {
+                Ty::ConstVal(v) => GenericArg::Const(v),
+                other => GenericArg::Type(other),
+            },
             c => c.clone(),
         }).collect()),
         Ty::Array(inner) => Ty::Array(Box::new(substitute_type_params(inner, subst))),
         Ty::Fixed(inner, n) => Ty::Fixed(Box::new(substitute_type_params(inner, subst)), *n),
+        Ty::SymFixed(inner, e) => {
+            let ne = subst_const_expr(e, subst);
+            let ni = substitute_type_params(inner, subst);
+            match CONSTS.with(|c| eval_const_int(&ne, &c.borrow())) {
+                Some(n) if (0..=u32::MAX as i128).contains(&n) => Ty::Fixed(Box::new(ni), n as u64),
+                _ => Ty::SymFixed(Box::new(ni), Box::new(ne)),
+            }
+        }
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute_type_params(t, subst)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(*m, Box::new(substitute_type_params(inner, subst))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(substitute_type_params(inner, subst))),
@@ -570,11 +739,28 @@ fn unify_infer(param_ty: &Ty, arg_ty: &Ty, out: &mut HashMap<String, Ty>) {
         }
         (Ty::Generic(pn, pa), Ty::Generic(an, aa)) if pn == an && pa.len() == aa.len() => {
             for (p, a) in pa.iter().zip(aa.iter()) {
-                if let (GenericArg::Type(p), GenericArg::Type(a)) = (p, a) {
-                    unify_infer(p, a, out);
+                match (p, a) {
+                    (GenericArg::Type(p), GenericArg::Type(a)) => unify_infer(p, a, out),
+                    // a const parameter (`R` in `Matrix<f64, R, K>`) meets a value
+                    (GenericArg::Type(p), GenericArg::Const(v)) => unify_infer(p, &Ty::ConstVal(*v), out),
+                    _ => {}
                 }
             }
         }
+        (Ty::SymFixed(p, e), Ty::Fixed(a, n)) => {
+            unify_infer(p, a, out);
+            if let Some(name) = bare_const_param(e) {
+                out.entry(name).or_insert(Ty::ConstVal(*n as i64));
+            }
+        }
+        (Ty::SymFixed(p, e1), Ty::SymFixed(a, e2)) => {
+            unify_infer(p, a, out);
+            // inside a generic body the "value" of the caller's own const parameter is its name
+            if let (Some(n1), Some(n2)) = (bare_const_param(e1), bare_const_param(e2)) {
+                out.entry(n1).or_insert(Ty::Named(n2));
+            }
+        }
+        (Ty::SymFixed(p, _), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Array(p), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Array(p), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Ref(_, p), Ty::Ref(_, a)) => unify_infer(p, a, out),
@@ -657,6 +843,7 @@ fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
         }).collect()),
         Ty::Array(inner) => Ty::Array(Box::new(mark_type_params(*inner, param_names))),
         Ty::Fixed(inner, n) => Ty::Fixed(Box::new(mark_type_params(*inner, param_names)), n),
+        Ty::SymFixed(inner, e) => Ty::SymFixed(Box::new(mark_type_params(*inner, param_names)), e),
         Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|t| mark_type_params(t, param_names)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(m, Box::new(mark_type_params(*inner, param_names))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(mark_type_params(*inner, param_names))),
@@ -792,6 +979,11 @@ pub struct TypeChecker {
     pub instances: HashMap<usize, (String, Vec<Ty>)>,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
+    /// Const generic parameter names of the function being checked (usable as `usize` values
+    /// and in array lengths; their value is only known after monomorphization).
+    cur_const_params: Vec<String>,
+    /// Structs marked `@copy` (Doc 23 §17.8): the element types `[x; N]` accepts.
+    copy_structs: std::collections::HashSet<String>,
     /// Declared bounds of the function being checked (for T-typed arguments).
     cur_bounds: Vec<(String, Vec<String>)>,
     generic_impls: HashMap<String, Vec<GenericImpl>>,
@@ -938,6 +1130,8 @@ impl TypeChecker {
             expr_types: HashMap::new(),
             instances: HashMap::new(),
             cur_tparams: Vec::new(),
+            cur_const_params: Vec::new(),
+            copy_structs: std::collections::HashSet::new(),
             cur_bounds: Vec::new(),
             generic_impls: HashMap::new(),
             infer: Vec::new(),
@@ -1044,6 +1238,10 @@ impl TypeChecker {
         // items of different functions are rejected by codegen).
         let items = crate::desugar::all_items(program);
         register_item_context(&items);
+        self.copy_structs = items.iter().filter_map(|it| match &it.kind {
+            ItemKind::Struct(s) if it.attrs.iter().any(|a| a.name == "copy") => Some(s.name.clone()),
+            _ => None,
+        }).collect();
         // Pass 1: register all struct/enum/trait data shapes and fn
         // signatures first, so forward references (a function defined
         // before a struct it uses, or mutual struct references) resolve
@@ -1080,8 +1278,7 @@ impl TypeChecker {
             ItemKind::Struct(s) => {
                 let generics = s.generics.0.clone();
                 let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
-                    GenericParam::Type { name, .. } => Some(name.clone()),
-                    GenericParam::Const { .. } => None,
+                    GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
                 }).collect();
                 let (fields, is_tuple) = match &s.body {
                     StructBody::Named(fs) => (
@@ -1099,8 +1296,7 @@ impl TypeChecker {
             ItemKind::Enum(e) => {
                 let generics = e.generics.0.clone();
                 let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
-                    GenericParam::Type { name, .. } => Some(name.clone()),
-                    GenericParam::Const { .. } => None,
+                    GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
                 }).collect();
                 let variants = e.variants.iter()
                     .map(|v| (v.name.clone(), v.data.iter().map(|t| mark_type_params(resolve_type(t), &type_param_names)).collect()))
@@ -1110,8 +1306,7 @@ impl TypeChecker {
             ItemKind::Fn(f) => {
                 let generics = f.generics.0.clone();
                 let type_param_names: Vec<String> = generics.iter().filter_map(|g| match g {
-                    GenericParam::Type { name, .. } => Some(name.clone()),
-                    GenericParam::Const { .. } => None,
+                    GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
                 }).collect();
                 let params = f.params.iter()
                     .filter(|p| p.name != "self")
@@ -1162,7 +1357,7 @@ impl TypeChecker {
                 let self_raw = resolve_type(&Type::Named(impl_decl.target.name.clone(), impl_decl.target.args.clone()));
                 let self_marked = mark_type_params(self_raw, &gnames);
                 let target_args: Vec<Ty> = match &self_marked {
-                    Ty::Generic(_, a) => a.iter().filter_map(|x| if let GenericArg::Type(t) = x { Some(t.clone()) } else { None }).collect(),
+                    Ty::Generic(_, a) => a.iter().map(garg_ty).collect(),
                     _ => Vec::new(),
                 };
                 let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), self_marked.clone())).collect();
@@ -1174,7 +1369,7 @@ impl TypeChecker {
                     if let ImplItem::Fn(f) = ii {
                         if !f.generics.0.is_empty() {
                             self.errors.push(TypeError {
-                                message: format!("method `{}` declares its own type parameters inside a generic `impl`; this is not yet supported by codegen — Phase 11c (Document 8 §2); declare it as a free generic function instead", f.name),
+                                message: format!("method `{}` declares its own type parameters inside a generic `impl`; not yet supported by codegen — Phase 11 (Doc 25 §2.5, generic functions/structs/enums); declare it as a free generic function instead", f.name),
                                 context: format!("impl {}", impl_decl.target.name),
                             });
                         }
@@ -1341,14 +1536,9 @@ impl TypeChecker {
     fn impl_subst(&self, imp: &GenericImpl, gargs: &[GenericArg]) -> Option<HashMap<String, Ty>> {
         let mut subst: HashMap<String, Ty> = HashMap::new();
         for (ta, ga) in imp.target_args.iter().zip(gargs.iter()) {
-            if let GenericArg::Type(t) = ga {
-                unify_infer(ta, t, &mut subst);
-            }
+            unify_infer(ta, &garg_ty(ga), &mut subst);
         }
-        let ok = imp.target_args.iter().zip(gargs.iter()).all(|(ta, ga)| match ga {
-            GenericArg::Type(t) => substitute_type_params(ta, &subst) == *t,
-            _ => true,
-        });
+        let ok = imp.target_args.iter().zip(gargs.iter()).all(|(ta, ga)| substitute_type_params(ta, &subst) == garg_ty(ga));
         if ok { Some(subst) } else { None }
     }
 
@@ -1389,11 +1579,36 @@ impl TypeChecker {
         let tp: Vec<String> = f.generics.0.iter().filter_map(|g| match g {
             GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
         }).collect();
+        let cp: Vec<String> = f.generics.0.iter().filter_map(|g| match g {
+            GenericParam::Const { name, .. } => Some(name.clone()),
+            _ => None,
+        }).collect();
         let saved = std::mem::replace(&mut self.cur_tparams, tp);
+        let saved_c = std::mem::replace(&mut self.cur_const_params, cp);
         let saved_b = std::mem::replace(&mut self.cur_bounds, fn_bounds(f));
         self.check_fn_inner(f, self_ty);
+        self.cur_const_params = saved_c;
         self.cur_tparams = saved;
         self.cur_bounds = saved_b;
+    }
+
+    /// Whether values of `t` are trivially duplicable (`copy`, Doc 3 Category C / Doc 23 §17.8).
+    /// Type parameters and unresolved inference variables are given the benefit of the doubt
+    /// here: the instantiated copy is checked again with the concrete type.
+    fn is_copy_ty(&self, t: &Ty) -> bool {
+        match t {
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize
+            | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize
+            | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Char | Ty::Unit | Ty::Never | Ty::ConstVal(_) => true,
+            Ty::Ref(m, _) => !*m,
+            Ty::Fixed(i, _) | Ty::SymFixed(i, _) => self.is_copy_ty(i),
+            Ty::Tuple(ts) => ts.iter().all(|x| self.is_copy_ty(x)),
+            Ty::Named(n) => self.cur_tparams.contains(n) || self.copy_structs.contains(n),
+            Ty::Generic(n, args) => self.copy_structs.contains(n.split('$').next().unwrap_or(n))
+                && args.iter().all(|a| match a { GenericArg::Type(x) => self.is_copy_ty(x), GenericArg::Const(_) => true }),
+            Ty::TypeParam(_) | Ty::Infer(_) => true,
+            _ => false,
+        }
     }
 
     /// True if `t` mentions a type parameter of the function being checked
@@ -1740,6 +1955,8 @@ impl TypeChecker {
                     self.zonk(&t)
                 } else if let Some(t) = self.globals.get(name) {
                     t.clone()
+                } else if self.cur_const_params.contains(name) {
+                    Ty::Usize // a const generic parameter used as a value (Doc 8 §8)
                 } else {
                     self.errors.push(TypeError {
                         message: format!("undefined variable `{}`", name),
@@ -1815,11 +2032,13 @@ impl TypeChecker {
 
             Expr::Array(items) => {
                 let elem_expected = match expected {
-                    Some(Ty::Array(inner)) | Some(Ty::Fixed(inner, _)) => Some((**inner).clone()),
+                    Some(Ty::Array(inner)) | Some(Ty::Fixed(inner, _)) | Some(Ty::SymFixed(inner, _)) => Some((**inner).clone()),
                     _ => None,
                 };
+                // Expected `[T; N]` with `N` a const parameter: the literal fixes `N` to its length.
                 let fixed_len = match expected {
                     Some(Ty::Fixed(_, n)) => Some(*n),
+                    Some(Ty::SymFixed(..)) => Some(items.len() as u64),
                     _ => None,
                 };
                 if let Some(n) = fixed_len {
@@ -1865,6 +2084,49 @@ impl TypeChecker {
                     match fixed_len {
                         Some(n) => Ty::Fixed(Box::new(first), n),
                         None => Ty::Array(Box::new(first)),
+                    }
+                }
+            }
+
+            Expr::ArrayRepeat(elem, len) => {
+                let elem_expected = match expected {
+                    Some(Ty::Array(i)) | Some(Ty::Fixed(i, _)) | Some(Ty::SymFixed(i, _)) => Some((**i).clone()),
+                    _ => None,
+                };
+                let et = self.check_expr(elem, elem_expected.as_ref(), env, ctx);
+                if !self.is_copy_ty(&et) {
+                    self.errors.push(TypeError {
+                        message: format!("`[x; N]` repeats its element by copying it, so the element type must be `copy`; `{}` is not (Doc 8 §8, Doc 6 §1)", et),
+                        context: ctx.into(),
+                    });
+                }
+                let consts = CONSTS.with(|c| c.borrow().clone());
+                // Like an array literal, against an unsized `[T]` expectation it is an unsized value.
+                let unsized_expected = matches!(expected, Some(Ty::Array(_)));
+                match eval_const_int(len, &consts) {
+                    Some(n) if (0..=u32::MAX as i128).contains(&n) && unsized_expected => { let _ = n; Ty::Array(Box::new(et)) }
+                    Some(n) if (0..=u32::MAX as i128).contains(&n) => Ty::Fixed(Box::new(et), n as u64),
+                    Some(n) => {
+                        self.errors.push(TypeError {
+                            message: format!("array length {} is out of range for `[x; N]`", n),
+                            context: ctx.into(),
+                        });
+                        Ty::Fixed(Box::new(et), 0)
+                    }
+                    None => {
+                        let idents = const_expr_idents(len);
+                        if const_shaped(len) && !idents.is_empty() && idents.iter().all(|i| self.cur_const_params.contains(i)) {
+                            Ty::SymFixed(Box::new(et), len.clone())
+                        } else {
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "the length of `[x; N]` must be a compile-time constant (an integer literal, a `const` item, or a const generic parameter, possibly combined with arithmetic); `{}` is not (Doc 8 §8)",
+                                    if const_shaped(len) { const_expr_str(len) } else { "this expression".to_string() }
+                                ),
+                                context: ctx.into(),
+                            });
+                            Ty::Fixed(Box::new(et), 0)
+                        }
                     }
                 }
             }
@@ -1986,8 +2248,8 @@ impl TypeChecker {
                 match t {
                     // `a[lo..hi]` is the unsized slice place `[T]` (Document 5
                     // §3.1's `&list[1..3]`); `a[i]` is one element.
-                    Ty::Array(elem) | Ty::Fixed(elem, _) if is_range => Ty::Array(elem),
-                    Ty::Array(elem) | Ty::Fixed(elem, _) => *elem,
+                    Ty::Array(elem) | Ty::Fixed(elem, _) | Ty::SymFixed(elem, _) if is_range => Ty::Array(elem),
+                    Ty::Array(elem) | Ty::Fixed(elem, _) | Ty::SymFixed(elem, _) => *elem,
                     other => {
                         self.errors.push(TypeError {
                             message: format!("cannot index into type `{}`", other),
@@ -2054,14 +2316,46 @@ impl TypeChecker {
                         // Explicit `f::<T, ..>(..)` (Doc 23 §17.2) seeds the
                         // substitution, in declaration order of the type params.
                         let tparam_names: Vec<String> = shape.generics.iter()
-                            .filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None })
+                            .map(|g| match g { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() })
+                            .collect();
+                        let const_names: Vec<String> = shape.generics.iter()
+                            .filter_map(|g| if let GenericParam::Const { name, .. } = g { Some(name.clone()) } else { None })
                             .collect();
                         for (pn, ta) in tparam_names.iter().zip(explicit_targs.iter()) {
-                            let t = resolve_type(ta);
-                            subst.insert(pn.clone(), t);
+                            subst.insert(pn.clone(), resolve_targ(ta));
                         }
                         for (p, a) in shape.params.iter().zip(arg_tys.iter()) {
                             unify_infer(p, a, &mut subst);
+                        }
+                        // One const parameter fixed to two different values by two arguments
+                        // (`K` in `Matrix<f64,R,K>` and `Matrix<f64,K,C>`) is a dimension mismatch.
+                        for (p, a) in shape.params.iter().zip(arg_tys.iter()) {
+                            if let Some(msg) = const_conflict(p, a, &subst) {
+                                self.errors.push(TypeError {
+                                    message: format!("{} in call to `{}` (Document 8 §8/§9: dimension mismatch is a compile-time error)", msg, name),
+                                    context: ctx.into(),
+                                });
+                            }
+                        }
+                        // Parameters only the result type mentions (`identity::<N>() -> [i32; N]`)
+                        // may be fixed by the expected type.
+                        if let Some(exp) = expected {
+                            let mut from_ret: HashMap<String, Ty> = HashMap::new();
+                            unify_infer(&shape.ret, exp, &mut from_ret);
+                            for (k, v) in from_ret {
+                                if tparam_names.contains(&k) && !subst.contains_key(&k) && !ty_has_infer(&v) {
+                                    subst.insert(k, v);
+                                }
+                            }
+                        }
+                        for n in &const_names {
+                            if !subst.contains_key(n) {
+                                self.errors.push(TypeError {
+                                    message: format!("cannot infer const generic parameter `{}` of `{}`; pass it explicitly, e.g. `{}::<3>(..)`, or annotate the result (Document 5 rule 6)", n, name, name),
+                                    context: ctx.into(),
+                                });
+                                subst.insert(n.clone(), Ty::ConstVal(0));
+                            }
                         }
                         // A parameter no argument fixed becomes an inference variable: a later
                         // use may still determine it (Doc 5 rule 4/6); if not, it is reported.
@@ -2686,6 +2980,7 @@ impl TypeChecker {
             },
             Ty::Array(i) => Ty::Array(Box::new(self.zonk(i))),
             Ty::Fixed(i, n) => Ty::Fixed(Box::new(self.zonk(i)), *n),
+            Ty::SymFixed(i, e) => Ty::SymFixed(Box::new(self.zonk(i)), e.clone()),
             Ty::Tuple(v) => Ty::Tuple(v.iter().map(|x| self.zonk(x)).collect()),
             Ty::Ref(m, i) => Ty::Ref(*m, Box::new(self.zonk(i))),
             Ty::OptionTy(i) => Ty::OptionTy(Box::new(self.zonk(i))),
@@ -2696,7 +2991,7 @@ impl TypeChecker {
                 lookup_assoc(&nb, n).unwrap_or_else(|| Ty::Assoc(Box::new(nb), n.clone()))
             }
             Ty::Generic(n, args) => Ty::Generic(n.clone(), args.iter().map(|a| match a {
-                GenericArg::Type(x) => GenericArg::Type(self.zonk(x)),
+                GenericArg::Type(x) => ty_garg(self.zonk(x)),
                 c => c.clone(),
             }).collect()),
             other => other.clone(),
@@ -2724,6 +3019,7 @@ impl TypeChecker {
             }
             (Ty::Array(x), Ty::Array(y)) | (Ty::OptionTy(x), Ty::OptionTy(y)) => self.unify_ty(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify_ty(x, y),
+            (Ty::SymFixed(x, e1), Ty::SymFixed(y, e2)) if e1 == e2 => self.unify_ty(x, y),
             (Ty::Ref(m1, x), Ty::Ref(m2, y)) if m1 == m2 => self.unify_ty(x, y),
             (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).all(|(x, y)| self.unify_ty(x, y)),
             (Ty::ResultTy(o1, e1), Ty::ResultTy(o2, e2)) => self.unify_ty(o1, o2) && self.unify_ty(e1, e2),
@@ -2731,7 +3027,7 @@ impl TypeChecker {
                 a1.iter().zip(a2.iter()).all(|(x, y)| match (x, y) {
                     (GenericArg::Type(x), GenericArg::Type(y)) => self.unify_ty(x, y),
                     (GenericArg::Const(x), GenericArg::Const(y)) => x == y,
-                    _ => false,
+                    (GenericArg::Type(x), GenericArg::Const(y)) | (GenericArg::Const(y), GenericArg::Type(x)) => self.unify_ty(x, &Ty::ConstVal(*y)),
                 })
             }
             _ => false,
@@ -3000,8 +3296,7 @@ impl TypeChecker {
         // Phase 11b-2 (Doc 5 rules 3/4/6): with no matching annotation, infer
         // the type arguments of a generic struct from its field values.
         let expected_matches = matches!(expected, Some(Ty::Generic(en, ea)) if en == name && ea.len() == shape.generics.len());
-        let only_type_params = shape.generics.iter().all(|g| matches!(g, GenericParam::Type { .. }));
-        if !shape.generics.is_empty() && !expected_matches && only_type_params {
+        if !shape.generics.is_empty() && !expected_matches {
             let mut s2: HashMap<String, Ty> = HashMap::new();
             let mut provided = std::collections::HashSet::new();
             for (fname, fval) in fields {
@@ -3024,13 +3319,19 @@ impl TypeChecker {
             }
             let mut targs = Vec::new();
             for g in &shape.generics {
-                if let GenericParam::Type { name: gn, .. } = g {
-                    match s2.get(gn) {
-                        Some(t) => targs.push(GenericArg::Type(t.clone())),
-                        None => {
-                            let v = self.fresh_var(format!("cannot infer type parameter `{}` of `{}`; add a type annotation (Document 5 rule 6)", gn, name), ctx);
-                            targs.push(GenericArg::Type(v));
-                        }
+                let (gn, is_const) = match g {
+                    GenericParam::Type { name: gn, .. } => (gn, false),
+                    GenericParam::Const { name: gn, .. } => (gn, true),
+                };
+                match s2.get(gn) {
+                    Some(t) => targs.push(ty_garg(t.clone())),
+                    None if is_const => {
+                        self.errors.push(TypeError { message: format!("cannot infer const generic parameter `{}` of `{}`; add a type annotation such as `{}<.., 4>` (Document 5 rule 6)", gn, name, name), context: ctx.into() });
+                        targs.push(GenericArg::Const(0));
+                    }
+                    None => {
+                        let v = self.fresh_var(format!("cannot infer type parameter `{}` of `{}`; add a type annotation (Document 5 rule 6)", gn, name), ctx);
+                        targs.push(GenericArg::Type(v));
                     }
                 }
             }
@@ -3039,11 +3340,7 @@ impl TypeChecker {
         let (subst, result_ty) = if !shape.generics.is_empty() {
             match expected {
                 Some(Ty::Generic(en, eargs)) if en == name && eargs.len() == shape.generics.len() => {
-                    let subst: HashMap<String, Ty> = shape.generics.iter().zip(eargs.iter())
-                        .filter_map(|(param, arg)| match (param, arg) {
-                            (GenericParam::Type { name, .. }, GenericArg::Type(t)) => Some((name.clone(), t.clone())),
-                            _ => None,
-                        }).collect();
+                    let subst: HashMap<String, Ty> = generic_subst(&shape.generics, eargs);
                     (subst, Ty::Generic(name.to_string(), eargs.clone()))
                 }
                 _ => (HashMap::new(), Ty::Named(name.to_string())),
@@ -3052,8 +3349,18 @@ impl TypeChecker {
             (HashMap::new(), Ty::Named(name.to_string()))
         };
 
+        // A field whose length depends on a const parameter (`data: [T; ROWS * COLS]`) is
+        // checked here for its element type only; the exact length is verified on the
+        // instantiated copy, where the length is a number (Doc 8 §8).
         let declared: HashMap<String, Ty> = shape.fields.iter()
-            .map(|(n, t)| (n.clone(), substitute_type_params(t, &subst)))
+            .map(|(n, t)| {
+                let s = substitute_type_params(t, &subst);
+                let s = match (t, s) {
+                    (Ty::SymFixed(..), Ty::Fixed(e, _)) => Ty::Array(e),
+                    (_, s) => s,
+                };
+                (n.clone(), s)
+            })
             .collect();
         let mut provided = std::collections::HashSet::new();
         for (fname, fval) in fields {
@@ -3710,7 +4017,7 @@ impl TypeChecker {
         for (seg, targs) in gens {
             if *seg == 0 {
                 for (ta, t) in imp.target_args.iter().zip(targs.iter()) {
-                    unify_infer(ta, &resolve_type(t), &mut subst);
+                    unify_infer(ta, &resolve_targ(t), &mut subst);
                 }
             }
         }
@@ -3734,7 +4041,7 @@ impl TypeChecker {
             }
         }
         let ret = substitute_type_params(&m.ret, &subst);
-        let targs: Vec<GenericArg> = imp.target_args.iter().map(|t| GenericArg::Type(substitute_type_params(t, &subst))).collect();
+        let targs: Vec<GenericArg> = imp.target_args.iter().map(|t| ty_garg(substitute_type_params(t, &subst))).collect();
         let full = Ty::Generic(tn.to_string(), targs);
         if !self.mentions_tparam(&full) {
             self.type_paths.insert(callee as *const Expr as usize, full);
@@ -3824,11 +4131,7 @@ impl TypeChecker {
         }
         if let Ty::Generic(n, args) = base {
             if let Some(shape) = self.structs.get(n).cloned() {
-                let subst: HashMap<String, Ty> = shape.generics.iter().zip(args.iter())
-                    .filter_map(|(param, arg)| match (param, arg) {
-                        (GenericParam::Type { name, .. }, GenericArg::Type(t)) => Some((name.clone(), t.clone())),
-                        _ => None,
-                    }).collect();
+                let subst: HashMap<String, Ty> = generic_subst(&shape.generics, args);
                 for (fname, fty) in &shape.fields {
                     if fname == field {
                         return substitute_type_params(fty, &subst);

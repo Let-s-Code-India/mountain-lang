@@ -1,0 +1,17 @@
+const SIZE: usize = 4;
+@copy
+struct P { x: i32 }
+fn main() {
+    let a: [i32; 4] = [7; 4];
+    let b: [i32; 4] = [0; SIZE];
+    let c: [i32; 0] = [1; 0];
+    let d: [f64; 2 * 3] = [1.5; 2 * 3];
+    let p: [P; 2] = [P { x: 3 }; 2];
+    println(a[3]);
+    println(b[0]);
+    println(d[5]);
+    println(p[1].x);
+    let mut t = 0;
+    for i in 0..4 { t += a[i]; }
+    println(t);
+}

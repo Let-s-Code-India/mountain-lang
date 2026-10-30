@@ -1,0 +1,26 @@
+struct Buf<T, const N: usize> {
+    data: [T; N],
+    len: usize,
+}
+impl<T, const N: usize> Buf<T, N> {
+    fn capacity(borrow self) -> usize { return N; }
+    fn count(borrow self) -> usize { return self.len; }
+}
+struct Grid<const R: usize, const C: usize> {
+    cells: [i32; R * C],
+}
+impl<const R: usize, const C: usize> Grid<R, C> {
+    fn size(borrow self) -> usize { return R * C; }
+    fn first(borrow self) -> i32 { return self.cells[0]; }
+}
+fn main() {
+    let b = Buf { data: [0; 4], len: 2 };
+    println(b.capacity());
+    println(b.count());
+    let c: Buf<f64, 2> = Buf { data: [1.5, 2.5], len: 1 };
+    println(c.capacity());
+    println(c.data[1]);
+    let g: Grid<2, 3> = Grid { cells: [9, 1, 2, 3, 4, 5] };
+    println(g.size());
+    println(g.first());
+}

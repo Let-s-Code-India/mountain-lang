@@ -549,6 +549,10 @@ pub enum Expr {
     Paren(Box<Expr>),
     Tuple(Vec<Expr>),
     Array(Vec<Expr>),
+    /// Phase 11b M4: the repeat expression `[x; N]` (Doc 23 §17.10 as scheduled by the
+    /// manager; Doc 8 §8). `N` must be a compile-time constant (literal, `const`, or a const
+    /// generic parameter and arithmetic of those); the element must be `copy`.
+    ArrayRepeat(Box<Expr>, Box<Expr>),
     StructLit { name: String, fields: Vec<(String, Expr)>, spread: Option<Box<Expr>> },
     If(Box<IfExpr>),
     Match(Box<MatchExpr>),

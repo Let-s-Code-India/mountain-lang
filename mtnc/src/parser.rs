@@ -1570,6 +1570,11 @@ impl Parser {
             let mut items = Vec::new();
             if !self.check_delim(Delim::RBracket) {
                 items.push(self.parse_expr(0)?);
+                if self.eat_delim(Delim::Semi) {
+                    let len = self.parse_expr(0)?;
+                    self.expect_delim(Delim::RBracket)?;
+                    return Ok(Expr::ArrayRepeat(Box::new(items.pop().unwrap()), Box::new(len)));
+                }
                 while self.eat_delim(Delim::Comma) {
                     if self.check_delim(Delim::RBracket) { break; }
                     items.push(self.parse_expr(0)?);

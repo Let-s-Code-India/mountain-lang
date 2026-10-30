@@ -1,0 +1,23 @@
+struct Buf<T, const N: usize> { data: [T; N], len: usize }
+impl<T, const N: usize> Buf<T, N> {
+    fn new(x: T) -> Buf<T, N> { return Buf { data: [x; N], len: 0 }; }
+    fn cap(borrow self) -> usize { return N; }
+}
+fn identity<const N: usize>() -> [i32; N] { return [0; N]; }
+fn outer<const N: usize>() -> [i32; N] { return identity::<N>(); }
+fn outer2<const N: usize>() -> usize {
+    let a: [i32; N] = identity();
+    return N;
+}
+fn main() {
+    let b: Buf<i32, 4> = Buf::new(7);
+    println(b.cap());
+    println(b.data[3]);
+    let c = Buf::<f64, 2>::new(1.5);
+    println(c.cap());
+    let o: [i32; 3] = outer();
+    println(o[1]);
+    println(outer2::<6>());
+    let e = identity::<0>();
+    println(1);
+}

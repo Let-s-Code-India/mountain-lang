@@ -13,7 +13,7 @@
 
 use crate::ast::*;
 use crate::desugar::{expr_children_mut, ty_to_type, ChildMut};
-use crate::types::{resolve_type, GenericArg, Ty, TypeChecker};
+use crate::types::{eval_const_int, garg_ty, resolve_type, GenericArg, Ty, TypeChecker};
 use std::collections::{HashMap, HashSet};
 
 /// Maximum number of instantiation rounds (nesting depth of
@@ -42,7 +42,12 @@ fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
                 subst_type(a, m);
             }
         }
-        Type::Array(i, _) => subst_type(i, m),
+        Type::Array(i, size) => {
+            subst_type(i, m);
+            if let Some(s) = size {
+                subst_expr(s, m);
+            }
+        }
         Type::Assoc(b, _) => subst_type(b, m),
         Type::Tuple(v) => v.iter_mut().for_each(|x| subst_type(x, m)),
         Type::Ref { inner, .. } => subst_type(inner, m),
@@ -85,6 +90,13 @@ fn subst_block(b: &mut Block, m: &HashMap<String, Type>) {
 
 fn subst_expr(e: &mut Expr, m: &HashMap<String, Type>) {
     match e {
+        // A const generic parameter used as a value (`N`, `[0; N]`) becomes its literal.
+        Expr::Ident(n) => {
+            if let Some(Type::ConstArg(c)) = m.get(n.as_str()) {
+                *e = (**c).clone();
+            }
+            return;
+        }
         Expr::Cast { ty, .. } => subst_type(ty, m),
         Expr::Closure(c) => {
             for (_, t) in c.params.iter_mut() {
@@ -369,17 +381,16 @@ fn collect_generic_tys(t: &Ty, bases: &HashSet<String>, out: &mut Vec<(String, V
     match t {
         Ty::Generic(n, args) => {
             let mut tys = Vec::new();
-            let mut ok = true;
             for a in args {
                 match a {
                     GenericArg::Type(x) => {
                         collect_generic_tys(x, bases, out);
                         tys.push(x.clone());
                     }
-                    GenericArg::Const(_) => ok = false,
+                    GenericArg::Const(v) => tys.push(Ty::ConstVal(*v)),
                 }
             }
-            if ok && bases.contains(n) {
+            if bases.contains(n) {
                 out.push((n.clone(), tys));
             }
         }
@@ -393,8 +404,9 @@ fn collect_generic_tys(t: &Ty, bases: &HashSet<String>, out: &mut Vec<(String, V
     }
 }
 
+/// Names of ALL generic parameters (type and const), in declaration order.
 fn generic_param_names(g: &GenericParams) -> Vec<String> {
-    g.0.iter().filter_map(|p| if let GenericParam::Type { name, .. } = p { Some(name.clone()) } else { None }).collect()
+    g.0.iter().map(|p| match p { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() }).collect()
 }
 
 /// One monomorphization round. Returns `Ok(true)` if the program changed
@@ -541,6 +553,13 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
                         Type::Named(g, a) if a.is_empty() && gnames.contains(g) => {
                             m.insert(g.clone(), at.clone());
                         }
+                        Type::ConstArg(ce) => {
+                            // `impl C for Buf<i32, 4>`: applies only to the instance with that length.
+                            let v = eval_const_int(ce, &HashMap::new());
+                            if v.map(|v| Ty::ConstVal(v as i64)) != Some(ty.clone()) {
+                                matches = false;
+                            }
+                        }
                         _ => {
                             // A concrete argument (`impl C for Stack<i32>`): applies only to that instance.
                             let rt = resolve_type(ta);
@@ -607,7 +626,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         // ---- expression-level renames (struct literals, `Type::f(..)` calls)
         for (addr, t) in tc.expr_types.iter() {
             if let Ty::Generic(n, args) = t {
-                let tys: Vec<Ty> = args.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                let tys: Vec<Ty> = args.iter().map(garg_ty).collect();
                 if tys.len() == args.len() && bases.contains(n) {
                     let mg = mangle(n, &tys);
                     if made.contains(&mg) {
@@ -619,7 +638,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         }
         for (addr, t) in tc.type_paths.iter() {
             if let Ty::Generic(n, args) = t {
-                let tys: Vec<Ty> = args.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                let tys: Vec<Ty> = args.iter().map(garg_ty).collect();
                 let mg = mangle(n, &tys);
                 if made.contains(&mg) {
                     rw.type_calls.insert(*addr, mg);
@@ -645,7 +664,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
             if let Type::Named(n, args) = t {
                 if !args.is_empty() && bases.contains(n) {
                     if let Ty::Generic(gn, gargs) = resolve_type(t) {
-                        let tys: Vec<Ty> = gargs.iter().filter_map(|a| if let GenericArg::Type(x) = a { Some(x.clone()) } else { None }).collect();
+                        let tys: Vec<Ty> = gargs.iter().map(garg_ty).collect();
                         if tys.len() == gargs.len() {
                             let mg = mangle(&gn, &tys);
                             if made.contains(&mg) {

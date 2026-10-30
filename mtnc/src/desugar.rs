@@ -137,6 +137,10 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
                 out.push(ChildMut::E(x));
             }
         }
+        Expr::ArrayRepeat(x, n) => {
+            out.push(ChildMut::E(x));
+            out.push(ChildMut::E(n));
+        }
         Expr::StructLit { fields, spread, .. } => {
             for (_, x) in fields.iter_mut() {
                 out.push(ChildMut::E(x));
@@ -221,6 +225,10 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
             for x in v.iter() {
                 out.push(Child::E(x));
             }
+        }
+        Expr::ArrayRepeat(x, n) => {
+            out.push(Child::E(x));
+            out.push(Child::E(n));
         }
         Expr::StructLit { fields, spread, .. } => {
             for (_, x) in fields.iter() {
@@ -566,6 +574,7 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
         Ty::Ref(m, i) => Type::Ref { lifetime: None, mutable: *m, inner: Box::new(ty_to_type(i)?) },
         Ty::Array(i) => Type::Array(Box::new(ty_to_type(i)?), None),
         Ty::Fixed(i, n) => Type::Array(Box::new(ty_to_type(i)?), Some(Box::new(Expr::Literal(Literal::Int(n.to_string()))))),
+        Ty::ConstVal(n) => Type::ConstArg(Box::new(Expr::Literal(Literal::Int(n.to_string())))),
         _ => return None,
     })
 }

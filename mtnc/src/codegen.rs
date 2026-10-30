@@ -364,7 +364,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
             Ty::Array(_) => return unsupported("growable `[T]` arrays", 11),
             Ty::Fn(..) => return unsupported("function values / closures", 12),
-            Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) => return unsupported("generics (monomorphization)", 11),
+            Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
             Ty::Null => return unsupported("`null`", 11),
         })

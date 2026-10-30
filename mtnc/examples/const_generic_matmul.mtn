@@ -1,0 +1,31 @@
+struct Matrix<T, const R: usize, const C: usize> {
+    data: [T; R * C],
+}
+fn matmul<const R: usize, const K: usize, const C: usize>(a: Matrix<f64, R, K>, b: Matrix<f64, K, C>) -> Matrix<f64, R, C> {
+    let mut out: [f64; R * C] = [0.0; R * C];
+    let mut i: usize = 0;
+    while i < R {
+        let mut j: usize = 0;
+        while j < C {
+            let mut s = 0.0;
+            let mut k: usize = 0;
+            while k < K {
+                s += a.data[i * K + k] * b.data[k * C + j];
+                k += 1;
+            }
+            out[i * C + j] = s;
+            j += 1;
+        }
+        i += 1;
+    }
+    return Matrix { data: out };
+}
+fn main() {
+    let a: Matrix<f64, 2, 3> = Matrix { data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] };
+    let b: Matrix<f64, 3, 2> = Matrix { data: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0] };
+    let c = matmul(a, b);
+    println(c.data[0]);
+    println(c.data[1]);
+    println(c.data[2]);
+    println(c.data[3]);
+}

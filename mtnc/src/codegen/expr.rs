@@ -292,6 +292,39 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 Ok(agg.into())
             }
+            Expr::ArrayRepeat(elem, _) => {
+                // `[x; N]` (Doc 8 §8): `x` is evaluated once and copied into every slot.
+                let ty = self.ty_of(e)?;
+                let Ty::Fixed(et, n) = &ty else {
+                    return Err(CgErr("`[x; N]` length is not a compile-time constant".into()));
+                };
+                let et = (**et).clone();
+                let n = *n;
+                let v = self.expr_as(elem, &et)?;
+                let lt = self.llty(&ty)?;
+                let arr = self.alloca(lt, "repeat")?;
+                let ut = self.usize_ty();
+                let zero = ut.const_zero();
+                let idx = self.alloca(ut.into(), "ri")?;
+                self.builder.build_store(idx, zero)?;
+                let head = self.new_block("rep.head");
+                let body = self.new_block("rep.body");
+                let done = self.new_block("rep.done");
+                self.builder.build_unconditional_branch(head)?;
+                self.builder.position_at_end(head);
+                let i = self.builder.build_load(ut, idx, "i")?.into_int_value();
+                let more = self.builder.build_int_compare(inkwell::IntPredicate::ULT, i, ut.const_int(n, false), "more")?;
+                self.builder.build_conditional_branch(more, body, done)?;
+                self.builder.position_at_end(body);
+                // SAFETY: `i < n`, the array length.
+                let slot = unsafe { self.builder.build_in_bounds_gep(lt, arr, &[zero, i], "slot")? };
+                self.builder.build_store(slot, v)?;
+                let next = self.builder.build_int_add(i, ut.const_int(1, false), "next")?;
+                self.builder.build_store(idx, next)?;
+                self.builder.build_unconditional_branch(head)?;
+                self.builder.position_at_end(done);
+                Ok(self.builder.build_load(lt, arr, "arr")?)
+            }
             Expr::Borrow { expr: inner, .. } => {
                 let ty = self.ty_of(e)?;
                 self.gen_borrow(&ty, inner)

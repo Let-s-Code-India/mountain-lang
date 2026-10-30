@@ -930,6 +930,7 @@ impl<'a> FnChecker<'a> {
                     self.check_expr(it, block, idx);
                 }
             }
+            Expr::ArrayRepeat(x, _) => self.check_expr(x, block, idx),
             Expr::StructLit { fields, spread, .. } => {
                 for (_, v) in fields {
                     self.check_expr(v, block, idx);
@@ -1261,6 +1262,7 @@ fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
         | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Field { expr: e, .. }
         | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } => expr_reads_ident(e, name),
         Expr::Tuple(items) | Expr::Array(items) => items.iter().any(|e| expr_reads_ident(e, name)),
+        Expr::ArrayRepeat(x, n) => expr_reads_ident(x, name) || expr_reads_ident(n, name),
         Expr::StructLit { fields, spread, .. } => {
             fields.iter().any(|(_, v)| expr_reads_ident(v, name))
                 || spread.as_ref().map_or(false, |s| expr_reads_ident(s, name))
