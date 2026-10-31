@@ -127,3 +127,10 @@ fn const_parameter_that_nothing_fixes_is_rejected() {
 fn struct_field_with_wrong_length_for_its_instance_is_rejected() {
     rejected("struct Grid<const R: usize, const C: usize> { cells: [i32; R * C] }\nfn main() { let g: Grid<2, 3> = Grid { cells: [1, 2] }; }\n", "has 2 element(s) but the type requires 6");
 }
+
+#[test]
+fn const_parameter_on_a_generic_enum() {
+    let src = "enum Slot<T, const N: usize> { Full([T; N]), Empty }\nfn main() {\n    let s: Slot<i32, 3> = Slot::Full([4, 5, 6]);\n    match s {\n        Slot::Full(a) => println(a[2]),\n        Slot::Empty => println(0),\n    }\n}\n";
+    let (o, c) = run_src(src);
+    assert_eq!((o.as_str(), c), ("6\n", 0));
+}
