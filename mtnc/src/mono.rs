@@ -29,7 +29,7 @@ pub fn mangle(name: &str, args: &[Ty]) -> String {
     format!("{}${}", name, parts.join("_"))
 }
 
-fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
+pub(crate) fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
     match t {
         Type::Named(n, args) => {
             if args.is_empty() {
@@ -65,7 +65,7 @@ fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
     }
 }
 
-fn subst_block(b: &mut Block, m: &HashMap<String, Type>) {
+pub(crate) fn subst_block(b: &mut Block, m: &HashMap<String, Type>) {
     for s in b.stmts.iter_mut() {
         match s {
             Stmt::Let { ty, value, .. } => {
@@ -131,6 +131,8 @@ struct Rw {
     struct_lits: HashMap<usize, String>,
     /// match scrutinee identity -> (generic enum base, mangled instance)
     scrut: HashMap<usize, (String, String)>,
+    /// `.into()` call -> `Target::from(x)` (None: identity conversion)
+    intos: HashMap<usize, Option<String>>,
 }
 
 fn rewrite_block(b: &mut Block, calls: &Rw) {
@@ -168,6 +170,18 @@ fn rename_pattern(p: &mut Pattern, base: &str, mg: &str) {
 
 fn rewrite_expr(e: &mut Expr, calls: &Rw) {
     let self_key = e as *const Expr as usize;
+    if let Expr::MethodCall { receiver, .. } = e {
+        if let Some(target) = calls.intos.get(&self_key) {
+            let recv = std::mem::replace(&mut **receiver, Expr::Tuple(Vec::new()));
+            *e = match target {
+                None => recv,
+                Some(tn) => Expr::Call {
+                    callee: Box::new(Expr::Path(vec![tn.clone(), "from".to_string()])),
+                    args: vec![Arg { name: None, value: recv }],
+                },
+            };
+        }
+    }
     if let Expr::Path(p) = e {
         if p.len() == 2 {
             if let Some(mg) = calls.type_calls.get(&self_key) {
@@ -648,6 +662,10 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         }
     }
 
+    for (addr, target) in tc.into_calls.iter() {
+        rw.intos.insert(*addr, target.clone());
+        changed = true;
+    }
     for (addr, inst) in tc.inst_names.iter() {
         rw.struct_lits.insert(*addr, inst.clone());
         rw.type_calls.insert(*addr, inst.clone());

@@ -146,8 +146,11 @@ pub struct Codegen<'ctx, 'a> {
     /// (type name, method name) -> function keys, inherent methods first.
     methods: HashMap<(String, String), Vec<String>>,
     consts: HashMap<String, (&'a Expr, Ty)>,
-    /// (target type, source type) -> function key of `impl From<source> for target` (Document 11 §2).
-    from_impls: HashMap<(String, String), String>,
+    /// (type, `Trait<Args>` label, method) -> function key, for impls of generic traits
+    /// (`impl From<Feet> for Meters`, Document 11 §2; `impl Convert<f64> for i32`).
+    trait_impls: HashMap<(String, String, String), String>,
+    /// Which impl of a generic trait each call resolved to (from the type checker).
+    choices: &'a HashMap<usize, String>,
     statics: HashMap<String, (PointerValue<'ctx>, Ty)>,
     const_depth: u32,
     /// The concrete type `Self` stands for while generating an `impl` method.
@@ -242,7 +245,7 @@ fn unescape_str(body: &str) -> Option<Vec<u8>> {
 }
 
 impl<'ctx, 'a> Codegen<'ctx, 'a> {
-    pub fn new(context: &'ctx Context, name: &str, td: TargetData, types: &'a HashMap<usize, Ty>, opts: Options) -> Self {
+    pub fn new(context: &'ctx Context, name: &str, td: TargetData, types: &'a HashMap<usize, Ty>, choices: &'a HashMap<usize, String>, opts: Options) -> Self {
         let module = context.create_module(name);
         module.set_data_layout(&td.get_data_layout());
         Codegen {
@@ -259,7 +262,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             fns: HashMap::new(),
             methods: HashMap::new(),
             consts: HashMap::new(),
-            from_impls: HashMap::new(),
+            trait_impls: HashMap::new(),
+            choices,
             statics: HashMap::new(),
             const_depth: 0,
             cur_self: None,
@@ -681,29 +685,26 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         errors.push("generic `impl` blocks are not yet supported by codegen — Phase 11".into());
                         continue;
                     }
-                    // `impl From<Src> for Target` (Document 11 §2) is the one trait with a type
-                    // argument supported here; other generic traits are monomorphized later (11b-2).
-                    let from_src: Option<Ty> = match &im.trait_ref {
-                        Some(t) if t.name == "From" && t.args.len() == 1 => Some(resolve_type(&t.args[0])),
-                        _ => None,
-                    };
-                    if !im.target.args.is_empty() || (im.trait_ref.as_ref().map(|t| !t.args.is_empty()).unwrap_or(false) && from_src.is_none()) {
-                        errors.push("`impl` of a generic type or generic trait is not yet supported by codegen — Phase 11".into());
+                    if !im.target.args.is_empty() {
+                        errors.push("`impl` of a generic type is not yet supported by codegen — Phase 11".into());
                         continue;
                     }
+                    // An impl of a generic trait is told apart by its trait arguments
+                    // (`Convert<f64>` vs `Convert<bool>`), so each gets its own function keys.
+                    let trait_args: Vec<Ty> = im.trait_ref.as_ref().map(|t| t.args.iter().map(resolve_type).collect()).unwrap_or_default();
                     let target_ty = resolve_type(&Type::Primitive(im.target.name.clone()));
                     let tystr = target_ty.to_string();
                     let trait_name = im.trait_ref.as_ref().map(|t| t.name.clone());
                     for ii in &im.items {
                         let ImplItem::Fn(f) = ii else { continue };
-                        let key = match (&trait_name, &from_src) {
-                            (Some(t), Some(src)) => format!("{}::{}<{}>::{}", tystr, t, src, f.name),
-                            (Some(t), None) => format!("{}::{}::{}", tystr, t, f.name),
-                            _ => format!("{}::{}", tystr, f.name),
+                        let label = trait_name.as_ref().map(|t| crate::types::trait_label(t, &trait_args));
+                        let key = match &label {
+                            Some(l) => format!("{}::{}::{}", tystr, l, f.name),
+                            None => format!("{}::{}", tystr, f.name),
                         };
-                        if let (Some(src), "from") = (&from_src, f.name.as_str()) {
-                            if self.from_impls.insert((tystr.clone(), src.to_string()), key.clone()).is_some() {
-                                errors.push(format!("`impl From<{}> for {}` is defined more than once", src, tystr));
+                        if let Some(l) = &label {
+                            if !trait_args.is_empty() && self.trait_impls.insert((tystr.clone(), l.clone(), f.name.clone()), key.clone()).is_some() {
+                                errors.push(format!("`impl {} for {}` is defined more than once", l, tystr));
                             }
                         }
                         if work.iter().any(|w| w.key == key) {
@@ -723,9 +724,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     // Default method bodies are copied into every implementing `impl`
                     // before type checking (`desugar::inline_default_methods`), so a
                     // trait item itself generates no code (static dispatch only).
-                    if !t.generics.0.is_empty() {
-                        errors.push(format!("generic trait `{}` is not yet supported by codegen — Phase 11", t.name));
-                    }
+                    let _ = t;
                 }
                 ItemKind::Const(c) => {
                     let ty = resolve_type(&c.ty);

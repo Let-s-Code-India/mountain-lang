@@ -265,6 +265,36 @@ pub fn fn_bounds(f: &FnDecl) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// Parameterised bounds of `f` (`T: Into<Meters>`): (parameter, trait, resolved arguments).
+pub fn fn_bound_args(f: &FnDecl, tparams: &[String]) -> Vec<(String, String, Vec<Ty>)> {
+    let mut out = Vec::new();
+    let mut add = |p: &str, bs: &[TraitBound]| {
+        for b in bs {
+            if !b.args.is_empty() {
+                out.push((p.to_string(), b.name.clone(), b.args.iter().map(|a| mark_type_params(resolve_type(a), tparams)).collect()));
+            }
+        }
+    };
+    for g in &f.generics.0 {
+        if let GenericParam::Type { name, bounds } = g {
+            add(name, bounds);
+        }
+    }
+    for wb in &f.where_clause.0 {
+        add(&wb.name, &wb.bounds);
+    }
+    out
+}
+
+/// The label of an impl of a generic trait, e.g. `From<Feet>` / `Convert<f64>` (shared with codegen).
+pub fn trait_label(name: &str, args: &[Ty]) -> String {
+    if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}<{}>", name, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))
+    }
+}
+
 pub fn resolve_type(t: &Type) -> Ty {
     resolve_type_depth(t, 0)
 }
@@ -883,6 +913,8 @@ pub struct TraitShape {
     pub methods: HashMap<String, FnSig>,
     /// Names of the associated types declared by the trait (`type Item;`, Doc 8 §5).
     pub assoc_types: Vec<String>,
+    /// Type parameters of a generic trait (`trait Convert<T>`); signatures mention them as `TypeParam`.
+    pub generics: Vec<String>,
 }
 
 /// One `impl` block's provided methods for a given target type. `Vec`
@@ -916,6 +948,8 @@ pub struct GenericImpl {
     pub generics: Vec<String>,
     pub target_args: Vec<Ty>,
     pub trait_name: Option<String>,
+    /// Arguments of a generic trait (`impl<T> Source<T> for Holder<T>`), marked with `TypeParam`.
+    pub trait_args: Vec<Ty>,
     pub methods: HashMap<String, GMethod>,
 }
 
@@ -982,6 +1016,13 @@ pub struct TypeChecker {
     /// Const generic parameter names of the function being checked (usable as `usize` values
     /// and in array lengths; their value is only known after monomorphization).
     cur_const_params: Vec<String>,
+    /// Arguments of the parameterised bounds of the function being checked (`S: Source<i32>`).
+    cur_bound_args: Vec<(String, String, Vec<Ty>)>,
+    /// Phase 11b M5: which impl of a generic trait a method / associated-function call resolved
+    /// to (call expression address -> `Trait<Args>`); consumed by codegen.
+    pub impl_choice: HashMap<usize, String>,
+    /// `.into()` calls (call address -> target type name; `None` = identity), rewritten by `mono`.
+    pub into_calls: HashMap<usize, Option<String>>,
     /// Structs marked `@copy` (Doc 23 §17.8): the element types `[x; N]` accepts.
     copy_structs: std::collections::HashSet<String>,
     /// Declared bounds of the function being checked (for T-typed arguments).
@@ -1014,6 +1055,9 @@ pub struct FunctionShape {
     /// examples (`T: Comparable`, `T: Serializable + Comparable + Clone`)
     /// never show a parameterized bound, so nothing broader is invented.
     pub bounds: Vec<(String, Vec<String>)>,
+    /// Phase 11b M5: the generic ARGUMENTS of parameterised bounds (`T: Into<Meters>`,
+    /// `T: Convert<f64>`): (type parameter, trait, arguments marked with `TypeParam`).
+    pub bound_args: Vec<(String, String, Vec<Ty>)>,
 }
 
 /// Local variable environment: a stack of scopes (blocks introduce a
@@ -1131,6 +1175,9 @@ impl TypeChecker {
             instances: HashMap::new(),
             cur_tparams: Vec::new(),
             cur_const_params: Vec::new(),
+            cur_bound_args: Vec::new(),
+            impl_choice: HashMap::new(),
+            into_calls: HashMap::new(),
             copy_structs: std::collections::HashSet::new(),
             cur_bounds: Vec::new(),
             generic_impls: HashMap::new(),
@@ -1316,22 +1363,27 @@ impl TypeChecker {
                     .map(|t| mark_type_params(resolve_type(t), &type_param_names))
                     .unwrap_or(Ty::Unit);
                 let bounds = fn_bounds(f);
-                self.functions.insert(f.name.clone(), FunctionShape { params, ret, generics, bounds });
+                let bound_args = fn_bound_args(f, &type_param_names);
+                self.functions.insert(f.name.clone(), FunctionShape { params, ret, generics, bounds, bound_args });
             }
             ItemKind::Trait(t) => {
+                let tgen: Vec<String> = t.generics.0.iter().filter_map(|g| match g {
+                    GenericParam::Type { name, .. } => Some(name.clone()),
+                    GenericParam::Const { .. } => None,
+                }).collect();
                 let methods = t.items.iter().filter_map(|ti| match ti {
                     TraitItem::Fn(f) => {
                         let params = f.params.iter()
                             .filter(|p| p.name != "self")
-                            .map(|p| resolve_type(&p.ty))
+                            .map(|p| mark_type_params(resolve_type(&p.ty), &tgen))
                             .collect();
-                        let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+                        let ret = f.return_type.as_ref().map(|r| mark_type_params(resolve_type(r), &tgen)).unwrap_or(Ty::Unit);
                         Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some() }))
                     }
                     TraitItem::AssocType(_) => None,
                 }).collect();
                 let assoc_types: Vec<String> = t.items.iter().filter_map(|ti| if let TraitItem::AssocType(n) = ti { Some(n.clone()) } else { None }).collect();
-                self.traits.insert(t.name.clone(), TraitShape { methods, assoc_types });
+                self.traits.insert(t.name.clone(), TraitShape { methods, assoc_types, generics: tgen });
             }
             ItemKind::Mod(m) => {
                 for inner in &m.items {
@@ -1383,11 +1435,12 @@ impl TypeChecker {
                     ImplItem::AssocType(..) => None,
                 }).collect();
                 let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
+                let trait_args: Vec<Ty> = impl_decl.trait_ref.as_ref().map(|tr| tr.args.iter().map(|a| conv(a)).collect()).unwrap_or_default();
                 if let Some(tn) = &trait_name {
                     let have_m: std::collections::HashSet<String> = methods.keys().cloned().collect();
                     self.check_impl_completeness(tn, &impl_decl.target.name, &have_m, impl_decl);
                 }
-                self.generic_impls.entry(impl_decl.target.name.clone()).or_default().push(GenericImpl { generics: gnames, target_args, trait_name, methods });
+                self.generic_impls.entry(impl_decl.target.name.clone()).or_default().push(GenericImpl { generics: gnames, target_args, trait_name, trait_args, methods });
                 return;
             }
             let target_name = impl_decl.target.name.clone();
@@ -1471,6 +1524,15 @@ impl TypeChecker {
             let trait_args: Vec<Ty> = impl_decl.trait_ref.as_ref()
                 .map(|tr| tr.args.iter().map(resolve_type).collect::<Vec<Ty>>())
                 .unwrap_or_default();
+            if let Some(tn) = &trait_name {
+                let dup = self.impls_by_type.get(&target_name).map(|v| v.iter().any(|r| r.trait_name.as_deref() == Some(tn.as_str()) && r.trait_args == trait_args)).unwrap_or(false);
+                if dup {
+                    self.errors.push(TypeError {
+                        message: format!("conflicting implementations of `{}` for `{}` (Document 7 §5: a trait is implemented at most once per type and argument list)", trait_label(tn, &trait_args), target_name),
+                        context: format!("impl {} for {}", tn, target_name),
+                    });
+                }
+            }
             self.impls_by_type.entry(target_name).or_default().push(ImplRecord { trait_name, trait_args, methods });
         } else if let ItemKind::Mod(m) = &item.kind {
             for inner in &m.items {
@@ -1586,7 +1648,9 @@ impl TypeChecker {
         let saved = std::mem::replace(&mut self.cur_tparams, tp);
         let saved_c = std::mem::replace(&mut self.cur_const_params, cp);
         let saved_b = std::mem::replace(&mut self.cur_bounds, fn_bounds(f));
+        let saved_ba = std::mem::replace(&mut self.cur_bound_args, fn_bound_args(f, &[]));
         self.check_fn_inner(f, self_ty);
+        self.cur_bound_args = saved_ba;
         self.cur_const_params = saved_c;
         self.cur_tparams = saved;
         self.cur_bounds = saved_b;
@@ -2366,6 +2430,9 @@ impl TypeChecker {
                             }
                         }
                         for (param_name, trait_names) in &shape.bounds {
+                            // `Into<U>` is the built-in blanket trait: it is checked below, through `From`.
+                            let trait_names: Vec<String> = trait_names.iter().filter(|n| !(n.as_str() == "Into" && !self.traits.contains_key("Into"))).cloned().collect();
+                            let trait_names = &trait_names;
                             if let Some(concrete) = subst.get(param_name).map(|c| self.zonk(c)) {
                                 let concrete = &concrete;
                                 if ty_has_infer(concrete) {
@@ -2392,6 +2459,32 @@ impl TypeChecker {
                                         });
                                     }
                                 }
+                            }
+                        }
+                        // Parameterised bounds (`T: Into<Meters>`, `T: Convert<f64>`): the argument
+                        // list must match too (Phase 11b M5).
+                        for (p, tn, bargs) in &shape.bound_args {
+                            let Some(concrete) = subst.get(p).map(|c| self.zonk(c)) else { continue };
+                            let sargs: Vec<Ty> = bargs.iter().map(|a| self.zonk(&substitute_type_params(a, &subst))).collect();
+                            if ty_has_infer(&concrete) || self.mentions_tparam(&concrete) || sargs.iter().any(|a| ty_has_infer(a) || self.mentions_tparam(a)) {
+                                continue;
+                            }
+                            let ok = if tn == "Into" && !self.traits.contains_key("Into") {
+                                sargs.first().map(|u| *u == concrete || self.from_impl_exists(&concrete, u)).unwrap_or(false)
+                            } else {
+                                ty_lookup_name(&concrete)
+                                    .and_then(|k| self.impls_by_type.get(&k))
+                                    .map(|v| v.iter().any(|r| r.trait_name.as_deref() == Some(tn.as_str()) && r.trait_args == sargs))
+                                    .unwrap_or(false)
+                            };
+                            if !ok {
+                                self.errors.push(TypeError {
+                                    message: format!(
+                                        "type `{}` does not satisfy bound `{}` required for generic parameter `{}` of `{}` (Document 8 §2/§3)",
+                                        concrete, trait_label(tn, &sargs), p, name
+                                    ),
+                                    context: ctx.into(),
+                                });
                             }
                         }
                         // A parameter no argument fixed becomes an inference variable: a later
@@ -2427,20 +2520,10 @@ impl TypeChecker {
                         let is_variant = self.enums.get(tn).map(|e| e.variants.iter().any(|(n, _)| n == fname)).unwrap_or(false);
                         if let (Some(type_name), false) = (type_name, is_variant) {
                             // Several impls of one generic trait (`From<A>`, `From<B>` for the same
-                            // type, Document 11 §2): choose the one whose first parameter fits.
-                            let cands: Vec<FnSig> = self
-                                .impls_by_type
-                                .get(&type_name)
-                                .map(|v| v.iter().filter_map(|r| r.methods.get(fname.as_str()).cloned()).collect())
-                                .unwrap_or_default();
-                            if cands.len() > 1 && !args.is_empty() {
-                                let at = self.check_expr(&args[0].value, None, env, ctx);
-                                if let Some(sig) = cands.iter().find(|c| c.params.first() == Some(&at)).cloned() {
-                                    for (i, arg) in args.iter().enumerate().skip(1) {
-                                        self.check_expr(&arg.value, sig.params.get(i), env, ctx);
-                                    }
-                                    return sig.ret;
-                                }
+                            // type, Document 11 §2): the general generic-trait mechanism picks one.
+                            let cands = self.trait_candidates(&type_name, fname);
+                            if !cands.is_empty() && !self.has_inherent(&type_name, fname) {
+                                return self.choose_trait_impl(expr as *const Expr as usize, &type_name, fname, cands, args, expected, env, ctx);
                             }
                             let sig = self.resolve_method(&Ty::Named(type_name), fname);
                             if let Some(sig) = sig {
@@ -2494,6 +2577,20 @@ impl TypeChecker {
 
             Expr::MethodCall { receiver, name, args } => {
                 let recv_ty = strip_refs(self.check_expr(receiver, None, env, ctx));
+                let call_addr = expr as *const Expr as usize;
+                // Phase 11b M5: impls of a generic trait (`impl Convert<f64> for i32`) are
+                // told apart by the call's arguments and expected type.
+                if let Some(key) = ty_lookup_name(&recv_ty) {
+                    let cands = self.trait_candidates(&key, name);
+                    if !cands.is_empty() && !self.has_inherent(&key, name) {
+                        return self.choose_trait_impl(call_addr, &recv_ty.to_string(), name, cands, args, expected, env, ctx);
+                    }
+                }
+                if name == "into" && args.is_empty() {
+                    if let Some(t) = self.check_into(call_addr, &recv_ty, expected, ctx) {
+                        return t;
+                    }
+                }
                 let sig = self.resolve_method(&recv_ty, name);
                 match sig {
                     Some(sig) => {
@@ -3449,6 +3546,130 @@ impl TypeChecker {
         }
     }
 
+    /// Impl records of generic traits (`impl Convert<f64> for i32`) providing method `name` for
+    /// the type registered under `key`: (trait, trait arguments, signature).
+    fn trait_candidates(&self, key: &str, name: &str) -> Vec<(String, Vec<Ty>, FnSig)> {
+        self.impls_by_type
+            .get(key)
+            .map(|v| {
+                v.iter()
+                    .filter(|r| !r.trait_args.is_empty())
+                    .filter_map(|r| Some((r.trait_name.clone()?, r.trait_args.clone(), r.methods.get(name)?.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn has_inherent(&self, key: &str, name: &str) -> bool {
+        self.impls_by_type
+            .get(key)
+            .map(|v| v.iter().any(|r| r.trait_name.is_none() && r.methods.contains_key(name)))
+            .unwrap_or(false)
+    }
+
+    /// Picks the impl of a generic trait a call refers to: by argument types, then by the
+    /// expected result type; zero or several remaining matches are errors (Doc 5 rule 6).
+    #[allow(clippy::too_many_arguments)]
+    fn choose_trait_impl(&mut self, call_addr: usize, ty_name: &str, name: &str, cands: Vec<(String, Vec<Ty>, FnSig)>, args: &[Arg], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let ats: Vec<Ty> = args.iter().map(|a| self.check_expr(&a.value, None, env, ctx)).collect();
+        let fits = |a: &Arg, at: &Ty, p: &Ty| -> bool {
+            at == p
+                || matches!(at, Ty::Infer(_))
+                || matches!(p, Ty::TypeParam(_))
+                || (matches!(a.value, Expr::Literal(Literal::Int(_))) && matches!(p, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize))
+                || (matches!(a.value, Expr::Literal(Literal::Float(_))) && matches!(p, Ty::F32 | Ty::F64))
+        };
+        let mut viable: Vec<usize> = (0..cands.len())
+            .filter(|&i| cands[i].2.params.len() == args.len() && args.iter().zip(ats.iter()).zip(cands[i].2.params.iter()).all(|((a, at), p)| fits(a, at, p)))
+            .collect();
+        if viable.len() > 1 {
+            if let Some(exp) = expected.map(|e| self.zonk(e)) {
+                let by_ret: Vec<usize> = viable.iter().copied().filter(|&i| cands[i].2.ret == exp).collect();
+                if !by_ret.is_empty() {
+                    viable = by_ret;
+                }
+            }
+        }
+        let list = |idx: &[usize]| idx.iter().map(|&i| trait_label(&cands[i].0, &cands[i].1)).collect::<Vec<_>>().join(", ");
+        match viable.len() {
+            1 => {
+                let (tn, targs, sig) = cands[viable[0]].clone();
+                // integer / float literal arguments take the parameter's type
+                for (a, p) in args.iter().zip(sig.params.iter()) {
+                    if matches!(a.value, Expr::Literal(_)) {
+                        self.check_expr(&a.value, Some(p), env, ctx);
+                    }
+                }
+                self.impl_choice.insert(call_addr, trait_label(&tn, &targs));
+                sig.ret
+            }
+            0 => {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "no implementation of `{}` for `{}` provides `{}` for these arguments (available: {}) (Document 7 §4)",
+                        cands[0].0, ty_name, name, list(&(0..cands.len()).collect::<Vec<_>>())
+                    ),
+                    context: ctx.into(),
+                });
+                expected.cloned().unwrap_or(Ty::Unit)
+            }
+            _ => {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "ambiguous call to `{}` on `{}`: it implements {} -- add a type annotation to say which (Document 5 rule 6)",
+                        name, ty_name, list(&viable)
+                    ),
+                    context: ctx.into(),
+                });
+                expected.cloned().unwrap_or(Ty::Unit)
+            }
+        }
+    }
+
+    /// `x.into()` (Document 11 §2): sugar for `Target::from(x)`, with the target taken from the
+    /// expected type. `None` = this is not an `.into()` conversion after all.
+    fn check_into(&mut self, call_addr: usize, recv_ty: &Ty, expected: Option<&Ty>, ctx: &str) -> Option<Ty> {
+        // inside a generic body a value bounded by `Into<..>` converts to whatever is expected
+        if let Ty::Named(n) = recv_ty {
+            if self.cur_tparams.contains(n) {
+                if !self.cur_bounds.iter().any(|(p, bs)| p == n && bs.iter().any(|b| b == "Into")) {
+                    return None;
+                }
+                return Some(expected.cloned().unwrap_or(Ty::Unit));
+            }
+        }
+        if self.has_method_named(recv_ty, "into") {
+            return None;
+        }
+        let target = match expected.map(|e| self.zonk(e)) {
+            Some(t) if !ty_has_infer(&t) && !matches!(t, Ty::Unit) => t,
+            _ => {
+                self.errors.push(TypeError {
+                    message: "cannot infer the target type of `.into()`: annotate the binding or pass it where the type is known (Document 5 rule 6)".into(),
+                    context: ctx.into(),
+                });
+                return Some(Ty::Unit);
+            }
+        };
+        if *recv_ty == target {
+            self.into_calls.insert(call_addr, None);
+            return Some(target);
+        }
+        if !self.from_impl_exists(recv_ty, &target) {
+            self.errors.push(TypeError {
+                message: format!("`.into()` cannot convert `{}` into `{}`: no `impl From<{}> for {}` exists (Document 11 §2)", recv_ty, target, recv_ty, target),
+                context: ctx.into(),
+            });
+            return Some(target);
+        }
+        self.into_calls.insert(call_addr, Some(target.to_string()));
+        Some(target)
+    }
+
+    fn has_method_named(&self, ty: &Ty, name: &str) -> bool {
+        self.resolve_method(ty, name).is_some()
+    }
+
     /// Does `impl From<src> for target` exist (Document 3 Category F;
     /// Document 11 §2)? Identical types always convert (the blanket
     /// `From<T> for T`), handled by the caller.
@@ -3836,8 +4057,7 @@ impl TypeChecker {
         }
         if let Ty::Generic(tn, targs) = ty {
             if let Some(shape) = self.enums.get(tn) {
-                let gn: Vec<String> = shape.generics.iter().filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None }).collect();
-                let subst: HashMap<String, Ty> = gn.into_iter().zip(targs.iter()).filter_map(|(g, a)| if let GenericArg::Type(t) = a { Some((g, t.clone())) } else { None }).collect();
+                let subst: HashMap<String, Ty> = generic_subst(&shape.generics, targs);
                 return shape.variants.iter().find(|(n, _)| n.as_str() == name).map(|(_, tys)| tys.iter().map(|t| substitute_type_params(t, &subst)).collect());
             }
         }
@@ -3945,15 +4165,12 @@ impl TypeChecker {
             for a in args { self.check_expr(&a.value, None, env, ctx); }
             return Ty::Named(en.to_string());
         };
-        let gnames: Vec<String> = shape.generics.iter().filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None }).collect();
+        let gnames: Vec<String> = shape.generics.iter().map(|g| match g { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() }).collect();
+        let const_names: Vec<String> = shape.generics.iter().filter_map(|g| if let GenericParam::Const { name, .. } = g { Some(name.clone()) } else { None }).collect();
         let mut subst: HashMap<String, Ty> = HashMap::new();
         if let Some(Ty::Generic(xn, xa)) = expected {
             if xn == en {
-                for (g, a) in gnames.iter().zip(xa.iter()) {
-                    if let GenericArg::Type(t) = a {
-                        subst.insert(g.clone(), t.clone());
-                    }
-                }
+                subst = generic_subst(&shape.generics, xa);
             }
         }
         for (i, a) in args.iter().enumerate() {
@@ -3968,11 +4185,16 @@ impl TypeChecker {
         }
         for g in &gnames {
             if !subst.contains_key(g) {
+                if const_names.contains(g) {
+                    self.errors.push(TypeError { message: format!("cannot infer const generic parameter `{}` of `{}::{}`; add a type annotation (Document 5 rule 6)", g, en, vn), context: ctx.into() });
+                    subst.insert(g.clone(), Ty::ConstVal(0));
+                    continue;
+                }
                 let v = self.fresh_var(format!("cannot infer type parameter `{}` of `{}::{}`; add a type annotation (Document 5 rule 6)", g, en, vn), ctx);
                 subst.insert(g.clone(), v);
             }
         }
-        let full = Ty::Generic(en.to_string(), gnames.iter().map(|g| GenericArg::Type(subst[g].clone())).collect());
+        let full = Ty::Generic(en.to_string(), gnames.iter().map(|g| ty_garg(subst[g].clone())).collect());
         if !self.mentions_tparam(&full) {
             self.type_paths.insert(callee as *const Expr as usize, full.clone());
         }
@@ -3989,6 +4211,24 @@ impl TypeChecker {
                     has_default_body: true,
                 });
             }
+        }
+        // a default method of the impl's trait that the impl did not override
+        for imp in self.generic_impls.get(gn)? {
+            let Some(tn) = &imp.trait_name else { continue };
+            let Some(shape) = self.traits.get(tn) else { continue };
+            let Some(sig) = shape.methods.get(name) else { continue };
+            if !sig.has_default_body {
+                continue;
+            }
+            let Some(mut subst) = self.impl_subst(imp, gargs) else { continue };
+            let self_ty = Ty::Generic(gn.to_string(), gargs.to_vec());
+            let targs: Vec<Ty> = imp.trait_args.iter().map(|a| substitute_type_params(a, &subst)).collect();
+            for (g, a) in shape.generics.iter().zip(targs.iter()) {
+                subst.insert(g.clone(), a.clone());
+            }
+            subst.insert("Self".to_string(), self_ty);
+            let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &subst);
+            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true });
         }
         None
     }
@@ -4065,6 +4305,15 @@ impl TypeChecker {
                     }
                     for b in bs {
                         if let Some(sig) = self.traits.get(b).and_then(|s| s.methods.get(name)) {
+                            // a parameterised bound (`S: Source<i32>`) fixes the trait's own parameters
+                            let mut self_subst = self_subst.clone();
+                            if let Some(shape) = self.traits.get(b) {
+                                if let Some((_, _, bargs)) = self.cur_bound_args.iter().find(|(bp, bt, _)| bp == n && bt == b) {
+                                    for (g, a) in shape.generics.iter().zip(bargs.iter()) {
+                                        self_subst.insert(g.clone(), a.clone());
+                                    }
+                                }
+                            }
                             let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
                             return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: sig.has_default_body });
                         }
@@ -4097,9 +4346,14 @@ impl TypeChecker {
                         let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), Ty::Named(type_name.clone()))).collect();
                         impls.iter().find_map(|r| {
                             let tn = r.trait_name.as_ref()?;
-                            let sig = self.traits.get(tn)?.methods.get(name)?;
+                            let shape = self.traits.get(tn)?;
+                            let sig = shape.methods.get(name)?;
                             if !sig.has_default_body {
                                 return None;
+                            }
+                            let mut self_subst = self_subst.clone();
+                            for (g, a) in shape.generics.iter().zip(r.trait_args.iter()) {
+                                self_subst.insert(g.clone(), a.clone());
                             }
                             let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
                             Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true })

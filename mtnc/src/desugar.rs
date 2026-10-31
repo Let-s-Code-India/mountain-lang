@@ -848,7 +848,7 @@ pub fn inline_default_methods(program: &mut Program) -> bool {
     use std::collections::HashMap;
     // Traits and impls may be nested in function bodies (Phase 11b-1), so
     // both are collected / patched over the whole item tree.
-    let mut defaults: HashMap<String, Vec<FnDecl>> = HashMap::new();
+    let mut defaults: HashMap<String, (Vec<String>, Vec<FnDecl>)> = HashMap::new();
     crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
         if let ItemKind::Trait(t) = &it.kind {
             let fs: Vec<FnDecl> = t
@@ -859,18 +859,34 @@ pub fn inline_default_methods(program: &mut Program) -> bool {
                     _ => None,
                 })
                 .collect();
-            defaults.insert(t.name.clone(), fs);
+            let gn: Vec<String> = t.generics.0.iter().filter_map(|g| if let GenericParam::Type { name, .. } = g { Some(name.clone()) } else { None }).collect();
+            defaults.insert(t.name.clone(), (gn, fs));
         }
     });
     let mut changed = false;
     crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
         if let ItemKind::Impl(im) = &mut it.kind {
             let Some(tr) = &im.trait_ref else { return };
-            let Some(fs) = defaults.get(&tr.name) else { return };
+            let Some((gn, fs)) = defaults.get(&tr.name) else { return };
+            // a default body of a generic trait mentions the trait's parameters; the impl's
+            // trait arguments take their place
+            let m: HashMap<String, Type> = gn.iter().cloned().zip(tr.args.iter().cloned()).collect();
             for f in fs {
                 let overridden = im.items.iter().any(|ii| matches!(ii, ImplItem::Fn(g) if g.name == f.name));
                 if !overridden {
-                    im.items.push(ImplItem::Fn(f.clone()));
+                    let mut f = f.clone();
+                    if !m.is_empty() {
+                        for p in f.params.iter_mut() {
+                            crate::mono::subst_type(&mut p.ty, &m);
+                        }
+                        if let Some(r) = &mut f.return_type {
+                            crate::mono::subst_type(r, &m);
+                        }
+                        if let Some(b) = &mut f.body {
+                            crate::mono::subst_block(b, &m);
+                        }
+                    }
+                    im.items.push(ImplItem::Fn(f));
                     changed = true;
                 }
             }

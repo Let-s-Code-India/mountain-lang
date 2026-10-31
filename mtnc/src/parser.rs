@@ -114,6 +114,25 @@ impl Parser {
             self.error(format!("expected keyword `{:?}`, found {:?}", kw, self.peek_kind()))
         }
     }
+    /// Consumes the `>` that closes a generic argument/parameter list. A closer that the
+    /// lexer fused with the next character (`>>` in `Option<Option<i32>>`, `>=`, `>>=`) is
+    /// split: one `>` is taken and the remainder stays as the current token.
+    fn expect_gt(&mut self) -> ParseResult<()> {
+        let rest = match self.peek_kind() {
+            TokenKind::Op(Op::Gt) => {
+                self.advance();
+                return Ok(());
+            }
+            TokenKind::Op(Op::Shr) => Op::Gt,
+            TokenKind::Op(Op::GtEq) => Op::Eq,
+            TokenKind::Op(Op::ShrEq) => Op::GtEq,
+            other => return self.error(format!("expected `>`, found {:?}", other)),
+        };
+        let pos = self.pos;
+        self.tokens[pos].kind = TokenKind::Op(rest);
+        Ok(())
+    }
+
     fn expect_op(&mut self, op: Op) -> ParseResult<()> {
         if self.eat_op(op) { Ok(()) } else {
             self.error(format!("expected `{}`, found {:?}", op, self.peek_kind()))
@@ -396,7 +415,7 @@ impl Parser {
             }
             if !self.eat_delim(Delim::Comma) { break; }
         }
-        self.expect_op(Op::Gt)?;
+        self.expect_gt()?;
         Ok(GenericParams(params))
     }
 
@@ -418,7 +437,7 @@ impl Parser {
                 args.push(self.parse_generic_arg()?);
             }
         }
-        self.expect_op(Op::Gt)?;
+        self.expect_gt()?;
         Ok(args)
     }
 
@@ -1027,7 +1046,7 @@ impl Parser {
         if self.eat_kw(Keyword::Option) {
             self.expect_op(Op::Lt)?;
             let inner = self.parse_type()?;
-            self.expect_op(Op::Gt)?;
+            self.expect_gt()?;
             return Ok(Type::Option(Box::new(inner)));
         }
         if self.eat_kw(Keyword::Result) {
@@ -1035,7 +1054,7 @@ impl Parser {
             let ok = self.parse_type()?;
             self.expect_delim(Delim::Comma)?;
             let err = self.parse_type()?;
-            self.expect_op(Op::Gt)?;
+            self.expect_gt()?;
             return Ok(Type::Result(Box::new(ok), Box::new(err)));
         }
         // plain name -- either a primitive (recognized by text, per the
