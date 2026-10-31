@@ -1004,7 +1004,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return unsupported("method calls on `dyn Trait` (dynamic dispatch)", 11);
         }
         let tystr = base.to_string();
-        let Some(key) = self.find_method(&tystr, name) else {
+        let mut found = self.find_method(&tystr, name);
+        if let Some(label) = self.choices.get(&call_addr) {
+            if let Some(k) = self.trait_impls.get(&(tystr.clone(), label.clone(), name.to_string())) {
+                found = Some(k.clone());
+            }
+        }
+        let Some(key) = found else {
             return Err(CgErr(format!("no method named `{}` found for type `{}` (standard-library methods arrive with the prelude in Phase 16)", name, tystr)));
         };
         let Some(kind) = self.fns[&key].self_kind else {
@@ -2181,7 +2187,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             };
             // Document 11 §2: a different error type is converted through a real `impl From<Src> for Target`.
             let converter = if src_err != tgt_err {
-                match self.from_impls.get(&(tgt_err.to_string(), src_err.to_string())).cloned() {
+                match self.trait_impls.get(&(tgt_err.to_string(), crate::types::trait_label("From", std::slice::from_ref(src_err)), "from".to_string())).cloned() {
                     Some(k) => Some(k),
                     None => {
                         return Err(CgErr(format!(
@@ -2281,13 +2287,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         resolve_type(&Type::Primitive(tn.clone())).to_string()
                     };
                     let mut chosen = self.find_method(&tystr, fname);
-                    // several impls of one generic trait (`From<A>`, `From<B>`): pick by the first argument's type
-                    if let Some(cands) = self.methods.get(&(tystr.clone(), fname.clone())).cloned() {
-                        if cands.len() > 1 && !args.is_empty() {
-                            let at = self.ty_of(&args[0].value)?;
-                            if let Some(k) = cands.iter().find(|k| self.fns.get(k.as_str()).map(|i| i.params.first().map(|p| p.ty == at).unwrap_or(false)).unwrap_or(false)) {
-                                chosen = Some(k.clone());
-                            }
+                    // several impls of one generic trait (`From<A>`, `From<B>`): the type
+                    // checker recorded which one this call means
+                    if let Some(label) = self.choices.get(&(whole as *const Expr as usize)) {
+                        if let Some(k) = self.trait_impls.get(&(tystr.clone(), label.clone(), fname.clone())) {
+                            chosen = Some(k.clone());
                         }
                     }
                     if let Some(key) = chosen {
