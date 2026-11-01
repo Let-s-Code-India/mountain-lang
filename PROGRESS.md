@@ -2234,7 +2234,7 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 **What the manager should read in the CI log (11a):** job `build-and-test` as in Phase 10 (CI file unchanged). Expected `test result:` lines: lib 60, borrow_checks 19, closures 10, control_flow 10, **e2e 50**, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, **phase11a 15**, parser_doc24 6, traits_impls 15, types_doc5 26 → **grand total 308, 0 failed, 0 warnings**. Smoke step output: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → `checked 17 file(s), 0 errors`; hello.mtn → `Hello, Mountain!`.
 
 ### Phase 11b-1 — 11a follow-ups, `?` with `From`, guaranteed tail calls, `try` with outer-local mutation
-**Status: 🟡 Implemented; 322 tests pass in the assistant's sandbox (308 earlier + 14 net new e2e), 0 warnings — ⏳ NOT yet confirmed by a real CI run.** (11b-2 = generics, 11b-3 = `unsafe`/raw pointers are separate later deliveries; the manager decided the split after the assistant reported that the front end did not yet support `impl<T>` generics/associated types and that Doc 23/Doc 4 had no raw-pointer grammar.)
+**Status: 🟢 Confirmed by a real CI log (reviewed by the manager): 322 tests passed, 0 failed, 0 warnings.** (11b-2 = generics, 11b-3 = `unsafe`/raw pointers are separate later deliveries; the manager decided the split after the assistant reported that the front end did not yet support `impl<T>` generics/associated types and that Doc 23/Doc 4 had no raw-pointer grammar.)
 
 **What 11b-1 delivers (each with positive tests; examples in `examples/`):**
 1. **Nested items scoped per function** (`src/scope.rs`, run right after parsing, before type checking). A nested item whose name is declared more than once in the program (counting top-level items) is renamed `<enclosing fn path>$<name>` and every reference inside the enclosing function (including inside other nested items) is rewritten; a local variable of the same name shadows it. Names that do not collide are never touched. A nested item is visible in the whole enclosing function body (not just its block); two same-named items in ONE function remain a "defined more than once" error. Example `nested_scope.mtn`.
@@ -2257,7 +2257,54 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 
 **What the manager should read in the CI log (11b-1):** job `build-and-test` (CI file unchanged). Expected `test result:` lines: lib 60, borrow_checks 19, closures 10, control_flow 10, **e2e 64**, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, phase11a 15, parser_doc24 6, traits_impls 15, types_doc5 26 → **grand total 322, 0 failed, 0 warnings**. Smoke: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → `checked 22 file(s), 0 errors`; hello → `Hello, Mountain!`.
 
-## Phases 11b-2 – 25
-**Status: ⚪ Not started**
+### Phase 11b (remaining) — generics, associated types, inference, const generics, generic traits, raw pointers (delivered as M1–M7 in one delivery)
+**Status per milestone (🟢 only where the manager has seen a real CI log):**
+- 11b-1: 🟢 322 tests.
+- M1/M2 (generic functions, structs, enums, impls, bounds, monomorphization): 🟢 341.
+- M3 (associated types, specialised impls) + item 2b (later-use inference): 🟢 357.
+- M4 (const generics, `[x; N]`): 🟢 375; smoke `checked 36 file(s)`.
+- M5 (generic traits, `From`/`Into`): 🟢 387; smoke `checked 38 file(s), 0 errors`.
+- M6 (`unsafe`, raw pointers, `alloc`/`dealloc`): 🟡 implemented, 413 tests pass in the sandbox (4 consecutive full runs), 0 warnings — the first CI run had 2 failures caused by a test-helper bug (below, fixed in checkpoint-M6b); ⏳ NOT yet confirmed by a green CI log.
+- **Phase 11 as a whole stays 🟡 until 11c (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind step, arena benchmark) has a green CI log.**
+
+**What was delivered**
+1. **Generics via AST-level monomorphization** (`src/mono.rs`): generic fns, structs, enums, impls, inline + `where` bounds, turbofish (Doc 23 §17.2), explicit and inferred type arguments. A fixpoint loop in `driver::check_source` (depth 32, cap 4096 instances; infinite instantiation is an error) clones and substitutes per instance (`pick$i32`, `Stack$i32`, `identity$3`, `Buf$f64_2`); codegen never sees generics. Only the first check reports errors on the original program; intermediate re-checks ignore transient errors; the final check reports.
+2. **Associated types** (Doc 8 §5), specialised impls (`impl Trait for Stack<i32>`) as template impls.
+3. **Later-use inference** for generic type parameters (`Ty::Infer`; deferred bound checks in `finalize_inference`).
+4. **Const generics** (Doc 8 §8): `const N: usize` params on fns/structs/enums/impls, inference from argument types, turbofish and expected type, `matmul<const R, K, C>`.
+5. **`[x; N]`** (array repeat): **Doc 23 §17.10 is the authority** (the Project copy of Doc 23 now contains §17.9 and §17.10).
+6. **Generic traits** (`trait Source<T>`), several impls of one trait told apart by trait arguments, parameterised bounds, default methods; **`From<T>` as a general mechanism**, **`Into<U>`/`.into()`** as a built-in blanket over `From`.
+7. **`unsafe` blocks, raw pointers `*const T` / `*mut T`, `alloc`/`dealloc`** (Doc 23 §17.9, Doc 3 Category C, Doc 13 §5): prefix `*`/`&`/`&mut` bind tighter than `as`; deref and `alloc`/`dealloc` only in `unsafe`; `*mut`→`*const` is the only implicit conversion; writes through `*const` rejected; cast table pointer↔pointer, `&T`→`*const T`, `&mut T`→`*mut/*const T`, pointer↔`usize`/`isize`, everything else an error; `null` as a pointer only in `unsafe`; pointer arithmetic, pointer methods and indexing give "not yet supported -- decided with the library that needs it". Codegen: opaque pointers, loads/stores with the pointee type, `ptrtoint`/`inttoptr`; `alloc`/`dealloc` go through ONE internal interface (`__mtn_alloc`/`__mtn_dealloc`: `malloc`, `aligned_alloc` when align > 16, `free`) so the allocator can be swapped later.
+
+**Bugs found and fixed (each at its root)**
+- Parser: `>>` closing nested generics (`Option<Option<i32>>`) did not parse; `expect_gt` now splits `>>`, `>=`, `>>=` (M5).
+- Const parameter on a generic enum lost its const argument in variant/pattern types; fixed, with a test (`const_parameter_on_a_generic_enum`) (M4/M5).
+- Deferred bound check skipped because fresh inference variables were inserted after the bound loop (M3b).
+- Smaller M4 fixes: `[]` against a const-sized struct field, explicit const turbofish (`Buf::<f64,2>::new`), a generic body calling another generic with a bare const param, spurious "expected [f64], found [f64; 20]" for `[x; N]`.
+- **Parallel-test temp-file collision (M6b):** the test helpers in `assoc_types`, `const_generics`, `generic_traits`, `infer`, `mono`, `raw_pointers` derived the temp dir from `process::id()` + `src.len()`. Cargo runs tests as threads of one process, so two tests with equal-length sources shared one `p.mtn` and each printed the other's result (CI: `doc13_alloc_write_read_dealloc`, `rejects_deref_of_non_pointer`). Fixed with a per-file `AtomicUsize` counter in the path; swept: `e2e.rs` already used a counter, no other test writes temp files.
+
+**Flagged interpretations (manager-accepted unless marked)**
+- Generic impl bodies are checked only after instantiation (Doc 8 §2).
+- `[]` keeps the eager Phase-3 error; later-use inference applies to generic type parameters only.
+- Phase 5 matmul: `matmul<const R, K, C>` is the general mechanism; the `Matrix * Matrix` special rule stays.
+- A const-param-sized struct field is checked for its element type in round 0; the exact length is checked on the instance.
+- `Into` is built in over `From` and not user-implementable; the orphan rule stays (`impl From<Celsius> for f64` is rejected).
+- Item 2c (a method with its own `<U>` inside a generic impl): "not yet supported by codegen — Phase 11" (Doc 25 §2.5); known gap.
+- Printing `&i32` is Phase 16. An integer-literal `let` binds `i32` at its first use when the variable is unbound; operators/field access on a still-unbound inference variable may reject.
+- **M6, needs sign-off:** `&mut x` / `borrow mut x` of a non-`mut` `let` binding is rejected (Mountain had no such rule; plain assignment to an immutable binding is still accepted — a pre-existing gap). Parameters and pattern bindings are not tracked. Pointer `==` was left as it was (untested). No `unsafe fn`.
+
+**Known limits / gaps**
+- Const expressions inside type arguments (`Matrix<f64, R*C, 1>`) are not parsed; no later-use inference for const params.
+- M3: same-named associated types in two traits implemented for one type (first impl wins); `Stack<i32>::Item` with generic args before `::`; `impl<T> Foo<Vec<T>>` (type parameter nested in an argument).
+- M5: `dyn Trait<T>` unsupported; generic-trait impls with the trait argument nested in another type only partly covered; a parameterised bound on an unresolved inference variable is not deferred.
+- **Pre-existing gap vs Doc 7:** impl method signatures are not compared with the trait's (names only).
+- Raw pointers: no arithmetic, methods or indexing (deliberately, until a library needs them); `&mut` mutability check does not cover parameters.
+
+**Files changed (11b remaining):** new `src/mono.rs`; new tests `tests/{mono,assoc_types,infer,const_generics,generic_traits,raw_pointers}.rs`; new examples `generic_fn, generic_bounds, generic_struct_pair, generic_nested_impls, generic_enum, generic_turbofish_sigs, assoc_container, assoc_generic_impl, infer_later_use, array_repeat, const_generic_fns, const_generic_container, const_generic_matmul, const_generic_assoc, generic_traits, from_into, raw_pointers` (17); changed `src/{ast,parser,types,borrow,scope,desugar,codegen,driver,lib}.rs`, `src/codegen/expr.rs`, `tests/e2e.rs`, `PROGRESS.md`, new `WORKLOG_11B.md`. CI file unchanged.
+
+**What the manager should read in the CI log (11b remaining)** — job `build-and-test`, step "Run tests" (`cargo test`) and the smoke step. Expected `test result:` lines: lib 60, assoc_types 8, borrow_checks 19, closures 10, const_generics 19, control_flow 10, e2e 64, error_handling 57, exhaustiveness 17, generators 5, generic_traits 11, generics 12, infer 8, integration 6, mono 19, parser_doc24 6, phase11a 15, **raw_pointers 26**, traits_impls 15, types_doc5 26 → **grand total 413, 0 failed, 0 warnings** (re-checked: 4 consecutive full runs in the sandbox, no flakiness). Smoke: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → **`checked 39 file(s), 0 errors`**; hello → `Hello, Mountain!`. A real CI log for M6/M7 is what turns M6 and 11b green.
+
+## Phases 11c – 25
+**Status: ⚪ Not started** (11c: drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, `@pack`/`@align`, valgrind step, arena benchmark.)
 
 (Full phase table: see Document 25 §2.3.)

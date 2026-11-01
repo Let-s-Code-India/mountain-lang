@@ -1,8 +1,11 @@
 //! Phase 11b-2: monomorphization tests (Doc 17 §5, Doc 8 §1-2).
 use std::process::Command;
 
+/// Unique per call: tests run in parallel threads of one process, so uniqueness must never come from the source text.
+static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn run(src: &str) -> (String, i32) {
-    let dir = std::env::temp_dir().join(format!("mtn_mono_{}_{}", std::process::id(), src.len()));
+    let dir = std::env::temp_dir().join(format!("mtn_mono_{}_{}", std::process::id(), COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     std::fs::create_dir_all(&dir).unwrap();
     let f = dir.join("p.mtn");
     std::fs::write(&f, src).unwrap();
