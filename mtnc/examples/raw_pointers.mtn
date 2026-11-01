@@ -1,0 +1,44 @@
+// Phase 11b M6 (Document 23 §17.9): raw pointers, `unsafe`, `alloc` / `dealloc`.
+fn bump(p: *mut i32) {
+    unsafe { *p += 1; }
+}
+fn read(p: *const i32) -> i32 {
+    return unsafe { *p };
+}
+fn main() {
+    // Document 3 / 13: pointer to a local, write through it
+    let mut value: i32 = 10;
+    let raw_ptr = &mut value as *mut i32;
+    unsafe {
+        *raw_ptr = 42;
+    }
+    println(value);
+    bump(raw_ptr);
+    println(value);
+
+    // heap block: alloc, write, read, dealloc
+    let raw = unsafe { alloc(4, 4) as *mut i32 };
+    unsafe {
+        *raw = 7;
+        println(*raw + 1);
+        dealloc(raw as *mut u8, 4, 4);
+    }
+
+    // pointer round trip through usize
+    let mut n: i32 = 5;
+    let p = &mut n as *mut i32;
+    let addr = p as usize;
+    let q = addr as *mut i32;
+    unsafe { *q = 99; }
+    println(n);
+
+    // *mut T -> *const T is implicit
+    println(read(p));
+    let c: *const i32 = p;
+    println(unsafe { *c });
+
+    // over-aligned block
+    let big = unsafe { alloc(64, 64) };
+    println((big as usize) % 64);
+    unsafe { dealloc(big, 64, 64); }
+}
