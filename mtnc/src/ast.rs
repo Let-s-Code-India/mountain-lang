@@ -373,6 +373,8 @@ pub enum Type {
     Array(Box<Type>, Option<Box<Expr>>),
     Tuple(Vec<Type>),
     Ref { lifetime: Option<String>, mutable: bool, inner: Box<Type> },
+    /// Phase 11b M6 (Doc 23 §17.9): the raw pointer type `*const T` / `*mut T`.
+    RawPtr { mutable: bool, inner: Box<Type> },
     Dyn(String, Vec<Type>),
     Fn(Vec<Type>, Box<Type>),
     Option(Box<Type>),
@@ -633,6 +635,8 @@ pub enum Expr {
     /// was a real gap in Phase 2 (no unsafe-block parsing existed at
     /// all), closed here since Phase 3's exit criteria needs it.
     Unsafe(Box<Block>),
+    /// Phase 11b M6 (Doc 23 §17.9): prefix `*p`, the dereference of a raw pointer (`ptr_expr`).
+    Deref(Box<Expr>),
 }
 
 // ---------- Database query expression (Document 20 / Doc23 §11) ----------

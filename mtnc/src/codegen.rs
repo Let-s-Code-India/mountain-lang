@@ -329,6 +329,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::F32 => self.context.f32_type().into(),
             Ty::F64 => self.context.f64_type().into(),
             Ty::Bool => self.int_ty(1).into(),
+            Ty::RawPtr(..) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Char => self.int_ty(32).into(),
             Ty::Unit | Ty::Never => self.unit_ty().into(),
             Ty::StringTy => self.str_ty().into(),
@@ -537,6 +538,48 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let _ = b.build_call(exit, &[i32t.const_int(101, false).into()], "");
         let _ = b.build_unreachable();
         f
+    }
+
+    /// The ONE internal allocation interface (Phase 11b M6): `__mtn_alloc(size, align) -> ptr`
+    /// and `__mtn_dealloc(ptr, size, align)`. Today they sit on the system `malloc`/`aligned_alloc`/`free`;
+    /// swapping the allocator later means changing only these two functions.
+    fn alloc_fns(&mut self) -> (FunctionValue<'ctx>, FunctionValue<'ctx>) {
+        if let (Some(a), Some(d)) = (self.module.get_function("__mtn_alloc"), self.module.get_function("__mtn_dealloc")) {
+            return (a, d);
+        }
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let iptr = self.int_ty(self.ptr_bits());
+        let malloc = self.get_extern("malloc", Some(ptr.into()), &[iptr.into()], false);
+        let aligned = self.get_extern("aligned_alloc", Some(ptr.into()), &[iptr.into(), iptr.into()], false);
+        let free = self.get_extern("free", None, &[ptr.into()], false);
+        // __mtn_alloc
+        let fa = self.module.add_function("__mtn_alloc", ptr.fn_type(&[iptr.into(), iptr.into()], false), None);
+        let (entry, small, big) = (self.context.append_basic_block(fa, "entry"), self.context.append_basic_block(fa, "small"), self.context.append_basic_block(fa, "big"));
+        let b = &self.rt_builder;
+        b.position_at_end(entry);
+        let size = fa.get_nth_param(0).unwrap().into_int_value();
+        let align = fa.get_nth_param(1).unwrap().into_int_value();
+        let c = b.build_int_compare(IntPredicate::ULE, align, iptr.const_int(16, false), "").unwrap();
+        let _ = b.build_conditional_branch(c, small, big);
+        b.position_at_end(small);
+        let r = b.build_call(malloc, &[size.into()], "").unwrap();
+        let ValueKind::Basic(rv) = r.try_as_basic_value() else { unreachable!() };
+        let _ = b.build_return(Some(&rv));
+        b.position_at_end(big);
+        // aligned_alloc wants size to be a multiple of the alignment: round up.
+        let am1 = b.build_int_sub(align, iptr.const_int(1, false), "").unwrap();
+        let rounded = b.build_and(b.build_int_add(size, am1, "").unwrap(), b.build_not(am1, "").unwrap(), "").unwrap();
+        let r2 = b.build_call(aligned, &[align.into(), rounded.into()], "").unwrap();
+        let ValueKind::Basic(rv2) = r2.try_as_basic_value() else { unreachable!() };
+        let _ = b.build_return(Some(&rv2));
+        // __mtn_dealloc
+        let fd = self.module.add_function("__mtn_dealloc", self.context.void_type().fn_type(&[ptr.into(), iptr.into(), iptr.into()], false), None);
+        let e2 = self.context.append_basic_block(fd, "entry");
+        let b = &self.rt_builder;
+        b.position_at_end(e2);
+        let _ = b.build_call(free, &[fd.get_nth_param(0).unwrap().into()], "");
+        let _ = b.build_return(None);
+        (fa, fd)
     }
 
     /// Emits a call to the panic routine with a constant message, followed by

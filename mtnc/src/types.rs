@@ -63,6 +63,8 @@ pub enum Ty {
     ConstVal(i64),
     Tuple(Vec<Ty>),
     Ref(bool, Box<Ty>),
+    /// Phase 11b M6 (Doc 23 §17.9): a raw pointer `*const T` (false) / `*mut T` (true).
+    RawPtr(bool, Box<Ty>),
     /// A user-declared struct or enum with no generic parameters, by
     /// name. Phase 3 had no generics at all; as of Phase 5, a
     /// zero-generic-parameter struct/enum still resolves to this
@@ -140,6 +142,7 @@ impl std::fmt::Display for Ty {
             Ty::Unit => write!(f, "()"), Ty::Never => write!(f, "!"),
             Ty::Array(t) => write!(f, "[{}]", t),
             Ty::SymFixed(t, e) => write!(f, "[{}; {}]", t, const_expr_str(e)),
+            Ty::RawPtr(m, t) => write!(f, "*{} {}", if *m { "mut" } else { "const" }, t),
             Ty::ConstVal(n) => write!(f, "{}", n),
             Ty::Fixed(t, n) => write!(f, "[{}; {}]", t, n),
             Ty::Tuple(ts) => write!(f, "({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
@@ -316,7 +319,7 @@ fn ty_mentions_var(t: &Ty, id: u32) -> bool {
 fn collect_unbound(t: &Ty, out: &mut Vec<u32>) {
     match t {
         Ty::Infer(i) => out.push(*i),
-        Ty::Array(i) | Ty::Fixed(i, _) | Ty::SymFixed(i, _) | Ty::Ref(_, i) | Ty::OptionTy(i) | Ty::Assoc(i, _) => collect_unbound(i, out),
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::SymFixed(i, _) | Ty::Ref(_, i) | Ty::RawPtr(_, i) | Ty::OptionTy(i) | Ty::Assoc(i, _) => collect_unbound(i, out),
         Ty::Tuple(v) => v.iter().for_each(|x| collect_unbound(x, out)),
         Ty::ResultTy(a, b) => {
             collect_unbound(a, out);
@@ -643,6 +646,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         }
         Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|x| resolve_type_depth(x, depth)).collect()),
         Type::Ref { mutable, inner, .. } => Ty::Ref(*mutable, Box::new(resolve_type_depth(inner, depth))),
+        Type::RawPtr { mutable, inner } => Ty::RawPtr(*mutable, Box::new(resolve_type_depth(inner, depth))),
         Type::Dyn(n, _) => Ty::DynTrait(n.clone()),
         Type::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| resolve_type_depth(x, depth)).collect(), Box::new(resolve_type_depth(r, depth))),
         Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type_depth(inner, depth))),
@@ -737,6 +741,7 @@ fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         }
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute_type_params(t, subst)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(*m, Box::new(substitute_type_params(inner, subst))),
+        Ty::RawPtr(m, inner) => Ty::RawPtr(*m, Box::new(substitute_type_params(inner, subst))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(substitute_type_params(inner, subst))),
         Ty::ResultTy(o, e) => Ty::ResultTy(
             Box::new(substitute_type_params(o, subst)),
@@ -793,7 +798,7 @@ fn unify_infer(param_ty: &Ty, arg_ty: &Ty, out: &mut HashMap<String, Ty>) {
         (Ty::SymFixed(p, _), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Array(p), Ty::Array(a)) => unify_infer(p, a, out),
         (Ty::Array(p), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Fixed(a, _)) | (Ty::Fixed(p, _), Ty::Array(a)) => unify_infer(p, a, out),
-        (Ty::Ref(_, p), Ty::Ref(_, a)) => unify_infer(p, a, out),
+        (Ty::Ref(_, p), Ty::Ref(_, a)) | (Ty::RawPtr(_, p), Ty::RawPtr(_, a)) => unify_infer(p, a, out),
         (Ty::Tuple(ps), Ty::Tuple(as_)) if ps.len() == as_.len() => {
             for (p, a) in ps.iter().zip(as_.iter()) {
                 unify_infer(p, a, out);
@@ -876,6 +881,7 @@ fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
         Ty::SymFixed(inner, e) => Ty::SymFixed(Box::new(mark_type_params(*inner, param_names)), e),
         Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(|t| mark_type_params(t, param_names)).collect()),
         Ty::Ref(m, inner) => Ty::Ref(m, Box::new(mark_type_params(*inner, param_names))),
+        Ty::RawPtr(m, inner) => Ty::RawPtr(m, Box::new(mark_type_params(*inner, param_names))),
         Ty::OptionTy(inner) => Ty::OptionTy(Box::new(mark_type_params(*inner, param_names))),
         Ty::ResultTy(o, e) => Ty::ResultTy(
             Box::new(mark_type_params(*o, param_names)),
@@ -954,6 +960,8 @@ pub struct GenericImpl {
 }
 
 pub struct TypeChecker {
+    /// Phase 11b M6: how many `unsafe { }` blocks lexically enclose the expression being checked.
+    unsafe_depth: u32,
     structs: HashMap<String, StructShape>,
     enums: HashMap<String, EnumShape>,
     /// Registered `fn` signatures (Document 5 §5: params/return type
@@ -1064,13 +1072,27 @@ pub struct FunctionShape {
 /// new scope; `let` bindings add to the innermost one).
 struct Env {
     scopes: Vec<HashMap<String, Ty>>,
+    /// Phase 11b M6: per scope, the plain `let x = ..` (no `mut`) bindings, so `&mut x` can be rejected.
+    immut: Vec<std::collections::HashSet<String>>,
 }
 impl Env {
-    fn new() -> Self { Env { scopes: vec![HashMap::new()] } }
-    fn push(&mut self) { self.scopes.push(HashMap::new()); }
-    fn pop(&mut self) { self.scopes.pop(); }
+    fn new() -> Self { Env { scopes: vec![HashMap::new()], immut: vec![Default::default()] } }
+    fn push(&mut self) { self.scopes.push(HashMap::new()); self.immut.push(Default::default()); }
+    fn pop(&mut self) { self.scopes.pop(); self.immut.pop(); }
     fn insert(&mut self, name: String, ty: Ty) {
+        self.immut.last_mut().unwrap().remove(&name);
         self.scopes.last_mut().unwrap().insert(name, ty);
+    }
+    fn mark_immut(&mut self, name: &str) {
+        self.immut.last_mut().unwrap().insert(name.to_string());
+    }
+    fn is_immut(&self, name: &str) -> bool {
+        for (sc, im) in self.scopes.iter().zip(self.immut.iter()).rev() {
+            if sc.contains_key(name) {
+                return im.contains(name);
+            }
+        }
+        false
     }
     fn get(&self, name: &str) -> Option<&Ty> {
         for scope in self.scopes.iter().rev() {
@@ -1162,6 +1184,7 @@ struct LoopFrame {
 impl TypeChecker {
     pub fn new() -> Self {
         TypeChecker {
+            unsafe_depth: 0,
             structs: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
@@ -1665,6 +1688,7 @@ impl TypeChecker {
             | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize
             | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Char | Ty::Unit | Ty::Never | Ty::ConstVal(_) => true,
             Ty::Ref(m, _) => !*m,
+            Ty::RawPtr(..) => true,
             Ty::Fixed(i, _) | Ty::SymFixed(i, _) => self.is_copy_ty(i),
             Ty::Tuple(ts) => ts.iter().all(|x| self.is_copy_ty(x)),
             Ty::Named(n) => self.cur_tparams.contains(n) || self.copy_structs.contains(n),
@@ -1775,7 +1799,7 @@ impl TypeChecker {
 
     fn check_stmt(&mut self, stmt: &Stmt, env: &mut Env, ctx: &str) {
         match stmt {
-            Stmt::Let { pattern, ty, value, .. } => {
+            Stmt::Let { pattern, ty, value, mutable } => {
                 let expected = ty.as_ref().map(|t| self.resolve_type_full(t, ctx));
                 let inferred = match value {
                     Some(v) => Some(self.check_expr(v, expected.as_ref(), env, ctx)),
@@ -1803,6 +1827,9 @@ impl TypeChecker {
                 };
                 if let Pattern::Ident(name) = pattern {
                     env.insert(name.clone(), final_ty);
+                    if !*mutable {
+                        env.mark_immut(name);
+                    }
                 } else if let Pattern::Mut(name) = pattern {
                     env.insert(name.clone(), final_ty);
                 } else {
@@ -2228,7 +2255,34 @@ impl TypeChecker {
 
             Expr::Block(b) => self.check_block(b, env, expected, ctx).unwrap_or(Ty::Unit),
 
-            Expr::Unsafe(b) => self.check_block(b, env, expected, ctx).unwrap_or(Ty::Unit),
+            Expr::Unsafe(b) => {
+                self.unsafe_depth += 1;
+                let t = self.check_block(b, env, expected, ctx).unwrap_or(Ty::Unit);
+                self.unsafe_depth -= 1;
+                t
+            }
+
+            Expr::Deref(inner) => {
+                let t = self.check_expr(inner, None, env, ctx);
+                match t {
+                    Ty::RawPtr(_, pointee) => {
+                        if self.unsafe_depth == 0 {
+                            self.errors.push(TypeError {
+                                message: "dereferencing a raw pointer is only allowed inside an `unsafe` block (Document 23 §17.9)".into(),
+                                context: ctx.into(),
+                            });
+                        }
+                        *pointee
+                    }
+                    other => {
+                        self.errors.push(TypeError {
+                            message: format!("cannot dereference a value of type `{}`: prefix `*` needs a raw pointer `*const T` / `*mut T` (Document 23 §17.9)", other),
+                            context: ctx.into(),
+                        });
+                        Ty::Unit
+                    }
+                }
+            }
 
             Expr::Unary { op, expr: inner } => {
                 let t = self.check_expr(inner, expected, env, ctx);
@@ -2259,6 +2313,20 @@ impl TypeChecker {
 
             Expr::Assign { lhs, rhs, .. } => {
                 let lt = self.check_expr(lhs, None, env, ctx);
+                {
+                    let mut l: &Expr = lhs;
+                    while let Expr::Paren(i) = l {
+                        l = i;
+                    }
+                    if let Expr::Deref(p) = l {
+                        if let Some(Ty::RawPtr(false, _)) = self.expr_types.get(&(p.as_ref() as *const Expr as usize)) {
+                            self.errors.push(TypeError {
+                                message: "cannot assign through a `*const T` pointer; only `*mut T` is writable (Document 23 §17.9)".into(),
+                                context: ctx.into(),
+                            });
+                        }
+                    }
+                }
                 self.check_expr(rhs, Some(&lt), env, ctx);
                 Ty::Unit
             }
@@ -2271,8 +2339,10 @@ impl TypeChecker {
                 // detail beyond this phase's core-type-system scope),
                 // only that `as` itself always type-checks to its
                 // target type regardless of the source expression's type.
-                self.check_expr(inner, None, env, ctx);
-                self.resolve_type_full(ty, ctx)
+                let src = self.check_expr(inner, None, env, ctx);
+                let dst = self.resolve_type_full(ty, ctx);
+                self.check_pointer_cast(&src, &dst, ctx);
+                dst
             }
 
             Expr::Range { lo, hi, .. } => {
@@ -2314,6 +2384,13 @@ impl TypeChecker {
                     // §3.1's `&list[1..3]`); `a[i]` is one element.
                     Ty::Array(elem) | Ty::Fixed(elem, _) | Ty::SymFixed(elem, _) if is_range => Ty::Array(elem),
                     Ty::Array(elem) | Ty::Fixed(elem, _) | Ty::SymFixed(elem, _) => *elem,
+                    Ty::RawPtr(..) => {
+                        self.errors.push(TypeError {
+                            message: format!("indexing a raw pointer is {} (not yet supported by codegen -- decided with the library that needs it)", "not supported"),
+                            context: ctx.into(),
+                        });
+                        Ty::Unit
+                    }
                     other => {
                         self.errors.push(TypeError {
                             message: format!("cannot index into type `{}`", other),
@@ -2338,6 +2415,9 @@ impl TypeChecker {
                         }
                         "panic" | "assert" | "ensure" if !self.functions.contains_key(name.as_str()) => {
                             return self.check_error_intrinsic(name, args, expected, env, ctx);
+                        }
+                        "alloc" | "dealloc" if !self.functions.contains_key(name.as_str()) => {
+                            return self.check_alloc_intrinsic(name, args, env, ctx);
                         }
                         _ => {}
                     }
@@ -2628,6 +2708,13 @@ impl TypeChecker {
                             Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n) || self.cur_tparams.contains(n),
                             Ty::Generic(n, _) => self.structs.contains_key(n) || self.enums.contains_key(n),
                             Ty::DynTrait(n) => self.traits.contains_key(n),
+                            Ty::RawPtr(..) => {
+                                self.errors.push(TypeError {
+                                    message: format!("method `{}` on a raw pointer: pointer methods are not yet supported -- decided with the library that needs them (Document 23 §17.9 specifies none)", name),
+                                    context: ctx.into(),
+                                });
+                                false
+                            }
                             _ => false,
                         };
                         if known_base {
@@ -2650,6 +2737,25 @@ impl TypeChecker {
                     _ => None,
                 };
                 let t = self.check_expr(inner, inner_expected.as_ref(), env, ctx);
+                // Phase 11b M6: a mutable borrow `&mut x` / `borrow mut x` needs a `mut` binding.
+                if *mutable {
+                    let mut root: &Expr = inner;
+                    loop {
+                        match root {
+                            Expr::Paren(i) => root = i,
+                            Expr::Field { expr, .. } | Expr::Index { expr, .. } => root = expr,
+                            _ => break,
+                        }
+                    }
+                    if let Expr::Ident(n) = root {
+                        if env.is_immut(n) && !matches!(env.get(n), Some(Ty::Ref(..)) | Some(Ty::RawPtr(..))) {
+                            self.errors.push(TypeError {
+                                message: format!("cannot borrow `{}` as mutable: it is not declared `mut` (declare it with `let mut {}`)", n, n),
+                                context: ctx.into(),
+                            });
+                        }
+                    }
+                }
                 // Phase 11a: borrowing a fixed array where a slice `&[T]` is
                 // expected is the (only) unsizing coercion, the array-to-slice view.
                 if let (Some(Ty::Ref(_, want)), Ty::Fixed(have, _)) = (expected, &t) {
@@ -2875,6 +2981,16 @@ impl TypeChecker {
                 // null; }`, which the language spec does intend to
                 // permit) -- flagged as a known simplification, not
                 // silently treated as complete unsafe-context support.
+                if let Some(t @ Ty::RawPtr(..)) = expected {
+                    if self.unsafe_depth > 0 {
+                        return t.clone();
+                    }
+                    self.errors.push(TypeError {
+                        message: "`null` as a raw pointer is only allowed inside an `unsafe` block (Document 5 §2.6 / Document 23 §17.9)".into(),
+                        context: ctx.into(),
+                    });
+                    return t.clone();
+                }
                 if let Some(t) = expected {
                     if *t != Ty::Null {
                         self.errors.push(TypeError {
@@ -2921,12 +3037,19 @@ impl TypeChecker {
         };
         let rhs_hint = if op == BinaryOp::Coalesce {
             coalesce_hint.as_ref()
-        } else if matches!(lt, Ty::Generic(..)) {
+        } else if matches!(lt, Ty::Generic(..) | Ty::RawPtr(..)) {
             None
         } else {
             Some(&lt)
         };
         let rt = self.check_expr(rhs, rhs_hint, env, ctx);
+        if arith && (matches!(lt, Ty::RawPtr(..)) || matches!(rt, Ty::RawPtr(..))) {
+            self.errors.push(TypeError {
+                message: format!("pointer arithmetic is not yet supported -- decided with the library that needs it (Document 23 §17.9 specifies none)"),
+                context: ctx.into(),
+            });
+            return lt;
+        }
         use BinaryOp::*;
         match op {
             Mul => {
@@ -3080,6 +3203,7 @@ impl TypeChecker {
             Ty::SymFixed(i, e) => Ty::SymFixed(Box::new(self.zonk(i)), e.clone()),
             Ty::Tuple(v) => Ty::Tuple(v.iter().map(|x| self.zonk(x)).collect()),
             Ty::Ref(m, i) => Ty::Ref(*m, Box::new(self.zonk(i))),
+            Ty::RawPtr(m, i) => Ty::RawPtr(*m, Box::new(self.zonk(i))),
             Ty::OptionTy(i) => Ty::OptionTy(Box::new(self.zonk(i))),
             Ty::ResultTy(o, e) => Ty::ResultTy(Box::new(self.zonk(o)), Box::new(self.zonk(e))),
             Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| self.zonk(x)).collect(), Box::new(self.zonk(r))),
@@ -3118,6 +3242,7 @@ impl TypeChecker {
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify_ty(x, y),
             (Ty::SymFixed(x, e1), Ty::SymFixed(y, e2)) if e1 == e2 => self.unify_ty(x, y),
             (Ty::Ref(m1, x), Ty::Ref(m2, y)) if m1 == m2 => self.unify_ty(x, y),
+            (Ty::RawPtr(m1, x), Ty::RawPtr(m2, y)) if m1 == m2 => self.unify_ty(x, y),
             (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).all(|(x, y)| self.unify_ty(x, y)),
             (Ty::ResultTy(o1, e1), Ty::ResultTy(o2, e2)) => self.unify_ty(o1, o2) && self.unify_ty(e1, e2),
             (Ty::Generic(n1, a1), Ty::Generic(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
@@ -3185,6 +3310,63 @@ impl TypeChecker {
         }
     }
 
+    /// `alloc(size, align) -> *mut u8` / `dealloc(ptr, size, align)` (Document 23 §17.9):
+    /// free functions, usable only inside `unsafe`.
+    fn check_alloc_intrinsic(&mut self, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        if self.unsafe_depth == 0 {
+            self.errors.push(TypeError {
+                message: format!("`{}` is only allowed inside an `unsafe` block (Document 23 §17.9)", name),
+                context: ctx.into(),
+            });
+        }
+        let ptr = Ty::RawPtr(true, Box::new(Ty::U8));
+        let want: Vec<Ty> = if name == "alloc" { vec![Ty::Usize, Ty::Usize] } else { vec![ptr.clone(), Ty::Usize, Ty::Usize] };
+        if args.len() != want.len() {
+            self.errors.push(TypeError {
+                message: format!("`{}` expects {} argument(s), found {} (Document 23 §17.9)", name, want.len(), args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+        } else {
+            for (a, w) in args.iter().zip(want.iter()) {
+                self.check_expr(&a.value, Some(w), env, ctx);
+            }
+        }
+        if name == "alloc" { ptr } else { Ty::Unit }
+    }
+
+    /// Doc 23 §17.9 cast table for pointers: pointer<->pointer, reference->raw pointer
+    /// (`&T`->`*const T`, `&mut T`->`*mut T`/`*const T`), pointer<->`usize`/`isize`.
+    /// Everything else involving a raw pointer is an error.
+    fn check_pointer_cast(&mut self, src: &Ty, dst: &Ty, ctx: &str) {
+        let involves = matches!(src, Ty::RawPtr(..)) || matches!(dst, Ty::RawPtr(..));
+        if !involves {
+            return;
+        }
+        let ok = match (src, dst) {
+            (Ty::RawPtr(..), Ty::RawPtr(..)) => true,
+            (Ty::RawPtr(..), Ty::Usize | Ty::Isize) | (Ty::Usize | Ty::Isize, Ty::RawPtr(..)) => true,
+            (Ty::Ref(false, _), Ty::RawPtr(false, _)) => true,
+            (Ty::Ref(true, _), Ty::RawPtr(..)) => true,
+            (Ty::Null, Ty::RawPtr(..)) => self.unsafe_depth > 0,
+            _ => false,
+        };
+        if !ok {
+            let hint = match (src, dst) {
+                (Ty::Ref(false, _), Ty::RawPtr(true, _)) => " (a shared `&T` cannot become `*mut T`)",
+                (Ty::Null, _) => " (`null` as a raw pointer needs `unsafe`)",
+                (_, Ty::RawPtr(..)) => " (integers convert to pointers only via `usize`/`isize`)",
+                _ => " (pointers convert to integers only via `usize`/`isize`)",
+            };
+            self.errors.push(TypeError {
+                message: format!("invalid cast from `{}` to `{}`{} (Document 23 §17.9)", src, dst, hint),
+                context: ctx.into(),
+            });
+        }
+    }
+
     fn check_compatible(&mut self, actual: &Ty, expected: Option<&Ty>, ctx: &str) {
         // `!` (Document 5 §2.5) is the bottom type: an expression that
         // never produces a value (`panic(..)`, `return ..`, `throw ..`)
@@ -3201,6 +3383,12 @@ impl TypeChecker {
             }
             // `borrow mut x` may be passed where a shared `borrow x` is expected.
             if let (Ty::Ref(true, a), Ty::Ref(false, e)) = (actual, exp) {
+                if a == e {
+                    return;
+                }
+            }
+            // Doc 23 §17.9: `*mut T` -> `*const T` is the only implicit pointer conversion.
+            if let (Ty::RawPtr(true, a), Ty::RawPtr(false, e)) = (actual, exp) {
                 if a == e {
                     return;
                 }

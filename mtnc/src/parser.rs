@@ -970,6 +970,18 @@ impl Parser {
             self.expect_delim(Delim::RBracket)?;
             return Ok(Type::Array(Box::new(elem), size));
         }
+        if self.eat_op(Op::Star) {
+            // Doc 23 §17.9: `raw_ptr_type ::= "*" ("const" | "mut") type`
+            let mutable = if self.eat_kw(Keyword::Mut) {
+                true
+            } else if self.eat_kw(Keyword::Const) {
+                false
+            } else {
+                return self.error("expected `const` or `mut` after `*` in a raw pointer type (Document 23 §17.9)");
+            };
+            let inner = self.parse_type()?;
+            return Ok(Type::RawPtr { mutable, inner: Box::new(inner) });
+        }
         if self.eat_op(Op::Amp) {
             // Document 6 §5.1's `&'a str` -- the lifetime token itself
             // is optional (bare `&Type` uses elision, Document 6 §5.2).
@@ -1327,6 +1339,25 @@ impl Parser {
             self.advance();
             let e = self.parse_prefix()?;
             return Ok(Expr::Unary { op: UnaryOp::Neg, expr: Box::new(e) });
+        }
+        // Phase 11b M6 (Doc 23 §17.9): `ptr_expr ::= ("*" | "&" "mut"?) ptr_expr | postfix_expr`.
+        // They are prefix operators here, so `*p + 1` is `(*p) + 1` and `&mut v as *mut i32`
+        // is `(&mut v) as *mut i32` (`as` is applied by the caller's loop afterwards).
+        if self.check_op(Op::Star) {
+            self.advance();
+            let e = self.parse_prefix()?;
+            return Ok(Expr::Deref(Box::new(e)));
+        }
+        if self.check_op(Op::StarStar) {
+            self.advance();
+            let e = self.parse_prefix()?;
+            return Ok(Expr::Deref(Box::new(Expr::Deref(Box::new(e)))));
+        }
+        if self.check_op(Op::Amp) {
+            self.advance();
+            let mutable = self.eat_kw(Keyword::Mut);
+            let e = self.parse_prefix()?;
+            return Ok(Expr::Borrow { mutable, expr: Box::new(e) });
         }
         if self.check_kw(Keyword::Await) {
             self.advance();

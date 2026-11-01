@@ -338,7 +338,7 @@ impl BorrowChecker {
             // (Document 13 §1 describes reference/pointer handles as
             // small, fixed-size stack values) -- copying the reference
             // never copies the underlying owned data it points to.
-            Type::Ref { .. } => true,
+            Type::Ref { .. } | Type::RawPtr { .. } => true,
             Type::Tuple(ts) => ts.iter().all(|t| self.is_type_copy(t)),
             Type::Named(name, _) => *self.struct_copy.get(name).unwrap_or(&false),
             Type::Unit => true,
@@ -924,7 +924,7 @@ impl<'a> FnChecker<'a> {
             Expr::Literal(_) => {}
             Expr::Path(_) | Expr::TurbofishPath { .. } => {}
             Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
-            | Expr::Unary { expr: e, .. } | Expr::Yield(e) => self.check_expr(e, block, idx),
+            | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Deref(e) => self.check_expr(e, block, idx),
             Expr::Tuple(items) | Expr::Array(items) => {
                 for it in items {
                     self.check_expr(it, block, idx);
@@ -1260,7 +1260,7 @@ fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
         Expr::Literal(_) | Expr::Path(_) | Expr::TurbofishPath { .. } => false,
         Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
         | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Field { expr: e, .. }
-        | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } => expr_reads_ident(e, name),
+        | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } | Expr::Deref(e) => expr_reads_ident(e, name),
         Expr::Tuple(items) | Expr::Array(items) => items.iter().any(|e| expr_reads_ident(e, name)),
         Expr::ArrayRepeat(x, n) => expr_reads_ident(x, name) || expr_reads_ident(n, name),
         Expr::StructLit { fields, spread, .. } => {

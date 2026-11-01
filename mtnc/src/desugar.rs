@@ -131,7 +131,7 @@ pub(crate) fn block_children(b: &Block) -> Vec<Child<'_>> {
 pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) => out.push(ChildMut::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) => out.push(ChildMut::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter_mut() {
                 out.push(ChildMut::E(x));
@@ -220,7 +220,7 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
 pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) => out.push(Child::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) => out.push(Child::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter() {
                 out.push(Child::E(x));
@@ -572,6 +572,7 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
         Ty::OptionTy(i) => Type::Option(Box::new(ty_to_type(i)?)),
         Ty::ResultTy(o, e) => Type::Result(Box::new(ty_to_type(o)?), Box::new(ty_to_type(e)?)),
         Ty::Ref(m, i) => Type::Ref { lifetime: None, mutable: *m, inner: Box::new(ty_to_type(i)?) },
+        Ty::RawPtr(m, i) => Type::RawPtr { mutable: *m, inner: Box::new(ty_to_type(i)?) },
         Ty::Array(i) => Type::Array(Box::new(ty_to_type(i)?), None),
         Ty::Fixed(i, n) => Type::Array(Box::new(ty_to_type(i)?), Some(Box::new(Expr::Literal(Literal::Int(n.to_string()))))),
         Ty::ConstVal(n) => Type::ConstArg(Box::new(Expr::Literal(Literal::Int(n.to_string())))),

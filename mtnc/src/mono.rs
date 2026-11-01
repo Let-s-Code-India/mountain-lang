@@ -50,7 +50,7 @@ pub(crate) fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
         }
         Type::Assoc(b, _) => subst_type(b, m),
         Type::Tuple(v) => v.iter_mut().for_each(|x| subst_type(x, m)),
-        Type::Ref { inner, .. } => subst_type(inner, m),
+        Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => subst_type(inner, m),
         Type::Dyn(_, v) => v.iter_mut().for_each(|x| subst_type(x, m)),
         Type::Fn(ps, r) => {
             ps.iter_mut().for_each(|x| subst_type(x, m));
@@ -262,7 +262,7 @@ fn walk_type(t: &mut Type, f: TyFn) {
         Type::Named(_, a) | Type::Tuple(a) | Type::Dyn(_, a) => a.iter_mut().for_each(|x| walk_type(x, f)),
         Type::Array(i, _) | Type::Option(i) => walk_type(i, f),
         Type::Assoc(b, _) => walk_type(b, f),
-        Type::Ref { inner, .. } => walk_type(inner, f),
+        Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => walk_type(inner, f),
         Type::Fn(ps, r) => {
             ps.iter_mut().for_each(|x| walk_type(x, f));
             walk_type(r, f);
@@ -408,7 +408,7 @@ fn collect_generic_tys(t: &Ty, bases: &HashSet<String>, out: &mut Vec<(String, V
                 out.push((n.clone(), tys));
             }
         }
-        Ty::Array(i) | Ty::Fixed(i, _) | Ty::Ref(_, i) | Ty::OptionTy(i) => collect_generic_tys(i, bases, out),
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::Ref(_, i) | Ty::RawPtr(_, i) | Ty::OptionTy(i) => collect_generic_tys(i, bases, out),
         Ty::Tuple(v) => v.iter().for_each(|x| collect_generic_tys(x, bases, out)),
         Ty::ResultTy(a, b) => {
             collect_generic_tys(a, bases, out);
