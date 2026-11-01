@@ -358,6 +358,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let v = self.expr_as(inner, &from)?;
                 self.cast(v, &from, &to)
             }
+            Expr::Deref(inner) => {
+                let ty = self.ty_of(e)?;
+                let pv = self.expr(inner)?.into_pointer_value();
+                self.load(pv, &ty)
+            }
             Expr::Propagate(inner) => self.propagate(inner),
             Expr::Call { callee, args } => self.call(e, callee, args),
             Expr::Return(v) => {
@@ -475,7 +480,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let inner = t.strip_prefix("r\"").and_then(|s| s.strip_suffix('"')).ok_or_else(|| CgErr("malformed raw string literal".into()))?;
                 Ok(self.str_const(inner.as_bytes()))
             }
-            Literal::Null => unsupported("`null`", 11),
+            Literal::Null => match ty {
+                Ty::RawPtr(..) => Ok(self.context.ptr_type(AddressSpace::default()).const_null().into()),
+                _ => unsupported("`null` outside a raw-pointer context", 11),
+            },
             _ => unreachable!(),
         }
     }
@@ -556,7 +564,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         match e {
             Expr::Paren(i) => self.is_place_expr(i),
             Expr::Ident(n) => self.lookup_local(n).is_some() || self.statics.contains_key(n.as_str()),
-            Expr::Field { .. } | Expr::Index { .. } => true,
+            Expr::Field { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
             _ => false,
         }
     }
@@ -614,6 +622,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ok((self.builder.build_struct_gep(st, bp, idx, "fp")?, fty))
             }
             Expr::Index { expr: base, index } => self.index_place(base, index),
+            Expr::Deref(inner) => {
+                let ty = self.ty_of(e)?;
+                let pv = self.expr(inner)?.into_pointer_value();
+                Ok((pv, ty))
+            }
             _ => unsupported("this assignment target", 11),
         }
     }
@@ -1421,6 +1434,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             } else {
                 self.builder.build_int_z_extend(iv, dt, "")?.into()
             });
+        }
+        match (from, to) {
+            (Ty::RawPtr(..), Ty::RawPtr(..)) | (Ty::Ref(..), Ty::RawPtr(..)) => return Ok(v),
+            (Ty::RawPtr(..), t) if matches!(t, Ty::Usize | Ty::Isize) => {
+                return Ok(self.builder.build_ptr_to_int(v.into_pointer_value(), to_lt.into_int_type(), "p2i")?.into());
+            }
+            (f, Ty::RawPtr(..)) if matches!(f, Ty::Usize | Ty::Isize) => {
+                return Ok(self.builder.build_int_to_ptr(v.into_int_value(), to_lt.into_pointer_type(), "i2p")?.into());
+            }
+            _ => {}
         }
         if is_int(from) && is_float(to) {
             let (iv, ft) = (v.into_int_value(), to_lt.into_float_type());
@@ -2234,6 +2257,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     match name.as_str() {
                         "Ok" | "Err" | "Some" => return self.ctor_call(whole, name, args),
                         "panic" => return self.gen_panic(args),
+                        "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
                         "assert" => return self.gen_assert(args),
                         "ensure" => return self.gen_ensure(whole, args),
                         "print" | "println" | "eprint" | "eprintln" => return self.gen_print(name, args),
@@ -2323,6 +2347,25 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let pty = self.variants_of(&ty).unwrap()[idx].1[0].clone();
         let v = self.expr_as(&args[0].value, &pty)?;
         self.make_enum(&ty, idx, vec![v])
+    }
+
+    /// `alloc(size, align)` / `dealloc(ptr, size, align)` lower to the single internal allocation interface.
+    fn gen_alloc_call(&mut self, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+        let (fa, fd) = self.alloc_fns();
+        let us = Ty::Usize;
+        if name == "alloc" {
+            let size = self.expr_as(&args[0].value, &us)?;
+            let align = self.expr_as(&args[1].value, &us)?;
+            let call = self.builder.build_call(fa, &[size.into(), align.into()], "alloc")?;
+            let ValueKind::Basic(r) = call.try_as_basic_value() else { return Err(CgErr("internal: alloc result".into())) };
+            Ok(r)
+        } else {
+            let p = self.expr_as(&args[0].value, &Ty::RawPtr(true, Box::new(Ty::U8)))?;
+            let size = self.expr_as(&args[1].value, &us)?;
+            let align = self.expr_as(&args[2].value, &us)?;
+            self.builder.build_call(fd, &[p.into(), size.into(), align.into()], "")?;
+            Ok(self.unit())
+        }
     }
 
     fn gen_panic(&mut self, args: &[Arg]) -> R<V<'ctx>> {
