@@ -912,6 +912,10 @@ pub struct FnSig {
     /// an `impl`. Always `true` (irrelevant) for `ImplRecord` methods,
     /// which always have a body by construction.
     pub has_default_body: bool,
+    /// Phase 11c C1: the method's OWN type parameters (`fn pick<U>(..)`), marked
+    /// with `TypeParam` inside `params`/`ret`; empty for ordinary methods.
+    pub own: Vec<String>,
+    pub own_bounds: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -944,6 +948,15 @@ pub struct ImplRecord {
 pub struct GMethod {
     pub params: Vec<Ty>,
     pub ret: Ty,
+    /// the method's own type parameters (Phase 11c C1), marked in `params`/`ret`
+    pub own: Vec<String>,
+    pub own_bounds: Vec<(String, Vec<String>)>,
+}
+
+fn generic_names(g: &GenericParams) -> Vec<String> {
+    g.0.iter().map(|g| match g {
+        GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone(),
+    }).collect()
 }
 
 /// A generic `impl` block. Its bodies are checked only after
@@ -1019,6 +1032,8 @@ pub struct TypeChecker {
     /// expression's identity: (generic fn name, concrete type arguments in
     /// declaration order). Consumed by `mono`.
     pub instances: HashMap<usize, (String, Vec<Ty>)>,
+    /// Phase 11c C1: method call address -> (receiver type name, method, its own type arguments)
+    pub method_instances: HashMap<usize, (String, String, Vec<Ty>)>,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
     /// Const generic parameter names of the function being checked (usable as `usize` values
@@ -1070,29 +1085,113 @@ pub struct FunctionShape {
 
 /// Local variable environment: a stack of scopes (blocks introduce a
 /// new scope; `let` bindings add to the innermost one).
+///
+/// Phase 11c (C1): every binding is IMMUTABLE unless marked (`let mut`,
+/// `mut` in a pattern, a `borrow mut` parameter), Document 3 `let`/`mut`.
+/// A `let x: T;` without initialiser is a *deferred* binding: its first
+/// assignment (on a path, at the same loop depth) is the initialisation.
+#[derive(Clone)]
 struct Env {
     scopes: Vec<HashMap<String, Ty>>,
-    /// Phase 11b M6: per scope, the plain `let x = ..` (no `mut`) bindings, so `&mut x` can be rejected.
-    immut: Vec<std::collections::HashSet<String>>,
+    /// per scope, the names declared mutable
+    muts: Vec<std::collections::HashSet<String>>,
+    /// per scope, deferred-initialisation bindings: name -> (loop depth at declaration, maybe-assigned)
+    deferred: Vec<HashMap<String, (usize, bool)>>,
+    /// loops and closure bodies entered since the function started
+    loop_depth: usize,
 }
-impl Env {
-    fn new() -> Self { Env { scopes: vec![HashMap::new()], immut: vec![Default::default()] } }
-    fn push(&mut self) { self.scopes.push(HashMap::new()); self.immut.push(Default::default()); }
-    fn pop(&mut self) { self.scopes.pop(); self.immut.pop(); }
-    fn insert(&mut self, name: String, ty: Ty) {
-        self.immut.last_mut().unwrap().remove(&name);
-        self.scopes.last_mut().unwrap().insert(name, ty);
+fn arms_merged_or(into: &mut DeferredState, other: &DeferredState) {
+    if into.len() != other.len() {
+        return;
     }
-    fn mark_immut(&mut self, name: &str) {
-        self.immut.last_mut().unwrap().insert(name.to_string());
-    }
-    fn is_immut(&self, name: &str) -> bool {
-        for (sc, im) in self.scopes.iter().zip(self.immut.iter()).rev() {
-            if sc.contains_key(name) {
-                return im.contains(name);
+    for (mine, theirs) in into.iter_mut().zip(other.iter()) {
+        for (k, (_, a)) in theirs {
+            if *a {
+                if let Some(e) = mine.get_mut(k) {
+                    e.1 = true;
+                }
             }
         }
-        false
+    }
+}
+type DeferredState = Vec<HashMap<String, (usize, bool)>>;
+impl Env {
+    fn new() -> Self {
+        Env { scopes: vec![HashMap::new()], muts: vec![Default::default()], deferred: vec![Default::default()], loop_depth: 0 }
+    }
+    fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.muts.push(Default::default());
+        self.deferred.push(Default::default());
+    }
+    fn pop(&mut self) {
+        self.scopes.pop();
+        self.muts.pop();
+        self.deferred.pop();
+    }
+    fn insert(&mut self, name: String, ty: Ty) {
+        self.muts.last_mut().unwrap().remove(&name);
+        self.deferred.last_mut().unwrap().remove(&name);
+        self.scopes.last_mut().unwrap().insert(name, ty);
+    }
+    fn mark_mut(&mut self, name: &str) {
+        self.muts.last_mut().unwrap().insert(name.to_string());
+    }
+    fn mark_deferred(&mut self, name: &str) {
+        let d = self.loop_depth;
+        self.deferred.last_mut().unwrap().insert(name.to_string(), (d, false));
+    }
+    fn scope_of(&self, name: &str) -> Option<usize> {
+        (0..self.scopes.len()).rev().find(|i| self.scopes[*i].contains_key(name))
+    }
+    /// An immutable binding (not declared `mut`).
+    fn is_immut(&self, name: &str) -> bool {
+        match self.scope_of(name) {
+            Some(i) => !self.muts[i].contains(name),
+            None => false,
+        }
+    }
+    /// The first assignment of a deferred binding: `Ok(())` and the binding is
+    /// now (maybe) initialised; `Err(in_loop)` otherwise.
+    fn first_assign(&mut self, name: &str) -> Result<(), bool> {
+        let Some(i) = self.scope_of(name) else { return Err(false) };
+        let depth = self.loop_depth;
+        match self.deferred[i].get_mut(name) {
+            Some((d, assigned)) => {
+                if depth > *d {
+                    Err(true)
+                } else if *assigned {
+                    Err(false)
+                } else {
+                    *assigned = true;
+                    Ok(())
+                }
+            }
+            None => Err(false),
+        }
+    }
+    fn deferred_snapshot(&self) -> DeferredState {
+        self.deferred.clone()
+    }
+    fn deferred_restore(&mut self, s: &DeferredState) {
+        if s.len() == self.deferred.len() {
+            self.deferred = s.clone();
+        }
+    }
+    /// `self.deferred |= other` (a binding is maybe-assigned if either path assigned it).
+    fn deferred_merge(&mut self, other: &DeferredState) {
+        if other.len() != self.deferred.len() {
+            return;
+        }
+        for (mine, theirs) in self.deferred.iter_mut().zip(other.iter()) {
+            for (k, (_, a)) in theirs {
+                if *a {
+                    if let Some(e) = mine.get_mut(k) {
+                        e.1 = true;
+                    }
+                }
+            }
+        }
     }
     fn get(&self, name: &str) -> Option<&Ty> {
         for scope in self.scopes.iter().rev() {
@@ -1196,6 +1295,7 @@ impl TypeChecker {
             propagations: Vec::new(),
             expr_types: HashMap::new(),
             instances: HashMap::new(),
+            method_instances: HashMap::new(),
             cur_tparams: Vec::new(),
             cur_const_params: Vec::new(),
             cur_bound_args: Vec::new(),
@@ -1401,7 +1501,7 @@ impl TypeChecker {
                             .map(|p| mark_type_params(resolve_type(&p.ty), &tgen))
                             .collect();
                         let ret = f.return_type.as_ref().map(|r| mark_type_params(resolve_type(r), &tgen)).unwrap_or(Ty::Unit);
-                        Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some() }))
+                        Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some(), own: Vec::new(), own_bounds: Vec::new() }))
                     }
                     TraitItem::AssocType(_) => None,
                 }).collect();
@@ -1440,21 +1540,17 @@ impl TypeChecker {
                     let r = mark_type_params(mark_type_params(resolve_type(ty), &gnames), &["Self".to_string()]);
                     substitute_type_params(&r, &self_subst)
                 };
-                for ii in &impl_decl.items {
-                    if let ImplItem::Fn(f) = ii {
-                        if !f.generics.0.is_empty() {
-                            self.errors.push(TypeError {
-                                message: format!("method `{}` declares its own type parameters inside a generic `impl`; not yet supported by codegen — Phase 11 (Doc 25 §2.5, generic functions/structs/enums); declare it as a free generic function instead", f.name),
-                                context: format!("impl {}", impl_decl.target.name),
-                            });
-                        }
-                    }
-                }
                 let methods: HashMap<String, GMethod> = impl_decl.items.iter().filter_map(|ii| match ii {
-                    ImplItem::Fn(f) => Some((f.name.clone(), GMethod {
-                        params: f.params.iter().filter(|p| p.name != "self").map(|p| arg_ty(p, conv(&p.ty))).collect(),
-                        ret: f.return_type.as_ref().map(|t| conv(t)).unwrap_or(Ty::Unit),
-                    })),
+                    ImplItem::Fn(f) => {
+                        let own = generic_names(&f.generics);
+                        let own_bounds = if own.is_empty() { Vec::new() } else { fn_bounds(f) };
+                        Some((f.name.clone(), GMethod {
+                            params: f.params.iter().filter(|p| p.name != "self").map(|p| arg_ty(p, mark_type_params(conv(&p.ty), &own))).collect(),
+                            ret: f.return_type.as_ref().map(|t| mark_type_params(conv(t), &own)).unwrap_or(Ty::Unit),
+                            own,
+                            own_bounds,
+                        }))
+                    }
                     ImplItem::AssocType(..) => None,
                 }).collect();
                 let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
@@ -1487,12 +1583,14 @@ impl TypeChecker {
 
             let methods: HashMap<String, FnSig> = impl_decl.items.iter().filter_map(|ii| match ii {
                 ImplItem::Fn(f) => {
+                    let own = generic_names(&f.generics);
                     let params = f.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| arg_ty(p, resolve_with_self(&p.ty)))
+                        .map(|p| arg_ty(p, mark_type_params(resolve_with_self(&p.ty), &own)))
                         .collect();
-                    let ret = f.return_type.as_ref().map(|t| resolve_with_self(t)).unwrap_or(Ty::Unit);
-                    Some((f.name.clone(), FnSig { params, ret, has_default_body: true }))
+                    let ret = f.return_type.as_ref().map(|t| mark_type_params(resolve_with_self(t), &own)).unwrap_or(Ty::Unit);
+                    let own_bounds = if own.is_empty() { Vec::new() } else { fn_bounds(f) };
+                    Some((f.name.clone(), FnSig { params, ret, has_default_body: true, own, own_bounds }))
                 }
                 ImplItem::AssocType(..) => None,
             }).collect();
@@ -1746,6 +1844,9 @@ impl TypeChecker {
             if p.name == "self" {
                 if let Some(t) = self_ty {
                     env.insert("self".to_string(), t.clone());
+                    if p.ownership == OwnershipMod::BorrowMut {
+                        env.mark_mut("self");
+                    }
                 }
                 continue;
             }
@@ -1768,6 +1869,9 @@ impl TypeChecker {
                 env.insert(p.name.clone(), Ty::Ref(false, Box::new(Ty::Array(Box::new(pty)))));
             } else {
                 env.insert(p.name.clone(), pty);
+                if p.ownership == OwnershipMod::BorrowMut {
+                    env.mark_mut(&p.name);
+                }
             }
         }
         let expected_ret = f.return_type.as_ref().map(|t| resolve_with_self(t));
@@ -1795,6 +1899,51 @@ impl TypeChecker {
         };
         env.pop();
         result
+    }
+
+    /// Phase 11c C1 (Document 3 `let`/`mut`): assigning to (a part of) a
+    /// binding that is not declared `mut` is an error. The one exception is
+    /// the FIRST assignment of a deferred `let x: T;` (a plain `x = v` on a
+    /// path where it is not yet initialised, outside any loop/closure that
+    /// does not also contain the declaration).
+    fn check_assign_mutability(&mut self, op: AssignOp, lhs: &Expr, env: &mut Env, ctx: &str) {
+        let mut root: &Expr = lhs;
+        let mut whole = true;
+        loop {
+            match root {
+                Expr::Paren(i) => root = i,
+                Expr::Field { expr, .. } | Expr::Index { expr, .. } => {
+                    whole = false;
+                    root = expr
+                }
+                _ => break,
+            }
+        }
+        let Expr::Ident(n) = root else { return };
+        if !env.is_immut(n) {
+            return;
+        }
+        // writing through a reference / raw pointer held in an immutable binding
+        if !whole && matches!(env.get(n), Some(Ty::Ref(..)) | Some(Ty::RawPtr(..))) {
+            return;
+        }
+        if whole && op == AssignOp::Eq {
+            match env.first_assign(n) {
+                Ok(()) => return,
+                Err(true) => {
+                    self.errors.push(TypeError {
+                        message: format!("cannot assign to `{}` inside a loop or closure: it is an immutable binding initialised outside it (declare it with `let mut {}`)", n, n),
+                        context: ctx.into(),
+                    });
+                    return;
+                }
+                Err(false) => {}
+            }
+        }
+        self.errors.push(TypeError {
+            message: format!("cannot assign to `{}` twice: it is not declared `mut` (declare it with `let mut {}`; Document 3 `let`)", n, n),
+            context: ctx.into(),
+        });
     }
 
     fn check_stmt(&mut self, stmt: &Stmt, env: &mut Env, ctx: &str) {
@@ -1827,11 +1976,14 @@ impl TypeChecker {
                 };
                 if let Pattern::Ident(name) = pattern {
                     env.insert(name.clone(), final_ty);
-                    if !*mutable {
-                        env.mark_immut(name);
+                    if *mutable {
+                        env.mark_mut(name);
+                    } else if value.is_none() {
+                        env.mark_deferred(name);
                     }
                 } else if let Pattern::Mut(name) = pattern {
                     env.insert(name.clone(), final_ty);
+                    env.mark_mut(name);
                 } else {
                     // Phase 10: destructuring `let (a, b) = pair;`
                     // (Document 5 §3.2, Document 10 §3.3) -- reuse the
@@ -2311,8 +2463,9 @@ impl TypeChecker {
 
             Expr::Binary { op, lhs, rhs } => self.check_binary_expected(*op, lhs, rhs, expected, env, ctx),
 
-            Expr::Assign { lhs, rhs, .. } => {
+            Expr::Assign { op, lhs, rhs } => {
                 let lt = self.check_expr(lhs, None, env, ctx);
+                self.check_assign_mutability(*op, lhs, env, ctx);
                 {
                     let mut l: &Expr = lhs;
                     while let Expr::Paren(i) = l {
@@ -2673,6 +2826,7 @@ impl TypeChecker {
                 }
                 let sig = self.resolve_method(&recv_ty, name);
                 match sig {
+                    Some(sig) if !sig.own.is_empty() => self.check_generic_method_call(call_addr, &recv_ty, name, sig, args, env, ctx),
                     Some(sig) => {
                         for (i, arg) in args.iter().enumerate() {
                             self.check_expr(&arg.value, sig.params.get(i), env, ctx);
@@ -2807,8 +2961,8 @@ impl TypeChecker {
             // where cheap, but not fully type-checked here. Not silently
             // claimed as "checked".
             Expr::Closure(c) => {
-                let mut inner_env = Env::new();
-                inner_env.scopes = env.scopes.clone();
+                let mut inner_env = env.clone();
+                inner_env.loop_depth += 1; // a closure may run many times
                 inner_env.push();
                 for (pat, ty) in &c.params {
                     if let Pattern::Ident(n) = pat {
@@ -2857,7 +3011,9 @@ impl TypeChecker {
                 // reported exactly once, not twice.
                 self.loop_frames.push(LoopFrame { label: label.clone(), collects_breaks: true, break_types: Vec::new() });
                 env.push();
+                env.loop_depth += 1;
                 self.check_block(body, env, None, ctx);
+                env.loop_depth -= 1;
                 env.pop();
                 let frame = self.loop_frames.pop().unwrap();
                 let mut common = expected.cloned();
@@ -2882,7 +3038,9 @@ impl TypeChecker {
                 self.check_expr(cond, Some(&Ty::Bool), env, ctx);
                 self.loop_frames.push(LoopFrame { label: label.clone(), collects_breaks: false, break_types: Vec::new() });
                 env.push();
+                env.loop_depth += 1;
                 self.check_block(body, env, None, ctx);
+                env.loop_depth -= 1;
                 env.pop();
                 self.loop_frames.pop();
                 Ty::Unit
@@ -2911,8 +3069,13 @@ impl TypeChecker {
                 };
                 if let Pattern::Ident(name) | Pattern::Mut(name) = pattern {
                     env.insert(name.clone(), elem_ty);
+                    if matches!(pattern, Pattern::Mut(_)) {
+                        env.mark_mut(name);
+                    }
                 }
+                env.loop_depth += 1;
                 self.check_block(body, env, None, ctx);
+                env.loop_depth -= 1;
                 env.pop();
                 self.loop_frames.pop();
                 Ty::Unit
@@ -2925,7 +3088,9 @@ impl TypeChecker {
                 // *some* loop.
                 self.loop_frames.push(LoopFrame { label: None, collects_breaks: false, break_types: Vec::new() });
                 env.push();
+                env.loop_depth += 1;
                 self.check_block(body, env, None, ctx);
+                env.loop_depth -= 1;
                 env.pop();
                 self.check_expr(cond, Some(&Ty::Bool), env, ctx);
                 self.loop_frames.pop();
@@ -3277,6 +3442,13 @@ impl TypeChecker {
             for z in &ztys { collect_unbound(z, &mut unresolved); }
             self.instances.insert(k, (n, ztys));
         }
+        let mis: Vec<usize> = self.method_instances.keys().copied().collect();
+        for k in mis {
+            let (t, m, tys) = self.method_instances[&k].clone();
+            let ztys: Vec<Ty> = tys.iter().map(|x| self.zonk(x)).collect();
+            for z in &ztys { collect_unbound(z, &mut unresolved); }
+            self.method_instances.insert(k, (t, m, ztys));
+        }
         let tps: Vec<usize> = self.type_paths.keys().copied().collect();
         for k in tps {
             let z = self.zonk(&self.type_paths[&k].clone());
@@ -3404,7 +3576,17 @@ impl TypeChecker {
 
     fn check_if(&mut self, if_expr: &IfExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
         self.check_expr(&if_expr.cond, Some(&Ty::Bool), env, ctx);
+        // C1: deferred initialisation is tracked per path (then / else).
+        let before = env.deferred_snapshot();
         let then_ty = self.check_block(&if_expr.then_block, env, expected, ctx).unwrap_or(Ty::Unit);
+        let after_then = env.deferred_snapshot();
+        env.deferred_restore(&before);
+        let r = self.check_if_else(if_expr, expected, env, ctx, then_ty);
+        env.deferred_merge(&after_then);
+        r
+    }
+
+    fn check_if_else(&mut self, if_expr: &IfExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str, then_ty: Ty) -> Ty {
         match &if_expr.else_branch {
             Some(ElseBranch::Block(b)) => {
                 // Phase 9: a diverging (`!`) branch contributes no value,
@@ -3506,7 +3688,10 @@ impl TypeChecker {
         let mut common: Option<Ty> = expected.cloned();
         let mut saw_arm = false;
         let mut all_arms_diverge = true;
+        let arms_before = env.deferred_snapshot();
+        let mut arms_merged = arms_before.clone();
         for arm in &match_expr.arms {
+            env.deferred_restore(&arms_before);
             env.push();
             // Phase 9: pattern-introduced bindings are now distributed
             // against the scrutinee's type for the shapes Document 11
@@ -3525,6 +3710,7 @@ impl TypeChecker {
                 MatchArmBody::Block(b) => self.check_block(b, env, common.as_ref(), ctx).unwrap_or(Ty::Unit),
             };
             env.pop();
+            arms_merged_or(&mut arms_merged, &env.deferred_snapshot());
             saw_arm = true;
             // Phase 9: an arm of type `!` (`panic(..)`, `return ..`)
             // contributes no value and can't conflict (Document 9 §2.3's
@@ -3550,6 +3736,7 @@ impl TypeChecker {
                 _ => {}
             }
         }
+        env.deferred_restore(&arms_merged);
         if saw_arm && all_arms_diverge && common.is_none() {
             return Ty::Never;
         }
@@ -4272,7 +4459,10 @@ impl TypeChecker {
     fn bind_pattern(&self, pat: &Pattern, ty: &Ty, env: &mut Env) {
         match pat {
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Array(..) => {}
-            Pattern::Mut(n) => env.insert(n.clone(), ty.clone()),
+            Pattern::Mut(n) => {
+                env.insert(n.clone(), ty.clone());
+                env.mark_mut(n);
+            }
             Pattern::Ident(n) => {
                 // A path (`HttpMethod::Get`) or a nullary variant of the
                 // scrutinee's own type (`None`) is a constructor test,
@@ -4389,6 +4579,65 @@ impl TypeChecker {
         full
     }
 
+    /// Phase 11c C1: a call of a method that declares its own type parameters
+    /// (`fn pick<U>(self, u: U) -> U`): `U` is inferred from the arguments like a
+    /// generic function's (Doc 8 §1/§2), bounds are checked, and the concrete
+    /// instance is recorded for `mono` (which adds `pick$f64` to the impl).
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_method_call(&mut self, call_addr: usize, recv_ty: &Ty, name: &str, sig: FnSig, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (i, a) in args.iter().enumerate() {
+            let exp = sig.params.get(i).map(|p| substitute_type_params(p, &subst)).filter(|p| !format!("{:?}", p).contains("TypeParam"));
+            let at = self.check_expr(&a.value, exp.as_ref(), env, ctx);
+            if let Some(p) = sig.params.get(i) {
+                unify_infer(p, &at, &mut subst);
+            }
+        }
+        if args.len() != sig.params.len() {
+            self.errors.push(TypeError {
+                message: format!("method `{}` on `{}` expects {} argument(s), found {}", name, recv_ty, sig.params.len(), args.len()),
+                context: ctx.into(),
+            });
+        }
+        for n in &sig.own {
+            if !subst.contains_key(n) {
+                let v = self.fresh_var(format!("cannot infer type parameter `{}` of method `{}`; add an explicit annotation (Document 5 rule 6)", n, name), ctx);
+                subst.insert(n.clone(), v);
+            }
+        }
+        for (pn, tns) in &sig.own_bounds {
+            let Some(concrete) = subst.get(pn).map(|c| self.zonk(c)) else { continue };
+            if ty_has_infer(&concrete) {
+                for tn in tns {
+                    self.pending_bounds.push((concrete.clone(), tn.clone(), pn.clone(), name.to_string(), ctx.to_string()));
+                }
+                continue;
+            }
+            for tn in tns {
+                let ok = match &concrete {
+                    Ty::Named(n) if self.cur_tparams.contains(n) => self.cur_bounds.iter().any(|(p, bs)| p == n && bs.contains(tn)),
+                    _ => self.satisfies_bound(&concrete, tn),
+                };
+                if !ok {
+                    self.errors.push(TypeError {
+                        message: format!("type `{}` does not satisfy bound `{}` required for generic parameter `{}` of method `{}` (Document 8 §2/§3)", concrete, tn, pn, name),
+                        context: ctx.into(),
+                    });
+                }
+            }
+        }
+        let tys: Vec<Ty> = sig.own.iter().map(|n| subst[n].clone()).collect();
+        // only a receiver of a concrete, non-generic type is recorded: a generic
+        // impl is instantiated first (`Box2<i32>` -> `Box2$i32`) and the call is
+        // seen again, on the instance, in the next round
+        if let Ty::Named(tn) = recv_ty {
+            if !self.cur_tparams.contains(tn) && tys.iter().all(|t| !self.mentions_tparam(t)) {
+                self.method_instances.insert(call_addr, (tn.clone(), name.to_string(), tys));
+            }
+        }
+        substitute_type_params(&sig.ret, &subst)
+    }
+
     fn generic_method_sig(&self, gn: &str, gargs: &[GenericArg], name: &str) -> Option<FnSig> {
         for imp in self.generic_impls.get(gn)? {
             if let Some(m) = imp.methods.get(name) {
@@ -4397,6 +4646,8 @@ impl TypeChecker {
                     params: m.params.iter().map(|p| substitute_type_params(p, &subst)).collect(),
                     ret: substitute_type_params(&m.ret, &subst),
                     has_default_body: true,
+                    own: m.own.clone(),
+                    own_bounds: m.own_bounds.clone(),
                 });
             }
         }
@@ -4416,7 +4667,7 @@ impl TypeChecker {
             }
             subst.insert("Self".to_string(), self_ty);
             let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &subst);
-            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true });
+            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true, own: Vec::new(), own_bounds: Vec::new() });
         }
         None
     }
@@ -4503,7 +4754,7 @@ impl TypeChecker {
                                 }
                             }
                             let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
-                            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: sig.has_default_body });
+                            return Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: sig.has_default_body, own: Vec::new(), own_bounds: Vec::new() });
                         }
                     }
                 }
@@ -4544,7 +4795,7 @@ impl TypeChecker {
                                 self_subst.insert(g.clone(), a.clone());
                             }
                             let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &["Self".to_string()]), &self_subst);
-                            Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true })
+                            Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: true, own: Vec::new(), own_bounds: Vec::new() })
                         })
                     })
             }

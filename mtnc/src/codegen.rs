@@ -98,11 +98,12 @@ pub(crate) struct FnInfo<'ctx, 'a> {
 
 /// Where a tail call stores a re-bound argument (Doc 10 §6): the parameter's
 /// stack slot, or (for `borrow` parameters, whose local IS the caller's pointer)
-/// the pointer itself, which can only be passed through unchanged.
+/// a phi node at the top of the function's `tail_loop` block: the entry edge
+/// supplies the incoming pointer, every tail call adds an edge with the new one.
 #[derive(Clone)]
 pub(crate) enum TailSlot<'ctx> {
     Slot(PointerValue<'ctx>),
-    Ref(PointerValue<'ctx>),
+    Phi(inkwell::values::PhiValue<'ctx>),
 }
 
 /// One function body to generate (free function or `impl` method).
@@ -989,6 +990,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let body_bb = self.context.append_basic_block(val, "body");
         self.position(body_bb);
         let mut llidx = 0u32;
+        let mut ref_params: Vec<(usize, String, Ty, PointerValue<'ctx>)> = Vec::new();
         if let Some(kind) = self_kind {
             let sty = w.self_ty.clone().unwrap();
             let pv = val.get_nth_param(llidx).unwrap();
@@ -997,8 +999,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 // `borrow self` / `borrow mut self`: the local IS the caller's value
                 // (reads and writes go through the pointer, Document 6 §3).
                 PMode::Ref(_) => {
-                    self.tail_params.push(TailSlot::Ref(pv.into_pointer_value()));
-                    self.locals.last_mut().unwrap().insert("self".to_string(), (pv.into_pointer_value(), sty));
+                    ref_params.push((self.tail_params.len(), "self".to_string(), sty, pv.into_pointer_value()));
+                    self.tail_params.push(TailSlot::Slot(pv.into_pointer_value())); // replaced by a phi below
                 }
                 _ => {
                     let slot = self.declare_local("self", &sty)?;
@@ -1012,8 +1014,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             llidx += 1;
             match p.mode {
                 PMode::Ref(_) => {
-                    self.tail_params.push(TailSlot::Ref(pv.into_pointer_value()));
-                    self.locals.last_mut().unwrap().insert(p.name.clone(), (pv.into_pointer_value(), p.ty.clone()));
+                    ref_params.push((self.tail_params.len(), p.name.clone(), p.ty.clone(), pv.into_pointer_value()));
+                    self.tail_params.push(TailSlot::Slot(pv.into_pointer_value())); // replaced by a phi below
                 }
                 PMode::Value => {
                     let slot = self.declare_local(&p.name, &p.ty)?;
@@ -1030,9 +1032,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         // A self-recursive call in tail position jumps back here (Document 10 §6).
         let loop_bb = self.new_block("tail_loop");
+        let entry_edge = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(loop_bb)?;
         self.position(loop_bb);
         self.tail_loop = Some(loop_bb);
+        // `borrow` parameters are re-bindable through a phi (Document 10 §6 for `borrow` places).
+        for (idx, name, ty, incoming) in ref_params {
+            let phi = self.builder.build_phi(incoming.get_type(), &format!("{}.ref", name))?;
+            phi.add_incoming(&[(&incoming, entry_edge)]);
+            let pv = phi.as_basic_value().into_pointer_value();
+            self.locals.last_mut().unwrap().insert(name, (pv, ty));
+            self.tail_params[idx] = TailSlot::Phi(phi);
+        }
         let (v, bty) = self.gen_block(body)?;
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
             if self.dead || bty == Ty::Never {

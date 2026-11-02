@@ -133,6 +133,8 @@ struct Rw {
     scrut: HashMap<usize, (String, String)>,
     /// `.into()` call -> `Target::from(x)` (None: identity conversion)
     intos: HashMap<usize, Option<String>>,
+    /// Phase 11c C1: generic-method call (`b.pick(x)`) -> instance name (`pick$f64`)
+    method_calls: HashMap<usize, String>,
 }
 
 fn rewrite_block(b: &mut Block, calls: &Rw) {
@@ -180,6 +182,11 @@ fn rewrite_expr(e: &mut Expr, calls: &Rw) {
                     args: vec![Arg { name: None, value: recv }],
                 },
             };
+        }
+    }
+    if let Expr::MethodCall { name, .. } = e {
+        if let Some(mg) = calls.method_calls.get(&self_key) {
+            *name = mg.clone();
         }
     }
     if let Expr::Path(p) = e {
@@ -671,7 +678,74 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
         rw.type_calls.insert(*addr, inst.clone());
         changed = true;
     }
+    // ---- generic METHOD instances (Phase 11c C1): `impl Foo { fn pick<U>(..) }` called
+    // as `f.pick(2.5)` gets a sibling `pick$f64` in the same impl; the call is renamed.
+    let mut method_adds: Vec<(String, String, FnDecl)> = Vec::new();
+    for (addr, (tname, mname, targs)) in &tc.method_instances {
+        let mut decl: Option<FnDecl> = None;
+        for it in &program.items {
+            if let ItemKind::Impl(i) = &it.kind {
+                if &i.target.name == tname && i.generics.0.is_empty() && i.target.args.is_empty() {
+                    for ii in &i.items {
+                        if let ImplItem::Fn(f) = ii {
+                            if &f.name == mname && !f.generics.0.is_empty() {
+                                decl = Some(f.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(decl) = decl else { continue };
+        let mangled = mangle(mname, targs);
+        rw.method_calls.insert(*addr, mangled.clone());
+        changed = true;
+        let key = format!("{}::{}", tname, mangled);
+        if made.contains(&key) {
+            continue;
+        }
+        if made.len() >= 4096 {
+            return Err(vec![format!("error: too many generic instantiations while instantiating method `{}` (Document 8)", mname)]);
+        }
+        made.insert(key);
+        let mut m: HashMap<String, Type> = HashMap::new();
+        for (p, t) in generic_param_names(&decl.generics).iter().zip(targs.iter()) {
+            match ty_to_type(t) {
+                Some(ty) => {
+                    m.insert(p.clone(), ty);
+                }
+                None => return Err(vec![format!("error: cannot instantiate method `{}` with type `{}` (not supported: the type has no source spelling)", mname, t)]),
+            }
+        }
+        let mut inst = decl.clone();
+        inst.name = mangled;
+        inst.generics = GenericParams(Vec::new());
+        inst.where_clause = WhereClause::default();
+        for p in inst.params.iter_mut() {
+            subst_type(&mut p.ty, &m);
+        }
+        if let Some(r) = &mut inst.return_type {
+            subst_type(r, &m);
+        }
+        if let Some(b) = &mut inst.body {
+            subst_block(b, &m);
+        }
+        method_adds.push((tname.clone(), mname.clone(), inst));
+    }
     rewrite_items(&mut program.items, &rw);
+    for (tname, mname, inst) in method_adds {
+        'find: for it in program.items.iter_mut() {
+            if let ItemKind::Impl(i) = &mut it.kind {
+                if i.target.name == tname && i.generics.0.is_empty() && i.target.args.is_empty() {
+                    let has = i.items.iter().any(|ii| matches!(ii, ImplItem::Fn(f) if f.name == mname));
+                    if has {
+                        i.items.push(ImplItem::Fn(inst));
+                        break 'find;
+                    }
+                }
+            }
+        }
+    }
     program.items.extend(new_items);
 
     // ---- rewrite written types `Pair<i32, f64>` -> `Pair$i32_f64` (top-down; a
@@ -710,6 +784,11 @@ pub fn strip_generics(program: &mut Program) {
         ItemKind::Enum(e) if !e.generics.0.is_empty() => Some(e.name.clone()),
         _ => None,
     }).collect();
+    for it in program.items.iter_mut() {
+        if let ItemKind::Impl(i) = &mut it.kind {
+            i.items.retain(|ii| !matches!(ii, ImplItem::Fn(f) if !f.generics.0.is_empty()));
+        }
+    }
     program.items.retain(|it| match &it.kind {
         ItemKind::Fn(f) => f.generics.0.is_empty(),
         ItemKind::Struct(s) => s.generics.0.is_empty(),
