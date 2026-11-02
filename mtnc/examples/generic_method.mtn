@@ -1,0 +1,14 @@
+// Phase 11c C1: a method with its own type parameter, inside a generic impl.
+struct Box2<T> { v: T }
+
+impl<T> Box2<T> {
+    fn pairWith<U>(self, u: U) -> U { return u; }
+    fn first(self) -> T { return self.v; }
+}
+
+fn main() {
+    let b = Box2 { v: 1 };
+    println(b.pairWith(2.5));
+    println(b.pairWith(true));
+    println(b.first());
+}

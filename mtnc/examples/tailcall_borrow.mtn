@@ -1,0 +1,14 @@
+// Phase 11c C1: a guaranteed self tail call (Doc 10 §6) that passes DIFFERENT
+// `borrow` places is a jump, not a call: depth 1,000,000 uses no extra stack.
+struct Pair { a: i64, b: i64 }
+
+fn count(borrow x: Pair, borrow y: Pair, n: i64, acc: i64) -> i64 {
+    if n == 0 { return acc; }
+    return count(borrow y, borrow x, n - 1, acc + x.a);
+}
+
+fn main() {
+    let p = Pair { a: 1, b: 0 };
+    let q = Pair { a: 2, b: 0 };
+    println(count(borrow p, borrow q, 1000000, 0));
+}
