@@ -953,6 +953,61 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.build_slice(slot, len)
     }
 
+    /// Is `p` (the address of local `name`) a parameter of the current function that
+    /// carries a reference from the caller? (a `borrow` parameter, or a by-value
+    /// parameter of reference type) -- such memory outlives the tail-call jump.
+    fn is_ref_param_local(&self, p: PointerValue<'ctx>, ty: &Ty) -> bool {
+        self.tail_params.iter().any(|slot| match slot {
+            TailSlot::Phi(phi) => phi.as_basic_value().into_pointer_value() == p,
+            TailSlot::Slot(sp) => *sp == p && matches!(ty, Ty::Ref(..)),
+        })
+    }
+
+    /// Does the PLACE `e` live in memory that survives a tail-call jump (not in a
+    /// local of the current frame)? Conservative: unknown shapes answer `false`.
+    fn place_safe(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Paren(i) => self.place_safe(i),
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => self.place_safe(expr),
+            Expr::Deref(_) => true, // a raw pointer: the user's responsibility (`unsafe`)
+            Expr::Ident(n) => match self.lookup_local(n) {
+                Some((p, ty)) => self.is_ref_param_local(p, &ty),
+                None => true, // a `static`/global
+            },
+            _ => false,
+        }
+    }
+
+    /// May the tail-call argument expression `e` be passed on across the jump?
+    /// Values are always fine; references must not point into the current frame.
+    fn frame_safe(&self, e: &Expr) -> R<bool> {
+        let has_ref = ty_has_ref(&self.ty_of(e).unwrap_or(Ty::Unit));
+        Ok(match e {
+            Expr::Paren(i) => return self.frame_safe(i),
+            Expr::Borrow { expr, .. } => self.place_safe(expr),
+            _ if !has_ref => true,
+            Expr::Ident(n) => match self.lookup_local(n) {
+                Some((p, ty)) => self.is_ref_param_local(p, &ty),
+                None => true,
+            },
+            Expr::Call { args, .. } => {
+                let mut all = true;
+                for a in args {
+                    all &= self.frame_safe(&a.value)?;
+                }
+                all
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                let mut all = if matches!(self.ty_of(receiver).unwrap_or(Ty::Unit), Ty::Ref(..)) { self.frame_safe(receiver)? } else { self.place_safe(receiver) };
+                for a in args {
+                    all &= self.frame_safe(&a.value)?;
+                }
+                all
+            }
+            _ => false,
+        })
+    }
+
     fn call_fn(&mut self, key: &str, display: &str, recv: Option<V<'ctx>>, args: &[Arg], call_addr: usize) -> R<V<'ctx>> {
         let (fv, params, ret) = {
             let i = &self.fns[key];
@@ -966,30 +1021,36 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             vals.push(v.into());
         }
         // Guaranteed self tail-call (Document 10 §6): re-bind the parameters and jump.
-        if key == self.cur_key && self.tail_calls.contains(&call_addr) && !self.dead && self.tail_params.len() == vals.len() {
-            let slots = self.tail_params.clone();
-            let mut ok = true;
-            for (slot, v) in slots.iter().zip(vals.iter()) {
-                if let TailSlot::Ref(p) = slot {
-                    // a `borrow` parameter can only be passed through unchanged
-                    match v {
-                        BasicMetadataValueEnum::PointerValue(pv) if pv == p => {}
-                        _ => ok = false,
-                    }
+        // Never a silent ordinary call: either a jump, or a clear error.
+        if key == self.cur_key && self.tail_calls.contains(&call_addr) && !self.dead {
+            if self.tail_params.len() != vals.len() {
+                return Err(CgErr(format!("internal: tail call of `{}` has {} argument(s) for {} parameter slot(s)", display, vals.len(), self.tail_params.len())));
+            }
+            for a in args {
+                if !self.frame_safe(&a.value)? {
+                    return Err(CgErr(format!(
+                        "guaranteed tail call (Document 10 §6): the call to `{}` passes a reference to a local of the current function, which cannot outlive the jump back to the top of the function; pass a reference derived from a `borrow` parameter, or make the call a non-tail call",
+                        display
+                    )));
                 }
             }
-            if ok {
-                for (slot, v) in slots.iter().zip(vals.iter()) {
-                    if let TailSlot::Slot(p) = slot {
-                        let bv: V<'ctx> = (*v).try_into().map_err(|_| CgErr("internal: tail-call argument".into()))?;
+            let cur_bb = self.builder.get_insert_block().unwrap();
+            let slots = self.tail_params.clone();
+            for (slot, v) in slots.iter().zip(vals.iter()) {
+                let bv: V<'ctx> = (*v).try_into().map_err(|_| CgErr("internal: tail-call argument".into()))?;
+                match slot {
+                    TailSlot::Slot(p) => {
                         self.builder.build_store(*p, bv)?;
                     }
+                    TailSlot::Phi(phi) => {
+                        phi.add_incoming(&[(&bv, cur_bb)]);
+                    }
                 }
-                let target = self.tail_loop.unwrap();
-                self.builder.build_unconditional_branch(target)?;
-                self.terminate();
-                return self.zero_of(&ret);
             }
+            let target = self.tail_loop.unwrap();
+            self.builder.build_unconditional_branch(target)?;
+            self.terminate();
+            return self.zero_of(&ret);
         }
         let call = self.builder.build_call(fv, &vals, "")?;
         if ret == Ty::Never {
@@ -1029,6 +1090,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let Some(kind) = self.fns[&key].self_kind else {
             return Err(CgErr(format!("`{}::{}` is an associated function without `self`: call it as `{}::{}(..)`", tystr, name, tystr, name)));
         };
+        if key == self.cur_key && self.tail_calls.contains(&call_addr) && !self.dead {
+            if let PMode::Ref(_) = kind {
+                let safe = if matches!(rty, Ty::Ref(..)) { self.frame_safe(receiver)? } else { self.place_safe(receiver) };
+                if !safe {
+                    return Err(CgErr(format!(
+                        "guaranteed tail call (Document 10 §6): the call to `{}::{}` borrows a local of the current function as `self`, which cannot outlive the jump back to the top of the function; call it on a value derived from a `borrow` parameter, or make the call a non-tail call",
+                        tystr, name
+                    )));
+                }
+            }
+        }
         let recv: V<'ctx> = match kind {
             PMode::Ref(_) => {
                 if matches!(rty, Ty::Ref(..)) {
@@ -2422,5 +2494,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.builder.build_unconditional_branch(end_bb)?;
         self.position(end_bb);
         self.load(slot, &ty)
+    }
+}
+
+/// Does a value of this type carry a reference (so passing it on may point into a frame)?
+fn ty_has_ref(t: &Ty) -> bool {
+    match t {
+        Ty::Ref(..) => true,
+        Ty::Tuple(ts) => ts.iter().any(ty_has_ref),
+        Ty::Array(e) | Ty::Fixed(e, _) => ty_has_ref(e),
+        _ => false,
     }
 }
