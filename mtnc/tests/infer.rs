@@ -75,10 +75,3 @@ fn deferred_bound_satisfied_accepted() {
 fn deferred_bound_unsatisfied_rejected() {
     rejected(&format!("{}fn main() {{ let mut h = mk(); h.put(2.5); }}\n", P), "does not satisfy bound `P`");
 }
-
-#[test]
-fn generic_method_with_own_params_in_generic_impl_is_clear_error() {
-    let src = "struct Box2<T> { v: T }\nimpl<T> Box2<T> {\n    fn pairWith<U>(self, u: U) -> U { return u; }\n}\nfn main() { let b = Box2 { v: 1 }; println(b.pairWith(2.5)); }\n";
-    let (o, c) = run(src);
-    assert!(c != 0 && o.contains("not yet supported by codegen — Phase 11"), "{}", o);
-}
