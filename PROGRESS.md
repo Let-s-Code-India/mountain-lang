@@ -2264,7 +2264,7 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 - M3 (associated types, specialised impls) + item 2b (later-use inference): 🟢 357.
 - M4 (const generics, `[x; N]`): 🟢 375; smoke `checked 36 file(s)`.
 - M5 (generic traits, `From`/`Into`): 🟢 387; smoke `checked 38 file(s), 0 errors`.
-- M6 (`unsafe`, raw pointers, `alloc`/`dealloc`): 🟡 implemented, 413 tests pass in the sandbox (4 consecutive full runs), 0 warnings — the first CI run had 2 failures caused by a test-helper bug (below, fixed in checkpoint-M6b); ⏳ NOT yet confirmed by a green CI log.
+- M6 (`unsafe`, raw pointers, `alloc`/`dealloc`) and M7/11b as a whole: 🟢 **413 tests passed, confirmed by a real CI log (reviewed by the manager)**; smoke `checked 39 file(s), 0 errors`. (The first M6 CI run had 2 failures caused by a test-helper bug, fixed in checkpoint-M6b — see below.)
 - **Phase 11 as a whole stays 🟡 until 11c (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind step, arena benchmark) has a green CI log.**
 
 **What was delivered**
@@ -2304,7 +2304,16 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 
 **What the manager should read in the CI log (11b remaining)** — job `build-and-test`, step "Run tests" (`cargo test`) and the smoke step. Expected `test result:` lines: lib 60, assoc_types 8, borrow_checks 19, closures 10, const_generics 19, control_flow 10, e2e 64, error_handling 57, exhaustiveness 17, generators 5, generic_traits 11, generics 12, infer 8, integration 6, mono 19, parser_doc24 6, phase11a 15, **raw_pointers 26**, traits_impls 15, types_doc5 26 → **grand total 413, 0 failed, 0 warnings** (re-checked: 4 consecutive full runs in the sandbox, no flakiness). Smoke: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → **`checked 39 file(s), 0 errors`**; hello → `Hello, Mountain!`. A real CI log for M6/M7 is what turns M6 and 11b green.
 
+### Phase 11c — IN PROGRESS (milestones C0–C7; checkpoints go to the manager; see `WORKLOG_11C.md`)
+**Status: 🟡 not complete.** C0 + C1 delivered as `checkpoint-C1.zip`.
+- **C0:** statuses above updated (11b-1, M1–M6 all 🟢; 413 confirmed by CI).
+- **C1 (carry-over fixes), fresh sandbox numbers: 441 passed, 0 failed, 0 warnings** (lib 60, assoc_types 8, borrow_checks 19, **c1_carryover 29 (new)**, closures 10, const_generics 19, control_flow 10, e2e 64, error_handling 57, exhaustiveness 17, generators 5, generic_traits 11, generics 12, **infer 7 (−1)**, integration 6, mono 19, parser_doc24 6, phase11a 15, raw_pointers 26, traits_impls 15, types_doc5 26); `mtnc check examples` → `checked 41 file(s), 0 errors`.
+  1. **Guaranteed tail call through `borrow`/`borrow mut`/`borrow self`** — `borrow` parameters are rebound through a phi at the loop head; depth 1,000,000 tested in debug and release (swapped places, `borrow mut` writes, method receiver, field of a borrow parameter). A tail call whose reference argument may point into the current frame is a clear compile error (no silent ordinary call). Flagged reading: the check is conservative (see WORKLOG_11C).
+  2. **Immutable bindings (Doc 3 `let`/`mut`)** — reassignment, compound assignment, field/index assignment, and `borrow mut` of a non-`mut` binding are rejected, for `let`, destructuring/pattern bindings, `for` variables, match bindings, by-value parameters and `borrow` (non-`mut`) parameters. **Exact reading of deferred initialisation:** `let x: T;` followed by one plain `x = v;` is the first assignment (allowed, tracked per control-flow path: each `if`/`else` branch and each `match` arm may initialise once); a second assignment, any compound assignment, and an assignment inside a loop or closure body that does not also contain the declaration are errors. Writing through a reference or raw pointer held in an immutable binding is allowed. **No earlier test relied on the old behaviour** (all 413 passed unchanged; one old test was removed: `infer::generic_method_with_own_params_in_generic_impl_is_clear_error`, which asserted the gap that item 3 closes). Flagged: Doc 3 says `mut` may mark a function parameter, but Doc 23's parameter grammar has no `mut x: T` form, so by-value parameters are simply immutable (no way to make one mutable) — needs the manager's ruling.
+  3. **Generic method with its own `<U>`** — works in plain and generic impls (inference, bounds, several instances); implemented in checker + mono (`method_instances`). Limits: methods of a trait / trait impls, explicit turbofish on a method call.
+- **Open items for the manager:** (a) `final-11b.zip` has no `.github/workflows/ci.yml`; C7 will add the valgrind step to a recreated file — please diff with the repo's real one; (b) the parameter-`mut` grammar question above; (c) generic methods in traits.
+
 ## Phases 11c – 25
-**Status: ⚪ Not started** (11c: drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, `@pack`/`@align`, valgrind step, arena benchmark.)
+**Status: see "Phase 11c — IN PROGRESS" above.** (11c: drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, `@pack`/`@align`, valgrind step, arena benchmark.)
 
 (Full phase table: see Document 25 §2.3.)
