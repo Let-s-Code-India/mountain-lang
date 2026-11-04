@@ -194,11 +194,54 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// Evaluates `e`; a diverging (`!`) expression stands in as zero of `want`.
     pub(super) fn expr_as(&mut self, e: &Expr, want: &Ty) -> R<V<'ctx>> {
         let t = self.ty_of(e)?;
+        // `String` -> `&str` (a string literal is accepted as `&str`, Doc 5 §2.4): a literal
+        // is a static view (no allocation); any other `String` value lends its `{ptr, len}`.
+        if t == Ty::StringTy && matches!(want, Ty::Ref(_, i) if **i == Ty::Str) {
+            let mut le = e;
+            while let Expr::Paren(i) = le {
+                le = i;
+            }
+            if let Expr::Literal(l @ (Literal::Str(_) | Literal::RawStr(_))) = le {
+                return self.literal(l, &t, false);
+            }
+            let h = self.expr(e)?.into_struct_value();
+            let p = self.builder.build_extract_value(h, 0, "sp")?.into_pointer_value();
+            let n = self.builder.build_extract_value(h, 1, "sn")?.into_int_value();
+            return self.build_slice(p, n);
+        }
         let v = self.expr(e)?;
         if t == Ty::Never && *want != Ty::Never {
             return self.zero_of(want);
         }
         Ok(v)
+    }
+
+    /// `{ptr, len, cap}` handle value.
+    pub(super) fn build_handle(&mut self, p: PointerValue<'ctx>, len: IntValue<'ctx>, cap: IntValue<'ctx>) -> R<V<'ctx>> {
+        let st = self.handle_ty();
+        let mut agg = st.get_undef();
+        agg = self.builder.build_insert_value(agg, p, 0, "")?.into_struct_value();
+        agg = self.builder.build_insert_value(agg, len, 1, "")?.into_struct_value();
+        agg = self.builder.build_insert_value(agg, cap, 2, "")?.into_struct_value();
+        Ok(agg.into())
+    }
+
+    /// A heap `String` holding a copy of `bytes` (a string literal in a `String` context).
+    /// Compiler-internal: user-level `String` operations are Phase 16.
+    fn heap_string(&mut self, bytes: &[u8]) -> R<V<'ctx>> {
+        let ut = self.usize_ty();
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        if bytes.is_empty() {
+            return self.build_handle(ptrt.const_null(), ut.const_zero(), ut.const_zero());
+        }
+        let n = ut.const_int(bytes.len() as u64, false);
+        let (fa, _) = self.alloc_fns();
+        let p = self.builder.build_call(fa, &[n.into(), ut.const_int(1, false).into()], "str")?;
+        let ValueKind::Basic(p) = p.try_as_basic_value() else { return Err(CgErr("internal: alloc result".into())) };
+        let p = p.into_pointer_value();
+        let src = self.global_str(bytes);
+        self.builder.build_memcpy(p, 1, src, 1, n)?;
+        self.build_handle(p, n, n)
     }
 
     fn materialize(&mut self, binds: Vec<Bind<'ctx>>) -> R<()> {
@@ -218,6 +261,21 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         match e {
             Expr::Literal(l) => {
                 let ty = self.ty_of(e)?;
+                if ty == Ty::StringTy {
+                    // a string literal in a `String` context is an owned heap `String` (Doc 13 §1.3)
+                    match l {
+                        Literal::Str(t) => {
+                            let inner = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')).ok_or_else(|| CgErr("malformed string literal".into()))?;
+                            let bytes = unescape_str(inner).ok_or_else(|| CgErr("invalid escape in string literal".into()))?;
+                            return self.heap_string(&bytes);
+                        }
+                        Literal::RawStr(t) => {
+                            let inner = t.strip_prefix("r\"").and_then(|s| s.strip_suffix('"')).ok_or_else(|| CgErr("malformed raw string literal".into()))?;
+                            return self.heap_string(inner.as_bytes());
+                        }
+                        _ => {}
+                    }
+                }
                 self.literal(l, &ty, false)
             }
             Expr::Paren(inner) => self.expr(inner),
@@ -280,8 +338,34 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Array(items) => {
                 let ty = self.ty_of(e)?;
+                if let Ty::Array(et) = &ty {
+                    // a growable `[T]` literal: heap buffer + `{ptr, len, cap}` handle (Doc 13 §1 point 3)
+                    let et = (**et).clone();
+                    let elt = self.llty(&et)?;
+                    let ut = self.usize_ty();
+                    let n = items.len() as u64;
+                    if n == 0 {
+                        let nul = self.context.ptr_type(AddressSpace::default()).const_null();
+                        return self.build_handle(nul, ut.const_zero(), ut.const_zero());
+                    }
+                    let esize = self.td.get_abi_size(&elt);
+                    let ealign = self.td.get_abi_alignment(&elt) as u64;
+                    let bytes = ut.const_int(esize * n, false);
+                    let (fa, _) = self.alloc_fns();
+                    let call = self.builder.build_call(fa, &[bytes.into(), ut.const_int(ealign.max(1), false).into()], "vec")?;
+                    let ValueKind::Basic(p) = call.try_as_basic_value() else { return Err(CgErr("internal: alloc result".into())) };
+                    let p = p.into_pointer_value();
+                    for (i, it) in items.iter().enumerate() {
+                        let v = self.expr_as(it, &et)?;
+                        // SAFETY: `i < n`, the number of elements allocated above.
+                        let slot = unsafe { self.builder.build_in_bounds_gep(elt, p, &[ut.const_int(i as u64, false)], "slot")? };
+                        self.builder.build_store(slot, v)?;
+                    }
+                    let len = ut.const_int(n, false);
+                    return self.build_handle(p, len, len);
+                }
                 let Ty::Fixed(et, _) = &ty else {
-                    return unsupported("growable `[T]` array literals (annotate the type as `[T; N]`)", 11);
+                    return Err(CgErr(format!("array literal of type `{}`", ty)));
                 };
                 let et = (**et).clone();
                 let lt = self.llty(&ty)?.into_array_type();
@@ -329,7 +413,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let ty = self.ty_of(e)?;
                 self.gen_borrow(&ty, inner)
             }
-            Expr::MethodCall { receiver, name, args } => self.method_call(receiver, name, args, e as *const Expr as usize),
+            Expr::MethodCall { receiver, name, args, .. } => self.method_call(receiver, name, args, e as *const Expr as usize),
             Expr::If(i) => {
                 let ty = self.ty_of(e)?;
                 self.gen_if(i, &ty)
@@ -725,7 +809,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 other => Err(CgErr(format!("cannot index into `&{}`", other))),
             },
-            Ty::Array(_) => unsupported("indexing a growable `[T]`", 11),
+            Ty::Array(t) => {
+                // a growable `[T]`: read `{ptr, len, cap}` from its place
+                let (hp, _) = self.place_or_spill(base)?;
+                let ht = self.handle_ty();
+                let data_p = self.builder.build_struct_gep(ht, hp, 0, "dp")?;
+                let len_p = self.builder.build_struct_gep(ht, hp, 1, "lp")?;
+                let ptrt = self.context.ptr_type(AddressSpace::default());
+                let data = self.builder.build_load(ptrt, data_p, "data")?.into_pointer_value();
+                let len = self.builder.build_load(ut, len_p, "len")?.into_int_value();
+                Ok((data, (**t).clone(), len, None))
+            }
             other => Err(CgErr(format!("cannot index into type `{}`", other))),
         }
     }
@@ -821,6 +915,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     Ty::Fixed(_, n) => {
                         let (p, _) = self.place_or_spill(inner)?;
                         self.build_slice(p, ut.const_int(*n, false))
+                    }
+                    // a growable `[T]` lends its `{ptr, len}` as a slice view
+                    Ty::Array(_) => {
+                        let (hp, _) = self.place_or_spill(inner)?;
+                        let ht = self.handle_ty();
+                        let ptrt = self.context.ptr_type(AddressSpace::default());
+                        let dp = self.builder.build_struct_gep(ht, hp, 0, "dp")?;
+                        let lp = self.builder.build_struct_gep(ht, hp, 1, "lp")?;
+                        let data = self.builder.build_load(ptrt, dp, "data")?.into_pointer_value();
+                        let len = self.builder.build_load(ut, lp, "len")?.into_int_value();
+                        self.build_slice(data, len)
                     }
                     Ty::Ref(_, i2) => match i2.as_ref() {
                         Ty::Array(_) => self.expr(inner),
@@ -2444,7 +2549,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         if args.len() != 1 {
             return Err(CgErr("`panic` takes exactly one argument".into()));
         }
-        let msg = self.expr_as(&args[0].value, &Ty::StringTy)?.into_struct_value();
+        let msg = self.expr_as(&args[0].value, &Ty::Ref(false, Box::new(Ty::Str)))?.into_struct_value();
         let p = self.builder.build_extract_value(msg, 0, "p")?;
         let n = self.builder.build_extract_value(msg, 1, "n")?;
         let f = self.panic_fn();

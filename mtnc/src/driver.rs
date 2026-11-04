@@ -36,6 +36,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     }
     // Same-named nested items of different functions get distinct names first.
     crate::scope::scope_nested_items(&mut program);
+    desugar::inline_generic_default_methods(&mut program);
     let mut tc = TypeChecker::new();
     tc.check_program(&program);
     let mut errors: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();
@@ -73,6 +74,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
         if changed_any || has_generic_fn {
             crate::mono::strip_generics(&mut program);
             tc = TypeChecker::new();
+            tc.final_pass = true;
             tc.check_program(&program);
             let mut e2: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();
             let mut bc2 = BorrowChecker::new();

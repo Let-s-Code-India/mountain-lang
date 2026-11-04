@@ -1034,6 +1034,8 @@ pub struct TypeChecker {
     pub instances: HashMap<usize, (String, Vec<Ty>)>,
     /// Phase 11c C1: method call address -> (receiver type name, method, its own type arguments)
     pub method_instances: HashMap<usize, (String, String, Vec<Ty>)>,
+    /// set by the driver for the check after `strip_generics`: generic method templates are gone then
+    pub final_pass: bool,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
     /// Const generic parameter names of the function being checked (usable as `usize` values
@@ -1296,6 +1298,7 @@ impl TypeChecker {
             expr_types: HashMap::new(),
             instances: HashMap::new(),
             method_instances: HashMap::new(),
+            final_pass: false,
             cur_tparams: Vec::new(),
             cur_const_params: Vec::new(),
             cur_bound_args: Vec::new(),
@@ -1496,12 +1499,13 @@ impl TypeChecker {
                 }).collect();
                 let methods = t.items.iter().filter_map(|ti| match ti {
                     TraitItem::Fn(f) => {
+                        let own = generic_names(&f.generics);
                         let params = f.params.iter()
                             .filter(|p| p.name != "self")
-                            .map(|p| mark_type_params(resolve_type(&p.ty), &tgen))
+                            .map(|p| mark_type_params(mark_type_params(resolve_type(&p.ty), &tgen), &own))
                             .collect();
-                        let ret = f.return_type.as_ref().map(|r| mark_type_params(resolve_type(r), &tgen)).unwrap_or(Ty::Unit);
-                        Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some(), own: Vec::new(), own_bounds: Vec::new() }))
+                        let ret = f.return_type.as_ref().map(|r| mark_type_params(mark_type_params(resolve_type(r), &tgen), &own)).unwrap_or(Ty::Unit);
+                        Some((f.name.clone(), FnSig { params, ret, has_default_body: f.body.is_some(), own, own_bounds: Vec::new() }))
                     }
                     TraitItem::AssocType(_) => None,
                 }).collect();
@@ -1629,6 +1633,9 @@ impl TypeChecker {
                 // trait's full method list isn't known to this checker).
                 if let Some(shape) = self.traits.get(tn).cloned() {
                     for (mname, sig) in &shape.methods {
+                        if self.final_pass && !sig.own.is_empty() {
+                            continue;
+                        }
                         if !sig.has_default_body && !methods.contains_key(mname) {
                             self.errors.push(TypeError {
                                 message: format!(
@@ -1704,6 +1711,9 @@ impl TypeChecker {
         self.check_impl_assoc_types(tn, target, d);
         if let Some(shape) = self.traits.get(tn).cloned() {
             for (mname, sig) in &shape.methods {
+                if self.final_pass && !sig.own.is_empty() {
+                    continue;
+                }
                 if !sig.has_default_body && !have.contains(mname) {
                     self.errors.push(TypeError {
                         message: format!("`impl {} for {}` is missing required method `{}` (Document 7 §4.2/§4.3)", tn, target, mname),
@@ -2808,14 +2818,15 @@ impl TypeChecker {
                 expected.cloned().unwrap_or(Ty::Unit)
             }
 
-            Expr::MethodCall { receiver, name, args } => {
+            Expr::MethodCall { receiver, name, args, gens } => {
                 let recv_ty = strip_refs(self.check_expr(receiver, None, env, ctx));
                 let call_addr = expr as *const Expr as usize;
                 // Phase 11b M5: impls of a generic trait (`impl Convert<f64> for i32`) are
                 // told apart by the call's arguments and expected type.
                 if let Some(key) = ty_lookup_name(&recv_ty) {
                     let cands = self.trait_candidates(&key, name);
-                    if !cands.is_empty() && !self.has_inherent(&key, name) {
+                    let own_generic = self.impls_by_type.get(&key).map(|v| v.iter().any(|r| r.methods.get(name).map(|m| !m.own.is_empty()).unwrap_or(false))).unwrap_or(false);
+                    if !cands.is_empty() && !self.has_inherent(&key, name) && !own_generic {
                         return self.choose_trait_impl(call_addr, &recv_ty.to_string(), name, cands, args, expected, env, ctx);
                     }
                 }
@@ -2826,7 +2837,7 @@ impl TypeChecker {
                 }
                 let sig = self.resolve_method(&recv_ty, name);
                 match sig {
-                    Some(sig) if !sig.own.is_empty() => self.check_generic_method_call(call_addr, &recv_ty, name, sig, args, env, ctx),
+                    Some(sig) if !sig.own.is_empty() => self.check_generic_method_call(call_addr, &recv_ty, name, sig, args, gens, env, ctx),
                     Some(sig) => {
                         for (i, arg) in args.iter().enumerate() {
                             self.check_expr(&arg.value, sig.params.get(i), env, ctx);
@@ -4584,8 +4595,14 @@ impl TypeChecker {
     /// generic function's (Doc 8 §1/§2), bounds are checked, and the concrete
     /// instance is recorded for `mono` (which adds `pick$f64` to the impl).
     #[allow(clippy::too_many_arguments)]
-    fn check_generic_method_call(&mut self, call_addr: usize, recv_ty: &Ty, name: &str, sig: FnSig, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+    fn check_generic_method_call(&mut self, call_addr: usize, recv_ty: &Ty, name: &str, sig: FnSig, args: &[Arg], gens: &[Type], env: &mut Env, ctx: &str) -> Ty {
         let mut subst: HashMap<String, Ty> = HashMap::new();
+        if gens.len() > sig.own.len() {
+            self.errors.push(TypeError { message: format!("method `{}` takes {} type argument(s), but {} were given", name, sig.own.len(), gens.len()), context: ctx.into() });
+        }
+        for (pn, ta) in sig.own.iter().zip(gens.iter()) {
+            subst.insert(pn.clone(), resolve_targ(ta));
+        }
         for (i, a) in args.iter().enumerate() {
             let exp = sig.params.get(i).map(|p| substitute_type_params(p, &subst)).filter(|p| !format!("{:?}", p).contains("TypeParam"));
             let at = self.check_expr(&a.value, exp.as_ref(), env, ctx);

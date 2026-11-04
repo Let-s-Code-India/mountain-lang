@@ -98,6 +98,7 @@ fn subst_expr(e: &mut Expr, m: &HashMap<String, Type>) {
             return;
         }
         Expr::Cast { ty, .. } => subst_type(ty, m),
+        Expr::MethodCall { gens, .. } => gens.iter_mut().for_each(|t| subst_type(t, m)),
         Expr::Closure(c) => {
             for (_, t) in c.params.iter_mut() {
                 if let Some(t) = t {
@@ -187,6 +188,9 @@ fn rewrite_expr(e: &mut Expr, calls: &Rw) {
     if let Expr::MethodCall { name, .. } = e {
         if let Some(mg) = calls.method_calls.get(&self_key) {
             *name = mg.clone();
+            if let Expr::MethodCall { gens, .. } = e {
+                gens.clear();
+            }
         }
     }
     if let Expr::Path(p) = e {
@@ -308,6 +312,7 @@ fn walk_block_types(b: &mut Block, f: TyFn) {
 fn walk_expr_types(e: &mut Expr, f: TyFn) {
     match e {
         Expr::Cast { ty, .. } => walk_type(ty, f),
+        Expr::MethodCall { gens, .. } => gens.iter_mut().for_each(|t| walk_type(t, f)),
         Expr::Closure(c) => {
             for (_, t) in c.params.iter_mut() {
                 if let Some(t) = t {
@@ -784,6 +789,7 @@ pub fn strip_generics(program: &mut Program) {
         ItemKind::Enum(e) if !e.generics.0.is_empty() => Some(e.name.clone()),
         _ => None,
     }).collect();
+    // generic METHOD templates: their instances (`name$args`) were added to the impl
     for it in program.items.iter_mut() {
         if let ItemKind::Impl(i) = &mut it.kind {
             i.items.retain(|ii| !matches!(ii, ImplItem::Fn(f) if !f.generics.0.is_empty()));

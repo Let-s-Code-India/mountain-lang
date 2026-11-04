@@ -309,6 +309,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.context.struct_type(&[p.into(), self.int_ty(self.ptr_bits()).into()], false)
     }
 
+    /// The `{ ptr, len, cap }` handle of a growable `[T]` or a `String` (Document 13 §1 point 3):
+    /// the 24-byte stack value; the data lives on the heap behind the one allocation interface.
+    fn handle_ty(&self) -> StructType<'ctx> {
+        let p = self.context.ptr_type(AddressSpace::default());
+        let u = self.int_ty(self.ptr_bits());
+        self.context.struct_type(&[p.into(), u.into(), u.into()], false)
+    }
+
     fn variants_of(&self, ty: &Ty) -> Option<Vec<(String, Vec<Ty>)>> {
         if let Some(v) = builtin_variants(ty) {
             return Some(v.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
@@ -333,7 +341,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::RawPtr(..) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Char => self.int_ty(32).into(),
             Ty::Unit | Ty::Never => self.unit_ty().into(),
-            Ty::StringTy => self.str_ty().into(),
+            Ty::StringTy => self.handle_ty().into(),
             Ty::Tuple(ts) => {
                 let mut fs = Vec::new();
                 for t in ts {
@@ -368,7 +376,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 _ => self.context.ptr_type(AddressSpace::default()).into(),
             },
             Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
-            Ty::Array(_) => return unsupported("growable `[T]` arrays", 11),
+            Ty::Array(elem) => {
+                self.llty(elem)?; // the element type must be representable
+                self.handle_ty().into()
+            }
             Ty::Fn(..) => return unsupported("function values / closures", 12),
             Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
@@ -741,6 +752,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     let trait_name = im.trait_ref.as_ref().map(|t| t.name.clone());
                     for ii in &im.items {
                         let ImplItem::Fn(f) = ii else { continue };
+                        // a generic method is only a template: `mono` made its `name$args` instances
+                        if !f.generics.0.is_empty() {
+                            continue;
+                        }
                         let label = trait_name.as_ref().map(|t| crate::types::trait_label(t, &trait_args));
                         let key = match &label {
                             Some(l) => format!("{}::{}::{}", tystr, l, f.name),

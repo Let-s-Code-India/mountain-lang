@@ -846,6 +846,17 @@ pub fn all_items(program: &Program) -> Vec<&Item> {
 /// the checker does not check trait default bodies themselves). Returns whether
 /// anything changed (the caller then re-checks the program).
 pub fn inline_default_methods(program: &mut Program) -> bool {
+    inline_defaults(program, false)
+}
+
+/// Phase 11c C1b: trait default methods that declare their own type parameters are
+/// inlined BEFORE the first check, so their calls are instantiated by `mono` like
+/// those of any other generic method.
+pub fn inline_generic_default_methods(program: &mut Program) -> bool {
+    inline_defaults(program, true)
+}
+
+fn inline_defaults(program: &mut Program, only_generic: bool) -> bool {
     use std::collections::HashMap;
     // Traits and impls may be nested in function bodies (Phase 11b-1), so
     // both are collected / patched over the whole item tree.
@@ -856,7 +867,7 @@ pub fn inline_default_methods(program: &mut Program) -> bool {
                 .items
                 .iter()
                 .filter_map(|ti| match ti {
-                    TraitItem::Fn(f) if f.body.is_some() => Some(f.clone()),
+                    TraitItem::Fn(f) if f.body.is_some() && (!only_generic || !f.generics.0.is_empty()) => Some(f.clone()),
                     _ => None,
                 })
                 .collect();

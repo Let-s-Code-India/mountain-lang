@@ -296,3 +296,93 @@ fn main() {
     println(c.n);
 }", "2.5\n5\n");
 }
+
+// ---------- C1b: turbofish on a method call; generic methods in traits ----------
+
+#[test]
+fn method_turbofish_fixes_the_type_parameter() {
+    ok("struct Foo { v: i32 }
+impl Foo { fn pick<U>(self, u: U) -> U { return u; } }
+fn main() { let f = Foo { v: 1 }; println(f.pick::<f64>(2.5)); let x: i64 = f.pick::<i64>(7); println(x); }", "2.5\n7\n");
+}
+
+#[test]
+fn method_turbofish_on_a_generic_impl() {
+    ok("struct Box2<T> { v: T }
+impl<T> Box2<T> { fn pairWith<U>(self, u: U) -> U { return u; } }
+fn main() { let b = Box2 { v: 1 }; println(b.pairWith::<bool>(true)); }", "true\n");
+}
+
+#[test]
+fn method_turbofish_with_too_many_arguments_is_rejected() {
+    rejected("struct Foo { v: i32 }
+impl Foo { fn pick<U>(self, u: U) -> U { return u; } }
+fn main() { let f = Foo { v: 1 }; println(f.pick::<f64, i32>(2.5)); }", "type argument");
+}
+
+#[test]
+fn method_turbofish_type_mismatch_is_rejected() {
+    rejected("struct Foo { v: i32 }
+impl Foo { fn pick<U>(self, u: U) -> U { return u; } }
+fn main() { let f = Foo { v: 1 }; println(f.pick::<bool>(2.5)); }", "expected");
+}
+
+#[test]
+fn generic_method_declared_in_a_trait_and_implemented() {
+    ok("trait Pick { fn pick<U>(self, u: U) -> U; fn id(self) -> i32; }
+struct Foo { v: i32 }
+impl Pick for Foo { fn pick<U>(self, u: U) -> U { return u; } fn id(self) -> i32 { return self.v; } }
+fn main() { let f = Foo { v: 4 }; println(f.pick(2.5)); println(f.pick(true)); println(f.pick::<i64>(9)); println(f.id()); }", "2.5\ntrue\n9\n4\n");
+}
+
+#[test]
+fn trait_generic_method_never_called_still_compiles() {
+    ok("trait Pick { fn pick<U>(self, u: U) -> U; }
+struct Foo { v: i32 }
+impl Pick for Foo { fn pick<U>(self, u: U) -> U { return u; } }
+fn main() { let f = Foo { v: 4 }; println(f.v); }", "4\n");
+}
+
+#[test]
+fn trait_generic_method_with_a_bound() {
+    ok("trait Scale { fn scale(self, k: i32) -> i32; }
+impl Scale for i32 { fn scale(self, k: i32) -> i32 { return self * k; } }
+trait Apply { fn apply<U: Scale>(self, x: U) -> i32; }
+struct Mul { k: i32 }
+impl Apply for Mul { fn apply<U: Scale>(self, x: U) -> i32 { return x.scale(self.k); } }
+fn main() { let m = Mul { k: 3 }; println(m.apply(5)); }", "15\n");
+}
+
+#[test]
+fn trait_generic_method_bound_violation_is_rejected() {
+    rejected("trait Scale { fn scale(self, k: i32) -> i32; }
+impl Scale for i32 { fn scale(self, k: i32) -> i32 { return self * k; } }
+trait Apply { fn apply<U: Scale>(self, x: U) -> i32; }
+struct Mul { k: i32 }
+impl Apply for Mul { fn apply<U: Scale>(self, x: U) -> i32 { return x.scale(self.k); } }
+fn main() { let m = Mul { k: 3 }; println(m.apply(true)); }", "does not satisfy bound");
+}
+
+#[test]
+fn trait_generic_default_method() {
+    ok("trait Pick { fn pick<U>(self, u: U) -> U { return u; } }
+struct Foo { v: i32 }
+impl Pick for Foo { }
+fn main() { let f = Foo { v: 4 }; println(f.pick(2.5)); }", "2.5\n");
+}
+
+#[test]
+fn trait_generic_method_in_a_generic_impl() {
+    ok("trait Pick { fn pick<U>(self, u: U) -> U; }
+struct Box2<T> { v: T }
+impl<T> Pick for Box2<T> { fn pick<U>(self, u: U) -> U { return u; } }
+fn main() { let b = Box2 { v: 1 }; println(b.pick(2.5)); }", "2.5\n");
+}
+
+#[test]
+fn missing_trait_generic_method_has_a_correct_message() {
+    rejected("trait Pick { fn pick<U>(self, u: U) -> U; }
+struct Foo { v: i32 }
+impl Pick for Foo { }
+fn main() { let f = Foo { v: 4 }; println(f.v); }", "missing required method `pick`");
+}

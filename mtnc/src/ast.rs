@@ -572,7 +572,7 @@ pub enum Expr {
     Field { expr: Box<Expr>, name: String },
     Index { expr: Box<Expr>, index: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Arg> },
-    MethodCall { receiver: Box<Expr>, name: String, args: Vec<Arg> },
+    MethodCall { receiver: Box<Expr>, name: String, args: Vec<Arg>, gens: Vec<Type> },
     Spawn { is_move: bool, body: SpawnBody },
     Select(Vec<SelectArm>),
     Query(QueryExpr),

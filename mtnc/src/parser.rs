@@ -1402,18 +1402,19 @@ impl Parser {
                 // (Document 16 §1.21.1's `"42".parse::<i32>()?`, used
                 // directly in Document 24 §1). Parsed and discarded for
                 // the same reason as the primary-position turbofish above.
+                let mut mgens: Vec<Type> = Vec::new();
                 if self.check_op(Op::ColonColon) {
                     let save = self.pos;
                     self.advance();
                     if self.check_op(Op::Lt) {
-                        let _ = self.parse_generic_args_opt()?;
+                        mgens = self.parse_generic_args_opt()?;
                     } else {
                         self.pos = save;
                     }
                 }
                 if self.check_delim(Delim::LParen) {
                     let args = self.parse_arg_list()?;
-                    expr = Expr::MethodCall { receiver: Box::new(expr), name, args };
+                    expr = Expr::MethodCall { receiver: Box::new(expr), name, args, gens: mgens };
                 } else {
                     expr = Expr::Field { expr: Box::new(expr), name };
                 }
@@ -2110,7 +2111,7 @@ mod tests {
                 to_sexpr(callee),
                 args.iter().map(|a| to_sexpr(&a.value)).collect::<Vec<_>>().join(", ")
             ),
-            Expr::MethodCall { receiver, name, args } => format!(
+            Expr::MethodCall { receiver, name, args, .. } => format!(
                 "(methodcall {} {} [{}])",
                 to_sexpr(receiver),
                 name,
