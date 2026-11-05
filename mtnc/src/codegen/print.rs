@@ -91,7 +91,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let newline = name.ends_with("ln");
         let fd = if name.starts_with('e') { 2u64 } else { 1u64 };
         let ty = self.ty_of(&args[0].value)?;
-        let v = self.expr_as(&args[0].value, &ty)?;
+        // printing lends its argument: a `String` local is read in place, not moved
+        let v = if ty == Ty::StringTy {
+            let (hp, _) = self.place_or_spill(&args[0].value)?;
+            self.load(hp, &Ty::StringTy)?
+        } else {
+            self.expr_as(&args[0].value, &ty)?
+        };
         let i32t = self.context.i32_type();
         let ptr = self.context.ptr_type(AddressSpace::default());
         let dprintf = self.get_extern("dprintf", Some(i32t.into()), &[i32t.into(), ptr.into()], true);

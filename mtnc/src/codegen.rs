@@ -123,6 +123,8 @@ struct LoopCtx<'ctx> {
     break_bb: BasicBlock<'ctx>,
     continue_bb: BasicBlock<'ctx>,
     result: Option<(PointerValue<'ctx>, Ty)>,
+    /// `drop_frames.len()` when the loop was entered: frames above it belong to the loop body.
+    frames: usize,
 }
 
 struct Bind<'ctx> {
@@ -165,6 +167,11 @@ pub struct Codegen<'ctx, 'a> {
     ret_ty: Ty,
     locals: Vec<HashMap<String, (PointerValue<'ctx>, Ty)>>,
     loops: Vec<LoopCtx<'ctx>>,
+    /// `match` expressions (by address) matched through a reference: owning bindings are `&T` (types.rs).
+    by_ref_matches: std::collections::HashSet<usize>,
+    cur_match_by_ref: bool,
+    drop_frames: Vec<drops::DropFrame<'ctx>>,
+    drop_glues: HashMap<String, FunctionValue<'ctx>>,
     dead: bool,
     block_counter: usize,
     /// Tail-call state of the function being generated (Document 10 §6).
@@ -275,6 +282,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             ret_ty: Ty::Unit,
             locals: Vec::new(),
             loops: Vec::new(),
+            by_ref_matches: std::collections::HashSet::new(),
+            cur_match_by_ref: false,
+            drop_frames: Vec::new(),
+            drop_glues: HashMap::new(),
             dead: false,
             block_counter: 0,
             cur_key: String::new(),
@@ -381,6 +392,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.handle_ty().into()
             }
             Ty::Fn(..) => return unsupported("function values / closures", 12),
+            Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
             Ty::Null => return unsupported("`null`", 11),
@@ -463,9 +475,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     fn declare_local(&mut self, name: &str, ty: &Ty) -> R<PointerValue<'ctx>> {
-        let lt = self.llty(ty)?;
-        let p = self.alloca(lt, name)?;
+        let p = self.alloca_owning(ty, name)?;
         self.locals.last_mut().unwrap().insert(name.to_string(), (p, ty.clone()));
+        self.register_local_drop(p, ty);
         Ok(p)
     }
 
@@ -645,6 +657,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// A written type, with aliases expanded and `Self` resolved.
     pub(crate) fn rty(&self, t: &Type) -> Ty {
         self.subst_self(resolve_type(t))
+    }
+
+    /// The `match` expressions the type checker matched through a reference.
+    pub fn set_by_ref_matches(&mut self, s: std::collections::HashSet<usize>) {
+        self.by_ref_matches = s;
     }
 
     pub fn generate(&mut self, program: &'a Program) -> Result<(), Vec<String>> {
@@ -998,6 +1015,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.tail_params = Vec::new();
         self.ret_ty = ret.clone();
         self.locals = vec![HashMap::new()];
+        self.drop_frames = vec![drops::DropFrame { scope: true, entries: Vec::new() }];
         self.loops.clear();
         self.dead = false;
         let alloca_bb = self.context.append_basic_block(val, "entry");
@@ -1064,8 +1082,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             if self.dead || bty == Ty::Never {
                 self.builder.build_unreachable()?;
             } else if is_unit_like(&ret) {
+                self.emit_frames_from(0)?;
                 self.builder.build_return(None)?;
             } else {
+                self.emit_frames_from(0)?;
                 self.builder.build_return(Some(&v))?;
             }
         }
@@ -1119,6 +1139,7 @@ pub struct EnumLayoutRef<'ctx> {
     pub variants: Vec<StructType<'ctx>>,
 }
 
+mod drops;
 mod expr;
 mod print;
 pub(crate) mod tail;

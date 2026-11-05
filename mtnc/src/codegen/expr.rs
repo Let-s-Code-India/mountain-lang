@@ -41,7 +41,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // ------------------------------------------------------------------
 
     pub(super) fn gen_block(&mut self, b: &Block) -> R<(V<'ctx>, Ty)> {
-        self.locals.push(HashMap::new());
+        self.push_scope();
         let mut result: R<(V<'ctx>, Ty)> = Ok((self.unit(), Ty::Unit));
         for s in &b.stmts {
             if let Err(e) = self.gen_stmt(s) {
@@ -51,20 +51,35 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         if result.is_ok() {
             result = match &b.tail {
-                Some(t) => (|| {
-                    let ty = self.ty_of(t)?;
-                    let v = self.expr(t)?;
-                    Ok((v, ty))
-                })(),
+                Some(t) => {
+                    self.push_frame(false);
+                    let r = (|| {
+                        let ty = self.ty_of(t)?;
+                        let v = self.expr(t)?;
+                        Ok((v, ty))
+                    })();
+                    let ok = r.is_ok();
+                    self.pop_frame(ok)?;
+                    r
+                }
                 None => Ok((self.unit(), Ty::Unit)),
             };
         }
-        self.locals.pop();
+        let ok = result.is_ok();
+        self.pop_scope(ok)?;
         let (v, ty) = result?;
         Ok((v, if self.dead { Ty::Never } else { ty }))
     }
 
     fn gen_stmt(&mut self, s: &Stmt) -> R<()> {
+        self.push_frame(false);
+        let r = self.gen_stmt_inner(s);
+        let ok = r.is_ok();
+        self.pop_frame(ok)?;
+        r
+    }
+
+    fn gen_stmt_inner(&mut self, s: &Stmt) -> R<()> {
         match s {
             Stmt::Let { pattern, ty, value, .. } => {
                 let annotated = ty.as_ref().map(|t| self.rty(t));
@@ -80,12 +95,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                                     self.builder.build_store(slot, val)?;
                                 }
                             }
-                            Pattern::Wildcard => {}
+                            Pattern::Wildcard => {
+                                if vty != Ty::Never {
+                                    self.spill_owned(val, &lty)?;
+                                }
+                            }
                             other => {
-                                let tmp = self.spill(val, &lty)?;
+                                let tmp = self.spill_owned(val, &lty)?;
                                 let mut binds = Vec::new();
                                 self.pat_test(other, tmp, &lty, &mut binds, false)?;
-                                self.materialize(binds)?;
+                                let pending = self.materialize(binds)?;
+                                self.commit_binds(pending)?;
                             }
                         }
                     }
@@ -102,7 +122,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ok(())
             }
             Stmt::Expr(e) => {
-                self.expr(e)?;
+                let ety = self.ty_of(e)?;
+                let v = self.expr(e)?;
+                // an unused owned value (`make();`) is dropped at the end of the statement
+                if ety != Ty::Never && !self.dead && self.needs_drop(&ety) {
+                    self.spill_owned(v, &ety)?;
+                }
                 Ok(())
             }
             Stmt::Return(v) => self.gen_return(v.as_ref()),
@@ -110,6 +135,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Stmt::Continue { label } => {
                 let idx = self.find_loop(label)?;
                 let bb = self.loops[idx].continue_bb;
+                let from = self.loops[idx].frames;
+                self.emit_frames_from(from)?;
                 self.builder.build_unconditional_branch(bb)?;
                 self.terminate();
                 Ok(())
@@ -155,6 +182,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         }
         let bb = self.loops[idx].break_bb;
+        let from = self.loops[idx].frames;
+        self.emit_frames_from(from)?;
         self.builder.build_unconditional_branch(bb)?;
         self.terminate();
         Ok(())
@@ -167,12 +196,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             None => None,
         };
         if is_unit_like(&ret) {
+            self.emit_frames_from(0)?;
             self.builder.build_return(None)?;
         } else {
             let v = match val {
                 Some(v) => v,
                 None => return Err(CgErr(format!("`return;` in a function returning `{}`", ret))),
             };
+            self.emit_frames_from(0)?;
             self.builder.build_return(Some(&v))?;
         }
         self.terminate();
@@ -186,7 +217,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(p)
     }
 
-    fn load(&mut self, p: PointerValue<'ctx>, ty: &Ty) -> R<V<'ctx>> {
+    pub(super) fn load(&mut self, p: PointerValue<'ctx>, ty: &Ty) -> R<V<'ctx>> {
         let lt = self.llty(ty)?;
         Ok(self.builder.build_load(lt, p, "")?)
     }
@@ -204,7 +235,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             if let Expr::Literal(l @ (Literal::Str(_) | Literal::RawStr(_))) = le {
                 return self.literal(l, &t, false);
             }
-            let h = self.expr(e)?.into_struct_value();
+            // lend the bytes of the place (a local is NOT moved); an rvalue lives as a temporary
+            let (hp, _) = self.place_or_spill(e)?;
+            let h = self.load(hp, &Ty::StringTy)?.into_struct_value();
             let p = self.builder.build_extract_value(h, 0, "sp")?.into_pointer_value();
             let n = self.builder.build_extract_value(h, 1, "sn")?.into_int_value();
             return self.build_slice(p, n);
@@ -244,11 +277,37 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.build_handle(p, n, n)
     }
 
-    fn materialize(&mut self, binds: Vec<Bind<'ctx>>) -> R<()> {
+    /// Copies every pattern binding into a new local. Bindings that own heap memory are NOT yet
+    /// owners (the arm's guard may still fail): `commit_binds` moves them out of the scrutinee.
+    fn materialize(&mut self, binds: Vec<Bind<'ctx>>) -> R<Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>> {
+        let mut pending = Vec::new();
         for b in binds {
+            if self.cur_match_by_ref && self.needs_drop(&b.ty) {
+                // behind a reference: the binding is a reference to the part, the owner keeps it
+                let rty = Ty::Ref(false, Box::new(b.ty.clone()));
+                let slot = self.alloca_ty(&rty, &b.name)?;
+                self.builder.build_store(slot, b.ptr)?;
+                self.locals.last_mut().unwrap().insert(b.name.clone(), (slot, rty));
+                continue;
+            }
             let v = self.load(b.ptr, &b.ty)?;
-            let slot = self.declare_local(&b.name, &b.ty)?;
+            let lt = self.llty(&b.ty)?;
+            let slot = self.alloca(lt, &b.name)?;
+            if self.needs_drop(&b.ty) {
+                self.alloca_builder.build_store(slot, lt.const_zero())?;
+                pending.push((slot, b.ptr, b.ty.clone()));
+            }
+            self.locals.last_mut().unwrap().insert(b.name.clone(), (slot, b.ty.clone()));
             self.builder.build_store(slot, v)?;
+        }
+        Ok(pending)
+    }
+
+    /// The bindings now own their parts: zero the source parts and register the locals for drop.
+    fn commit_binds(&mut self, pending: Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>) -> R<()> {
+        for (slot, src, ty) in pending {
+            self.mark_moved(src, &ty)?;
+            self.register_local_drop(slot, &ty);
         }
         Ok(())
     }
@@ -323,10 +382,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Field { expr: base, name } => {
                 let bty = self.ty_of(base)?;
-                if self.is_place_expr(base) || matches!(bty, Ty::Ref(..)) {
+                if self.is_place_expr(base) || matches!(bty, Ty::Ref(..) | Ty::Generic(..)) || self.needs_drop(&bty) {
                     // Read through the place (auto-deref of references, no whole-struct copy).
                     let (p, t) = self.place(e)?;
-                    return self.load(p, &t);
+                    let v = self.load(p, &t)?;
+                    if self.needs_drop(&t) {
+                        // a partial move out of the struct
+                        if self.root_is_borrowed(e) {
+                            return Err(CgErr(format!("cannot move the `{}` field (type `{}`) out of a borrowed value", name, t)));
+                        }
+                        self.mark_moved(p, &t)?;
+                    }
+                    return Ok(v);
                 }
                 let (idx, _) = self.field_index(&bty, name)?;
                 let bv = self.expr(base)?;
@@ -334,6 +401,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Index { .. } => {
                 let (p, t) = self.place(e)?;
+                if self.needs_drop(&t) {
+                    return Err(CgErr(format!("cannot move an element of type `{}` out of an array by indexing (borrow it with `borrow v[i]`)", t)));
+                }
                 self.load(p, &t)
             }
             Expr::Array(items) => {
@@ -444,6 +514,31 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Deref(inner) => {
                 let ty = self.ty_of(e)?;
+                let ity = self.ty_of(inner)?;
+                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc") {
+                    if self.needs_drop(&ty) {
+                        return Err(CgErr(format!("cannot move a `{}` out of a shared `{}` (use `.clone()` on the pointer, or borrow through it)", ty, ity)));
+                    }
+                    let (bp, _) = self.place_or_spill(inner)?;
+                    let (vp, _) = self.peel_box_place(bp, ity.clone())?;
+                    return self.load(vp, &ty);
+                }
+                if matches!(&ity, Ty::Generic(n, _) if n == "Box") {
+                    let (bp, _) = self.place_or_spill(inner)?;
+                    let ptrt = self.context.ptr_type(AddressSpace::default());
+                    let bptr = self.builder.build_load(ptrt, bp, "box")?.into_pointer_value();
+                    let v = self.load(bptr, &ty)?;
+                    if self.needs_drop(&ty) {
+                        // `*b` moves the content out: only the allocation itself is released
+                        let ut = self.usize_ty();
+                        let lt = self.llty(&ty)?;
+                        let (size, align) = (self.td.get_abi_size(&lt).max(1), (self.td.get_abi_alignment(&lt) as u64).max(1));
+                        let (_, fd) = self.alloc_fns();
+                        self.builder.build_call(fd, &[bptr.into(), ut.const_int(size, false).into(), ut.const_int(align, false).into()], "")?;
+                        self.mark_moved(bp, &ity)?;
+                    }
+                    return Ok(v);
+                }
                 let pv = self.expr(inner)?.into_pointer_value();
                 self.load(pv, &ty)
             }
@@ -467,7 +562,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     fn ident(&mut self, e: &Expr, name: &str) -> R<V<'ctx>> {
         if let Some((p, t)) = self.lookup_local(name) {
-            return self.load(p, &t);
+            let v = self.load(p, &t)?;
+            // reading an owning local by value moves it out
+            if self.needs_drop(&t) {
+                if self.is_ref_param_local(p, &t) {
+                    return Err(CgErr(format!("cannot move `{}` out of a borrowed parameter", name)));
+                }
+                self.mark_moved(p, &t)?;
+            }
+            return Ok(v);
         }
         if let Some((ce, cty)) = self.consts.get(name).cloned() {
             // Document 3: a `const` is inlined at every use site.
@@ -610,12 +713,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
     }
 
-    fn variant_index(&self, name: &str, ty: &Ty) -> Option<usize> {
+    pub(super) fn variant_index(&self, name: &str, ty: &Ty) -> Option<usize> {
         let last = name.rsplit("::").next().unwrap_or(name);
         self.variants_of(ty)?.iter().position(|(n, _)| n == last)
     }
 
-    fn make_enum(&mut self, ty: &Ty, idx: usize, vals: Vec<V<'ctx>>) -> R<V<'ctx>> {
+    pub(super) fn make_enum(&mut self, ty: &Ty, idx: usize, vals: Vec<V<'ctx>>) -> R<V<'ctx>> {
         let layout = self.enum_layout(ty)?;
         let tmp = self.alloca(layout.llty.into(), "enum")?;
         let tag = self.builder.build_struct_gep(layout.llty, tmp, 0, "tag")?;
@@ -630,7 +733,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(self.builder.build_load(layout.llty, tmp, "")?)
     }
 
-    fn enum_tag(&mut self, ty: &Ty, place: PointerValue<'ctx>) -> R<IntValue<'ctx>> {
+    pub(super) fn enum_tag(&mut self, ty: &Ty, place: PointerValue<'ctx>) -> R<IntValue<'ctx>> {
         let layout = self.enum_layout(ty)?;
         let tp = self.builder.build_struct_gep(layout.llty, place, 0, "tag")?;
         Ok(self.builder.build_load(self.int_ty(32), tp, "tag")?.into_int_value())
@@ -653,6 +756,48 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
     }
 
+    /// Follows `Box` layers: `p` addresses a value of type `ty`; returns the address and type of the
+    /// content when `ty` is a `Box<T>` (repeatedly), otherwise `p` and `ty` unchanged.
+    fn peel_box_place(&mut self, mut p: PointerValue<'ctx>, mut ty: Ty) -> R<(PointerValue<'ctx>, Ty)> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        loop {
+            match &ty {
+                Ty::Generic(n, a) if n == "Box" => {
+                    let Some(crate::types::GenericArg::Type(inner)) = a.first() else { return Err(CgErr("internal: `Box` without a type argument".into())) };
+                    let inner = inner.clone();
+                    p = self.builder.build_load(ptrt, p, "boxed")?.into_pointer_value();
+                    ty = inner;
+                }
+                Ty::Generic(n, a) if (n == "Rc" || n == "Arc") && !a.is_empty() => {
+                    let Some(crate::types::GenericArg::Type(inner)) = a.first() else { return Err(CgErr("internal: `Rc` without a type argument".into())) };
+                    let inner = inner.clone();
+                    let obj = self.builder.build_load(ptrt, p, "rcobj")?.into_pointer_value();
+                    let objt = self.rc_obj_ty(&inner)?;
+                    p = self.builder.build_struct_gep(objt, obj, 2, "rcval")?;
+                    ty = inner;
+                }
+                _ => return Ok((p, ty)),
+            }
+        }
+    }
+
+    /// Does the place expression `e` live behind a reference / `borrow` parameter?
+    fn root_is_borrowed(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Paren(i) => self.root_is_borrowed(i),
+            Expr::Field { expr, .. } => {
+                matches!(self.ty_of(expr), Ok(Ty::Ref(..))) || matches!(self.ty_of(expr), Ok(Ty::Generic(ref n, _)) if n == "Rc" || n == "Arc") || self.root_is_borrowed(expr)
+            }
+            Expr::Index { expr, .. } => matches!(self.ty_of(expr), Ok(Ty::Ref(..))) || self.root_is_borrowed(expr),
+            Expr::Deref(_) => true,
+            Expr::Ident(n) => match self.lookup_local(n) {
+                Some((p, ty)) => self.is_ref_param_local(p, &ty) || matches!(ty, Ty::Ref(..)),
+                None => true,
+            },
+            _ => false,
+        }
+    }
+
     /// The memory location of `e`; an rvalue is first spilled to a temporary.
     pub(super) fn place_or_spill(&mut self, e: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
         if self.is_place_expr(e) {
@@ -660,7 +805,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         let ty = self.ty_of(e)?;
         let v = self.expr_as(e, &ty)?;
-        let p = self.spill(v, &ty)?;
+        let p = self.spill_owned(v, &ty)?;
         Ok((p, ty))
     }
 
@@ -701,6 +846,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         (p, t)
                     }
                 };
+                let (bp, st_ty) = self.peel_box_place(bp, st_ty)?;
                 let (idx, fty) = self.field_index(&st_ty, name)?;
                 let st = self.llty(&st_ty)?;
                 Ok((self.builder.build_struct_gep(st, bp, idx, "fp")?, fty))
@@ -708,6 +854,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::Index { expr: base, index } => self.index_place(base, index),
             Expr::Deref(inner) => {
                 let ty = self.ty_of(e)?;
+                let ity = self.ty_of(inner)?;
+                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc") {
+                    let (bp, _) = self.place_or_spill(inner)?;
+                    let (vp, _) = self.peel_box_place(bp, ity.clone())?;
+                    return Ok((vp, ty));
+                }
+                if matches!(&ity, Ty::Generic(n, _) if n == "Box") {
+                    let (bp, _) = self.place_or_spill(inner)?;
+                    let ptrt = self.context.ptr_type(AddressSpace::default());
+                    let bptr = self.builder.build_load(ptrt, bp, "box")?.into_pointer_value();
+                    return Ok((bptr, ty));
+                }
                 let pv = self.expr(inner)?.into_pointer_value();
                 Ok((pv, ty))
             }
@@ -717,7 +875,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     // ---- arrays, slices, references (Phase 11a) -------------------------------
 
-    fn usize_ty(&self) -> IntType<'ctx> {
+    pub(super) fn usize_ty(&self) -> IntType<'ctx> {
         self.int_ty(self.ptr_bits())
     }
 
@@ -1139,6 +1297,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     )));
                 }
             }
+            // everything owned by this activation is dropped before the jump (the arguments were
+            // already evaluated; those that moved a local left it all-zero)
+            self.emit_frames_from(0)?;
             let cur_bb = self.builder.get_insert_block().unwrap();
             let slots = self.tail_params.clone();
             for (slot, v) in slots.iter().zip(vals.iter()) {
@@ -1175,9 +1336,32 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Arg], call_addr: usize) -> R<V<'ctx>> {
         let rty = self.ty_of(receiver)?;
+        {
+            let mut b0 = rty.clone();
+            while let Ty::Ref(_, i) = b0 {
+                b0 = *i;
+            }
+            if let Ty::Generic(gn, ga) = &b0 {
+                if matches!(gn.as_str(), "Rc" | "Arc" | "Weak") && matches!(name, "clone" | "downgrade" | "upgrade") {
+                    let whole_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: the type checker recorded no type for a method call".into()))?;
+                    return self.rc_method(receiver, gn, ga, name, &whole_ty);
+                }
+            }
+        }
         let mut base = rty.clone();
-        while let Ty::Ref(_, i) = base {
-            base = *i;
+        let mut boxed = false;
+        loop {
+            match base {
+                Ty::Ref(_, i) => base = *i,
+                Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => {
+                    boxed = true;
+                    match &a[0] {
+                        crate::types::GenericArg::Type(t) => base = t.clone(),
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
         }
         if let Ty::DynTrait(_) = base {
             return unsupported("method calls on `dyn Trait` (dynamic dispatch)", 11);
@@ -1207,6 +1391,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         }
         let recv: V<'ctx> = match kind {
+            PMode::Ref(_) if boxed => {
+                // auto-deref through `Box<T>`: the receiver is the pointer to the content
+                let (p, t) = self.place_or_spill(receiver)?;
+                let mut t = t;
+                let mut p = p;
+                while let Ty::Ref(_, i) = &t {
+                    let ptrt = self.context.ptr_type(AddressSpace::default());
+                    p = self.builder.build_load(ptrt, p, "deref")?.into_pointer_value();
+                    t = (**i).clone();
+                }
+                let (p, _) = self.peel_box_place(p, t)?;
+                p.into()
+            }
+            _ if boxed => {
+                return Err(CgErr(format!("cannot call the by-value method `{}::{}` through a `Box`: move the value out first with `*b`", tystr, name)));
+            }
             PMode::Ref(_) => {
                 if matches!(rty, Ty::Ref(..)) {
                     let mut v = self.expr(receiver)?;
@@ -1257,6 +1457,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let rty = self.ty_of(rhs)?;
             let v = self.expr_as(rhs, &lty)?;
             if rty != Ty::Never {
+                // the old value is dropped first (it may be all-zero: moved out earlier)
+                if self.needs_drop(&lty) {
+                    self.drop_in_place(p, &lty)?;
+                }
                 self.builder.build_store(p, v)?;
             }
             return Ok(());
@@ -1911,7 +2115,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let end = self.new_block("loop_end");
                 self.builder.build_unconditional_branch(head)?;
                 self.position(head);
-                self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: head, result: result.clone() });
+                self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: head, result: result.clone(), frames: self.drop_frames.len() });
                 let r = self.gen_block(body);
                 self.loops.pop();
                 r?;
@@ -1928,10 +2132,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let end = self.new_block("while_end");
                 self.builder.build_unconditional_branch(head)?;
                 self.position(head);
+                self.push_frame(false);
                 let c = self.expr_as(cond, &Ty::Bool)?.into_int_value();
+                self.pop_frame(true)?;
                 self.builder.build_conditional_branch(c, body_bb, end)?;
                 self.position(body_bb);
-                self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: head, result: None });
+                self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: head, result: None, frames: self.drop_frames.len() });
                 let r = self.gen_block(body);
                 self.loops.pop();
                 r?;
@@ -1945,13 +2151,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let end = self.new_block("do_end");
                 self.builder.build_unconditional_branch(body_bb)?;
                 self.position(body_bb);
-                self.loops.push(LoopCtx { label: None, break_bb: end, continue_bb: cond_bb, result: None });
+                self.loops.push(LoopCtx { label: None, break_bb: end, continue_bb: cond_bb, result: None, frames: self.drop_frames.len() });
                 let r = self.gen_block(body);
                 self.loops.pop();
                 r?;
                 self.builder.build_unconditional_branch(cond_bb)?;
                 self.position(cond_bb);
+                self.push_frame(false);
                 let c = self.expr_as(cond, &Ty::Bool)?.into_int_value();
+                self.pop_frame(true)?;
                 self.builder.build_conditional_branch(c, body_bb, end)?;
                 self.position(end);
                 Ok(self.unit())
@@ -2008,7 +2216,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Pattern::Wildcard => {}
             _ => return unsupported("destructuring patterns in `for`", 16),
         }
-        self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: step, result: None });
+        self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: step, result: None, frames: self.drop_frames.len() });
         let r = self.gen_block(body);
         self.loops.pop();
         self.locals.pop();
@@ -2242,14 +2450,34 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         if let (Some(s), true) = (slot, ty != Ty::Never) {
             self.builder.build_store(s, v)?;
         }
+        // drop the arm's bindings before leaving the arm
+        self.emit_top_frame_if_live()?;
         self.builder.build_unconditional_branch(merge)?;
         Ok(())
     }
 
     fn gen_match(&mut self, m: &MatchExpr, ty: &Ty) -> R<V<'ctx>> {
-        let sty = self.ty_of(&m.scrutinee)?;
-        let sval = self.expr(&m.scrutinee)?;
-        let place = self.spill(sval, &sty)?;
+        let by_ref = self.by_ref_matches.contains(&(m as *const MatchExpr as usize));
+        let saved_by_ref = std::mem::replace(&mut self.cur_match_by_ref, by_ref);
+        let r = self.gen_match_inner(m, ty);
+        self.cur_match_by_ref = saved_by_ref;
+        r
+    }
+
+    fn gen_match_inner(&mut self, m: &MatchExpr, ty: &Ty) -> R<V<'ctx>> {
+        let by_ref = self.cur_match_by_ref;
+        let mut sty = self.ty_of(&m.scrutinee)?;
+        // a place scrutinee is matched in place (bindings move their parts out of it); an rvalue
+        // lives in a temporary that is dropped with the statement
+        let place = match &sty {
+            Ty::Ref(_, inner) if by_ref && !matches!(**inner, Ty::Array(_) | Ty::Str) => {
+                // matching through a reference: the pointer value is the place of the referent
+                let pv = self.expr(&m.scrutinee)?.into_pointer_value();
+                sty = (**inner).clone();
+                pv
+            }
+            _ => self.place_or_spill(&m.scrutinee)?.0,
+        };
         let slot = if is_unit_like(ty) { None } else { Some(self.alloca_ty(ty, "match")?) };
         let merge = self.new_block("match_end");
         if self.switchable(&m.arms, &sty) {
@@ -2307,17 +2535,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.builder.build_switch(discr, default_bb, &cases)?;
         for (arm, bb) in m.arms.iter().zip(arm_bbs.iter()) {
             self.position(*bb);
-            self.locals.push(HashMap::new());
+            self.push_scope();
             let flat = flatten_patterns(&arm.patterns);
             let r = (|| -> R<()> {
                 if let Some(p) = flat.first() {
                     let mut binds = Vec::new();
                     self.pat_test(p, place, sty, &mut binds, false)?;
-                    self.materialize(binds)?;
+                    let pending = self.materialize(binds)?;
+                    self.commit_binds(pending)?;
                 }
                 self.arm_body(&arm.body, slot, merge)
             })();
-            self.locals.pop();
+            self.pop_scope(false)?;
             r?;
         }
         Ok(())
@@ -2341,18 +2570,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let next_bb = self.new_block("arm_next");
             self.builder.build_conditional_branch(cond, body_bb, next_bb)?;
             self.position(body_bb);
-            self.locals.push(HashMap::new());
+            self.push_scope();
             let res = (|| -> R<()> {
-                self.materialize(binds)?;
+                let pending = self.materialize(binds)?;
                 if let Some(g) = &arm.guard {
+                    // the guard sees copies; the bindings take ownership only once it passed
+                    self.push_frame(false);
                     let gv = self.expr_as(g, &Ty::Bool)?.into_int_value();
+                    self.pop_frame(true)?;
                     let go = self.new_block("guard_ok");
                     self.builder.build_conditional_branch(gv, go, next_bb)?;
                     self.position(go);
                 }
+                self.commit_binds(pending)?;
                 self.arm_body(&arm.body, slot, merge)
             })();
-            self.locals.pop();
+            self.pop_scope(false)?;
             res?;
             self.position(next_bb);
         }
@@ -2408,12 +2641,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ev = v;
             }
             let out = self.make_enum(&ret, 1, vec![ev])?;
+            self.emit_frames_from(0)?;
             self.builder.build_return(Some(&out))?;
         } else {
             if !matches!(ret, Ty::OptionTy(_)) {
                 return Err(CgErr(format!("`?` on an `Option` needs the function to return `Option<_>`, it returns `{}`", ret)));
             }
             let out = self.make_enum(&ret, 1, Vec::new())?;
+            self.emit_frames_from(0)?;
             self.builder.build_return(Some(&out))?;
         }
         self.position(ok_bb);
@@ -2435,6 +2670,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         "Ok" | "Err" | "Some" => return self.ctor_call(whole, name, args),
                         "panic" => return self.gen_panic(args),
                         "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
+                        "drop" => return self.gen_drop_call(args),
                         "assert" => return self.gen_assert(args),
                         "ensure" => return self.gen_ensure(whole, args),
                         "print" | "println" | "eprint" | "eprintln" => return self.gen_print(name, args),
@@ -2502,7 +2738,32 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         let display = format!("{}::{}", tystr, fname);
                         return self.call_fn(&key, &display, None, args, whole as *const Expr as usize);
                     }
-                    if matches!(tn.as_str(), "Box" | "Rc" | "Arc" | "Weak") {
+                    if tn == "Box" && fname == "new" {
+                        let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `Box::new` is not typed as a Box".into())) };
+                        let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(CgErr("internal: `Box` without a type argument".into())) };
+                        let inner = inner.clone();
+                        let v = self.expr_as(&args[0].value, &inner)?;
+                        return self.box_new(&inner, v);
+                    }
+                    if tn == "String" && fname == "from" {
+                        let at = self.ty_of(&args[0].value)?;
+                        if at == Ty::StringTy {
+                            return self.expr(&args[0].value);
+                        }
+                        let v = self.expr_as(&args[0].value, &at)?;
+                        return self.string_from_str(v);
+                    }
+                    if matches!(tn.as_str(), "Rc" | "Arc") && fname == "new" {
+                        let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `new` is not typed as an Rc/Arc".into())) };
+                        let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(CgErr("internal: `Rc` without a type argument".into())) };
+                        let inner = inner.clone();
+                        let v = self.expr_as(&args[0].value, &inner)?;
+                        return self.rc_new(&inner, v);
+                    }
+                    if matches!(tn.as_str(), "Rc" | "Arc") && matches!(fname.as_str(), "strongCount" | "weakCount") {
+                        return self.rc_count(&args[0].value, fname);
+                    }
+                    if matches!(tn.as_str(), "Rc" | "Arc" | "Weak") {
                         return unsupported(&format!("`{}::{}` (heap / shared-ownership types)", tn, fname), 11);
                     }
                     return Err(CgErr(format!("no associated function `{}::{}` found", tn, fname)));
@@ -2524,6 +2785,26 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let pty = self.variants_of(&ty).unwrap()[idx].1[0].clone();
         let v = self.expr_as(&args[0].value, &pty)?;
         self.make_enum(&ty, idx, vec![v])
+    }
+
+    /// `drop(x)`: moves `x` into a temporary and runs its drop glue right away.
+    fn gen_drop_call(&mut self, args: &[Arg]) -> R<V<'ctx>> {
+        let ty = self.ty_of(&args[0].value)?;
+        let v = self.expr_as(&args[0].value, &ty)?;
+        if self.needs_drop(&ty) && ty != Ty::Never {
+            let tmp = self.alloca_owning(&ty, "dropped")?;
+            self.builder.build_store(tmp, v)?;
+            self.drop_in_place(tmp, &ty)?;
+        }
+        Ok(self.unit())
+    }
+
+    /// Drops the top frame's entries when the current block is still live.
+    fn emit_top_frame_if_live(&mut self) -> R<()> {
+        if self.dead {
+            return Ok(());
+        }
+        self.emit_top_frame()
     }
 
     /// `alloc(size, align)` / `dealloc(ptr, size, align)` lower to the single internal allocation interface.

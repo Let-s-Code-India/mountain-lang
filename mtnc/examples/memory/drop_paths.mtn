@@ -1,0 +1,59 @@
+struct Person { name: String, age: i32 }
+struct Pair { a: String, b: String }
+
+fn consume(p: Person) -> i32 { return p.age; }
+
+fn maybe(flag: bool) {
+    let s = String::from("cond");
+    if flag {
+        let t = s;
+        println(t);
+    }
+}
+
+fn early(n: i32) -> i32 {
+    let a = String::from("a");
+    let b = String::from("b");
+    if n > 0 { return n; }
+    println(a);
+    return 0;
+}
+
+fn partial() {
+    let p = Pair { a: String::from("x"), b: String::from("y") };
+    let first = p.a;
+    println(first);
+}
+
+fn looped() {
+    let mut i = 0;
+    while i < 3 {
+        let s = String::from("loop");
+        if i == 1 { i = i + 1; continue; }
+        if i == 2 { break; }
+        println(s);
+        i = i + 1;
+    }
+}
+
+fn reassign() {
+    let mut s = String::from("one");
+    s = String::from("two");
+    println(s);
+}
+
+fn main() {
+    let p = Person { name: String::from("bob"), age: 4 };
+    println(consume(p));
+    maybe(true);
+    maybe(false);
+    println(early(1));
+    println(early(0));
+    partial();
+    looped();
+    reassign();
+    let d = String::from("dropme");
+    drop(d);
+    let v = [String::from("a"), String::from("b"), String::from("c")];
+    println(v[1]);
+}

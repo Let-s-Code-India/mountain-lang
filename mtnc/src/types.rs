@@ -187,6 +187,20 @@ pub fn builtin_variants(ty: &Ty) -> std::option::Option<Vec<(&'static str, Vec<T
 /// `borrow`ed parameter (Document 11 §5's `balance: borrow mut Account`
 /// followed by `balance.funds`). Before Phase 9 a `Ty::Ref` receiver
 /// silently fell through to `Ty::Unit`.
+/// Auto-deref through `Box<T>` (and references to it) for field and method access.
+fn peel_box(t: Ty) -> Ty {
+    let mut t = strip_refs(t);
+    loop {
+        match t {
+            Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+                GenericArg::Type(inner) => t = strip_refs(inner.clone()),
+                _ => return t,
+            },
+            _ => return t,
+        }
+    }
+}
+
 fn strip_refs(t: Ty) -> Ty {
     match t {
         Ty::Ref(_, inner) => strip_refs(*inner),
@@ -590,6 +604,11 @@ pub fn register_item_context(items: &[&Item]) {
     CONSTS.with(|c| *c.borrow_mut() = consts);
 }
 
+/// `Box`/`Rc`/`Arc`/`Weak` are compiler-known generic heap types (Doc 6/13); they need no declaration.
+pub fn is_heap_generic(n: &str) -> bool {
+    matches!(n, "Box" | "Rc" | "Arc" | "Weak")
+}
+
 fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
     let alias = |name: &str| -> Option<Type> { ALIASES.with(|a| a.borrow().get(name).cloned()) };
     match t {
@@ -613,7 +632,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         Type::Named(n, args) => match alias(n) {
             Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
             _ => {
-                if !args.is_empty() && GENERIC_TYPES.with(|g| g.borrow().contains(n)) {
+                if !args.is_empty() && (is_heap_generic(n) || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
                     let mut out = Vec::new();
                     for a in args {
                         match a {
@@ -623,6 +642,9 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
                             },
                             other => out.push(GenericArg::Type(resolve_type_depth(other, depth))),
                         }
+                    }
+                    if n == "Weak" && out.len() == 2 && matches!(&out[1], GenericArg::Type(Ty::Named(k)) if k == "Rc") {
+                        out.truncate(1);
                     }
                     Ty::Generic(n.clone(), out)
                 } else {
@@ -1036,6 +1058,9 @@ pub struct TypeChecker {
     pub method_instances: HashMap<usize, (String, String, Vec<Ty>)>,
     /// set by the driver for the check after `strip_generics`: generic method templates are gone then
     pub final_pass: bool,
+    /// `match` expressions (by address) whose scrutinee lives behind a reference: owning bindings are `&T`.
+    pub match_by_ref: std::collections::HashSet<usize>,
+    self_borrowed: bool,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
     /// Const generic parameter names of the function being checked (usable as `usize` values
@@ -1299,6 +1324,8 @@ impl TypeChecker {
             instances: HashMap::new(),
             method_instances: HashMap::new(),
             final_pass: false,
+            match_by_ref: std::collections::HashSet::new(),
+            self_borrowed: false,
             cur_tparams: Vec::new(),
             cur_const_params: Vec::new(),
             cur_bound_args: Vec::new(),
@@ -1422,6 +1449,7 @@ impl TypeChecker {
         for item in &items {
             self.register_item(item);
         }
+        self.check_type_layouts();
         // Pass 2: register and validate every `impl` block -- run only
         // after pass 1 so a trait declared textually *after* its impl
         // still resolves correctly, and so the orphan-rule / required-
@@ -1850,9 +1878,11 @@ impl TypeChecker {
         };
         let saved_self_type = self.self_type.take();
         self.self_type = self_ty.cloned();
+        self.self_borrowed = false;
         for p in &f.params {
             if p.name == "self" {
                 if let Some(t) = self_ty {
+                    self.self_borrowed = matches!(p.ownership, OwnershipMod::Borrow | OwnershipMod::BorrowMut);
                     env.insert("self".to_string(), t.clone());
                     if p.ownership == OwnershipMod::BorrowMut {
                         env.mark_mut("self");
@@ -1999,7 +2029,7 @@ impl TypeChecker {
                     // (Document 5 §3.2, Document 10 §3.3) -- reuse the
                     // match-arm binder so tuple/tuple-struct patterns
                     // distribute their field types.
-                    self.bind_pattern(pattern, &final_ty, env);
+                    self.bind_pattern(pattern, &final_ty, env, false);
                 }
                 // Other pattern shapes (tuple/array/tuple-struct
                 // destructuring) would need per-field type distribution;
@@ -2436,6 +2466,10 @@ impl TypeChecker {
                         }
                         *pointee
                     }
+                    Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+                        GenericArg::Type(inner) => inner.clone(),
+                        _ => Ty::Unit,
+                    },
                     other => {
                         self.errors.push(TypeError {
                             message: format!("cannot dereference a value of type `{}`: prefix `*` needs a raw pointer `*const T` / `*mut T` (Document 23 §17.9)", other),
@@ -2525,7 +2559,7 @@ impl TypeChecker {
             Expr::Propagate(inner) => self.check_propagate(inner, expected, env, ctx),
 
             Expr::Field { expr: inner, name } => {
-                let t = self.check_expr(inner, None, env, ctx);
+                let t = peel_box(self.check_expr(inner, None, env, ctx));
                 self.field_type(&t, name, ctx)
             }
 
@@ -2739,6 +2773,68 @@ impl TypeChecker {
                         return substitute_type_params(&shape.ret, &subst);
                     }
                 }
+                if let Expr::Path(path) = callee.as_ref() {
+                    if let [tn, fname] = path.as_slice() {
+                        if tn == "Box" && fname == "new" && !self.structs.contains_key("Box") {
+                            let inner_exp = match expected {
+                                Some(Ty::Generic(n, a)) if n == "Box" && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
+                                _ => None,
+                            };
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`Box::new` takes exactly one argument, found {}", args.len()), context: ctx.into() });
+                            }
+                            let mut it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
+                            if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
+                            return Ty::Generic("Box".into(), vec![GenericArg::Type(it)]);
+                        }
+                        if matches!(tn.as_str(), "Rc" | "Arc") && fname == "new" && !self.structs.contains_key(tn.as_str()) {
+                            let inner_exp = match expected {
+                                Some(Ty::Generic(n, a)) if n == tn && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
+                                _ => None,
+                            };
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`{}::new` takes exactly one argument, found {}", tn, args.len()), context: ctx.into() });
+                            }
+                            let it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
+                            return Ty::Generic(tn.clone(), vec![GenericArg::Type(it)]);
+                        }
+                        if matches!(tn.as_str(), "Rc" | "Arc") && matches!(fname.as_str(), "strongCount" | "weakCount") && !self.structs.contains_key(tn.as_str()) {
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`{}::{}` takes exactly one argument (`borrow` the pointer), found {}", tn, fname, args.len()), context: ctx.into() });
+                            }
+                            for a in args {
+                                let at = self.check_expr(&a.value, None, env, ctx);
+                                let ok = matches!(&at, Ty::Ref(_, i) if matches!(&**i, Ty::Generic(n, _) if n == tn));
+                                if !ok {
+                                    self.errors.push(TypeError { message: format!("`{}::{}` needs `borrow <{}<T>>`, found `{}`", tn, fname, tn, at), context: ctx.into() });
+                                }
+                            }
+                            return Ty::Usize;
+                        }
+                        if tn == "String" && fname == "from" && !self.structs.contains_key("String") {
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`String::from` takes exactly one argument, found {}", args.len()), context: ctx.into() });
+                            }
+                            if let Some(a) = args.first() {
+                                let at = self.check_expr(&a.value, Some(&Ty::StringTy), env, ctx);
+                                let ok = at == Ty::StringTy || matches!(&at, Ty::Ref(_, i) if **i == Ty::Str);
+                                if !ok {
+                                    self.errors.push(TypeError { message: format!("`String::from` needs a string (`&str` or `String`), found `{}`", at), context: ctx.into() });
+                                }
+                            }
+                            return Ty::StringTy;
+                        }
+                    }
+                }
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "drop" && !self.functions.contains_key("drop") {
+                        if args.len() != 1 {
+                            self.errors.push(TypeError { message: format!("`drop` takes exactly one argument, found {}", args.len()), context: ctx.into() });
+                        }
+                        for a in args { self.check_expr(&a.value, None, env, ctx); }
+                        return Ty::Unit;
+                    }
+                }
                 {
                     let gp: Option<(&Vec<String>, &[(usize, Vec<Type>)])> = match callee.as_ref() {
                         Expr::Path(p) => Some((p, &[][..])),
@@ -2819,7 +2915,27 @@ impl TypeChecker {
             }
 
             Expr::MethodCall { receiver, name, args, gens } => {
-                let recv_ty = strip_refs(self.check_expr(receiver, None, env, ctx));
+                let raw_recv = strip_refs(self.check_expr(receiver, None, env, ctx));
+                if let Ty::Generic(gn, ga) = &raw_recv {
+                    let inner = match ga.first() { Some(GenericArg::Type(t)) => Some(t.clone()), _ => None };
+                    let is_arc_weak = gn == "Weak" && matches!(ga.get(1), Some(GenericArg::Type(Ty::Named(k))) if k == "Arc");
+                    match (gn.as_str(), name.as_str(), inner) {
+                        ("Rc" | "Arc", "clone", Some(_)) if args.is_empty() => return raw_recv.clone(),
+                        ("Rc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t)]),
+                        ("Arc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t), GenericArg::Type(Ty::Named("Arc".into()))]),
+                        ("Weak", "clone", Some(_)) if args.is_empty() => return raw_recv.clone(),
+                        ("Weak", "upgrade", Some(t)) if args.is_empty() => {
+                            let strong = Ty::Generic(if is_arc_weak { "Arc" } else { "Rc" }.into(), vec![GenericArg::Type(t)]);
+                            return Ty::OptionTy(Box::new(strong));
+                        }
+                        ("Rc" | "Arc" | "Weak", "clone" | "downgrade" | "upgrade", _) => {
+                            self.errors.push(TypeError { message: format!("`{}::{}` takes no arguments (and `{}` has no such method)", gn, name, raw_recv), context: ctx.into() });
+                            return Ty::Unit;
+                        }
+                        _ => {}
+                    }
+                }
+                let recv_ty = peel_box(raw_recv);
                 let call_addr = expr as *const Expr as usize;
                 // Phase 11b M5: impls of a generic trait (`impl Convert<f64> for i32`) are
                 // told apart by the call's arguments and expected type.
@@ -3667,6 +3783,16 @@ impl TypeChecker {
         // that case, the same "unresolved => stay silent" convention used
         // everywhere else in this checker.
         let scrutinee_unresolved = scrutinee_ty == Ty::Unit && self.saw_unresolved;
+        // Matching through a reference (`match head` with `head: borrow T`, or `match n.next` with
+        // `n: borrow Node`): the patterns match the referent; owning bindings become `&Field`.
+        let (scrut_inner, by_ref) = match &scrutinee_ty {
+            Ty::Ref(_, i) if !matches!(**i, Ty::Array(_) | Ty::Str) => ((**i).clone(), true),
+            other => (other.clone(), self.expr_behind_ref(&match_expr.scrutinee)),
+        };
+        if by_ref {
+            self.match_by_ref.insert(match_expr as *const MatchExpr as usize);
+        }
+        let scrutinee_ty = scrut_inner.clone();
         self.saw_unresolved = saved_unresolved || self.saw_unresolved;
         // Phase 8 (Document 9 §2.5 / Document 17 §4.5): real
         // pattern-matrix exhaustiveness checking, not a heuristic --
@@ -3711,7 +3837,7 @@ impl TypeChecker {
             // (see `bind_pattern`). `let`-destructuring is still the
             // Phase 3 gap (only plain identifiers bind there).
             for pat in &arm.patterns {
-                self.bind_pattern(pat, &scrutinee_ty, env);
+                self.bind_pattern(pat, &scrut_inner, env, by_ref);
             }
             if let Some(guard) = &arm.guard {
                 self.check_expr(guard, Some(&Ty::Bool), env, ctx);
@@ -4467,11 +4593,119 @@ impl TypeChecker {
     /// checker's existing "unknown => `()`" convention -- instead of
     /// being left undefined, which would report a false "undefined
     /// variable" for perfectly valid code.
-    fn bind_pattern(&self, pat: &Pattern, ty: &Ty, env: &mut Env) {
+    /// Phase 11c C3: a struct/enum that contains itself BY VALUE has infinite size (it needs a
+    /// `Box`, Document 6/13), and a `@copy` type cannot own heap memory (Document 3 category C).
+    fn check_type_layouts(&mut self) {
+        let mut names: Vec<String> = self.structs.keys().cloned().chain(self.enums.keys().cloned()).collect();
+        names.sort();
+        names.dedup();
+        for start in names {
+            let mut seen = std::collections::HashSet::new();
+            if self.contains_by_value(&start, &start, &mut seen) {
+                self.errors.push(TypeError {
+                    message: format!("recursive type `{}` has infinite size: a value of `{}` contains another `{}` directly; put the recursive field behind a `Box<{}>` (Document 6 / Document 13 §2)", start, start, start, start),
+                    context: start.clone(),
+                });
+            }
+        }
+        let mut copies: Vec<String> = self.copy_structs.iter().cloned().collect();
+        copies.sort();
+        for c in copies {
+            let bad = self.structs.get(&c).and_then(|sh| sh.fields.iter().find(|(_, t)| self.owns_heap(t, 0)).cloned());
+            if let Some((f, t)) = bad {
+                self.errors.push(TypeError {
+                    message: format!("`@copy` struct `{}` cannot own heap memory: field `{}` has type `{}` (a copy type is duplicated bit for bit, which would free it twice; Document 3 category C / Document 13)", c, f, t),
+                    context: c.clone(),
+                });
+            }
+        }
+    }
+
+    /// Does `cur` (a struct/enum name) contain a value of `target` by value, directly or through
+    /// other by-value fields (not through `Box`/`Rc`/references/`[T]`/`String`)?
+    fn contains_by_value(&self, cur: &str, target: &str, seen: &mut std::collections::HashSet<String>) -> bool {
+        if !seen.insert(cur.to_string()) {
+            return false;
+        }
+        let mut tys: Vec<Ty> = Vec::new();
+        if let Some(sh) = self.structs.get(cur) {
+            tys.extend(sh.fields.iter().map(|(_, t)| t.clone()));
+        }
+        if let Some(sh) = self.enums.get(cur) {
+            for (_, fs) in &sh.variants {
+                tys.extend(fs.iter().cloned());
+            }
+        }
+        fn walk(me: &TypeChecker, t: &Ty, target: &str, seen: &mut std::collections::HashSet<String>) -> bool {
+            match t {
+                Ty::Named(n) | Ty::Generic(n, _) if !is_heap_generic(n) => {
+                    n == target || me.contains_by_value(n, target, seen)
+                }
+                Ty::Tuple(ts) => ts.iter().any(|x| walk(me, x, target, seen)),
+                Ty::Fixed(x, _) | Ty::SymFixed(x, _) | Ty::OptionTy(x) => walk(me, x, target, seen),
+                Ty::ResultTy(a, b) => walk(me, a, target, seen) || walk(me, b, target, seen),
+                _ => false,
+            }
+        }
+        tys.iter().any(|t| walk(self, t, target, seen))
+    }
+
+    /// Addresses of the expressions whose type owns heap memory (for the borrow checker's move tracking).
+    pub fn owning_expr_addrs(&self) -> std::collections::HashSet<usize> {
+        self.expr_types.iter().filter(|(_, t)| self.owns_heap(t, 0)).map(|(a, _)| *a).collect()
+    }
+
+    /// Does a value of `t` own heap memory (so that binding it by value would be a move)?
+    pub fn owns_heap(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return true;
+        }
+        match t {
+            Ty::StringTy | Ty::Array(_) => true,
+            Ty::Generic(n, _) if is_heap_generic(n) => true,
+            Ty::Tuple(ts) => ts.iter().any(|x| self.owns_heap(x, depth + 1)),
+            Ty::Fixed(x, _) => self.owns_heap(x, depth + 1),
+            Ty::OptionTy(x) => self.owns_heap(x, depth + 1),
+            Ty::ResultTy(a, b) => self.owns_heap(a, depth + 1) || self.owns_heap(b, depth + 1),
+            Ty::Named(n) => {
+                if let Some(sh) = self.structs.get(n) {
+                    sh.fields.iter().any(|(_, f)| self.owns_heap(f, depth + 1))
+                } else if let Some(sh) = self.enums.get(n) {
+                    sh.variants.iter().any(|(_, fs)| fs.iter().any(|f| self.owns_heap(f, depth + 1)))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Is the place expression `e` reached through a reference (so it is borrowed, not owned)?
+    fn expr_behind_ref(&self, e: &Expr) -> bool {
+        // behind a reference, or inside a shared `Rc`/`Arc` (whose content is never moved out)
+        let is_ref = |x: &Expr| match self.expr_types.get(&(x as *const Expr as usize)) {
+            Some(Ty::Ref(..)) => true,
+            Some(Ty::Generic(n, _)) => n == "Rc" || n == "Arc",
+            _ => false,
+        };
+        match e {
+            Expr::Paren(i) => self.expr_behind_ref(i),
+            Expr::Ident(n) => (n == "self" && self.self_borrowed) || is_ref(e),
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => is_ref(expr) || self.expr_behind_ref(expr),
+            Expr::Deref(inner) => match self.expr_types.get(&(inner.as_ref() as *const Expr as usize)) {
+                Some(Ty::Generic(n, _)) if n == "Box" => self.expr_behind_ref(inner),
+                _ => true,
+            },
+            _ => false,
+        }
+    }
+
+    fn bind_pattern(&self, pat: &Pattern, ty: &Ty, env: &mut Env, by_ref: bool) {
         match pat {
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Array(..) => {}
             Pattern::Mut(n) => {
-                env.insert(n.clone(), ty.clone());
+                let bt = if by_ref && self.owns_heap(ty, 0) { Ty::Ref(false, Box::new(ty.clone())) } else { ty.clone() };
+                env.insert(n.clone(), bt);
                 env.mark_mut(n);
             }
             Pattern::Ident(n) => {
@@ -4483,18 +4717,20 @@ impl TypeChecker {
                     self.ctor_field_types(last, ty).map(|f| f.is_empty()).unwrap_or(false)
                 };
                 if !is_ctor {
-                    env.insert(n.clone(), ty.clone());
+                    // behind a reference a binding that owns heap memory is a reference to it
+                    let bt = if by_ref && self.owns_heap(ty, 0) { Ty::Ref(false, Box::new(ty.clone())) } else { ty.clone() };
+                    env.insert(n.clone(), bt);
                 }
             }
             Pattern::Tuple(subs) => match ty {
                 Ty::Tuple(tys) if tys.len() == subs.len() => {
                     for (p, t) in subs.iter().zip(tys.iter()) {
-                        self.bind_pattern(p, t, env);
+                        self.bind_pattern(p, t, env, by_ref);
                     }
                 }
                 _ => {
                     for p in subs {
-                        self.bind_pattern(p, &Ty::Unit, env);
+                        self.bind_pattern(p, &Ty::Unit, env, by_ref);
                     }
                 }
             },
@@ -4503,19 +4739,19 @@ impl TypeChecker {
                 match self.ctor_field_types(last, ty) {
                     Some(tys) if tys.len() == subs.len() => {
                         for (p, t) in subs.iter().zip(tys.iter()) {
-                            self.bind_pattern(p, t, env);
+                            self.bind_pattern(p, t, env, by_ref);
                         }
                     }
                     _ => {
                         for p in subs {
-                            self.bind_pattern(p, &Ty::Unit, env);
+                            self.bind_pattern(p, &Ty::Unit, env, by_ref);
                         }
                     }
                 }
             }
             Pattern::Or(alts) => {
                 for a in alts {
-                    self.bind_pattern(a, ty, env);
+                    self.bind_pattern(a, ty, env, by_ref);
                 }
             }
         }

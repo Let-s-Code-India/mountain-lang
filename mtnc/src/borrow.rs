@@ -236,6 +236,8 @@ pub struct BorrowChecker {
     struct_copy: HashMap<String, bool>,
     struct_fields: HashMap<String, Vec<Type>>,
     functions: HashMap<String, FnRefShape>,
+    /// Addresses of expressions whose type owns heap memory (from the type checker, Phase 11c).
+    owning: std::collections::HashSet<usize>,
     pub errors: Vec<BorrowError>,
 }
 
@@ -245,8 +247,14 @@ impl BorrowChecker {
             struct_copy: HashMap::new(),
             struct_fields: HashMap::new(),
             functions: HashMap::new(),
+            owning: std::collections::HashSet::new(),
             errors: Vec::new(),
         }
+    }
+
+    /// Tells the pass which expressions have heap-owning types (so their values are move-tracked).
+    pub fn set_owning_exprs(&mut self, owning: std::collections::HashSet<usize>) {
+        self.owning = owning;
     }
 
     pub fn check_program(&mut self, program: &Program) {
@@ -718,6 +726,19 @@ impl<'a> FnChecker<'a> {
     /// (§5.1). See the module doc's "Move-checking is precise only
     /// for..." note for exactly what is and isn't covered here.
     fn classify_initializer(&mut self, init: &Expr) -> Binding {
+        let mut b = self.classify_initializer_syntactic(init);
+        // Phase 11c C3: a value that owns heap memory (`String::from(..)`, a call returning a
+        // `Box`, a struct holding a `[T]`, ...) is always moved, whatever expression produced it.
+        // The type checker's table says what the initializer's type is.
+        if b.is_copy {
+            if self.checker.owning.contains(&(init as *const Expr as usize)) {
+                b.is_copy = false;
+            }
+        }
+        b
+    }
+
+    fn classify_initializer_syntactic(&mut self, init: &Expr) -> Binding {
         match init {
             Expr::Ident(src) => {
                 let (src_copy, src_sources) = match self.lookup(src) {

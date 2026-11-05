@@ -495,7 +495,6 @@ fn unsupported_features_give_clear_codegen_errors_not_crashes() {
     let cases = [
         ("fn main() { let f = |x: i32| x + 1; println(f(1)); }\n", "closures"),
         ("fn main() { spawn { println(1); }; }\n", "Phase"),
-        ("fn main() { let b = Box::new(5); }\n", "Phase"),
     ];
     for (src, needle) in cases {
         let err = build_must_fail(src);
