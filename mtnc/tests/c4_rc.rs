@@ -166,3 +166,33 @@ fn rc_drop_glue_is_generated_once_per_type() {
     let text = ir("fn main() { let a = Rc::new(1); let b = Rc::new(2); let c = a.clone(); println(*b + *c); }");
     assert_eq!(text.matches("define void @__mtn_drop_Rc_i32_").count(), 1, "{}", text);
 }
+
+// ---- shared immutability: Rc/Arc give shared access only (manager item 5) ----
+
+#[test]
+fn assignment_through_rc_deref_is_rejected() {
+    let m = rejected("fn main() { let mut r = Rc::new(1); *r = 2; }");
+    assert!(m.contains("cannot assign through an `Rc`/`Arc`"), "{}", m);
+}
+
+#[test]
+fn assignment_to_a_field_through_rc_is_rejected() {
+    let m = rejected("struct P { n: i32 }\nfn main() { let r = Rc::new(P { n: 1 }); r.n = 2; }");
+    assert!(m.contains("cannot assign through an `Rc`/`Arc`"), "{}", m);
+}
+
+#[test]
+fn assignment_to_a_field_through_arc_is_rejected() {
+    let m = rejected("struct P { n: i32 }\nfn main() { let mut r = Arc::new(P { n: 1 }); r.n = 2; }");
+    assert!(m.contains("cannot assign through an `Rc`/`Arc`"), "{}", m);
+}
+
+#[test]
+fn borrow_mut_self_method_through_arc_is_rejected() {
+    let src = "struct P { n: i32 }\nimpl P { fn bump(borrow mut self) { self.n = self.n + 1; } }\nfn main() { let mut r = Arc::new(P { n: 1 }); r.bump(); }";
+    let f = tmp(src);
+    let exe = f.with_extension("bin");
+    let b = Command::new(env!("CARGO_BIN_EXE_mtnc")).arg("build").arg(&f).arg("-o").arg(&exe).output().unwrap();
+    assert!(!b.status.success());
+    assert!(String::from_utf8_lossy(&b.stderr).contains("through an `Rc`/`Arc`"));
+}

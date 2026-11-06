@@ -138,6 +138,7 @@ fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Mo
     let context = Context::create();
     let mut cg = Codegen::new(&context, "mountain", tm.get_target_data(), &tc.expr_types, &tc.impl_choice, opts.clone());
     cg.set_by_ref_matches(tc.match_by_ref.clone());
+    cg.set_dyn_coercions(tc.dyn_coercions.clone());
     cg.generate(&program)?;
     cg.module.set_triple(&TargetMachine::get_default_triple());
     cg.module.verify().map_err(|e| vec![format!("internal error: LLVM rejected the generated IR: {}", e.to_string())])?;

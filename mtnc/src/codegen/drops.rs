@@ -274,6 +274,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.build_unconditional_branch(end)?;
                 self.builder.position_at_end(end);
             }
+            Ty::Generic(n, args) if n == "Box" && matches!(args.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => {
+                self.dyn_box_glue(f, p)?;
+            }
             Ty::Generic(n, args) if n == "Box" => {
                 let Some(crate::types::GenericArg::Type(inner)) = args.first() else {
                     return Err(CgErr("internal: `Box` without a type argument".into()));

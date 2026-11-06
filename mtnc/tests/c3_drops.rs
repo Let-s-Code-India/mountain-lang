@@ -273,3 +273,13 @@ fn types_without_heap_have_no_glue() {
     let text = ir("struct P { a: i32 } fn main() { let x = P { a: 1 }; println(x.a); }");
     assert!(!text.contains("__mtn_drop_"), "{}", text);
 }
+
+#[test]
+fn move_inside_a_loop_body_frees_each_iteration_exactly_once() {
+    // loop move: each iteration creates a String, moves it into `take` (callee drops it) or keeps it (scope drops it).
+    ok(
+        "fn take(s: String) -> i32 { return 1; }\n\
+         fn main() { let mut i = 0; let mut n = 0; while i < 5 { let s = String::from(\"x\"); if i % 2 == 0 { n = n + take(s); } i = i + 1; } println(n); }",
+        "3\n",
+    );
+}

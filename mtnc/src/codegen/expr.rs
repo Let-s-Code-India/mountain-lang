@@ -317,6 +317,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // ------------------------------------------------------------------
 
     pub(super) fn expr(&mut self, e: &Expr) -> R<V<'ctx>> {
+        if let Some((src, dst)) = self.dyn_coercions.get(&(e as *const Expr as usize)).cloned() {
+            let v = self.expr_raw(e)?;
+            return self.coerce_to_dyn(v, &src, &dst);
+        }
+        self.expr_raw(e)
+    }
+
+    fn expr_raw(&mut self, e: &Expr) -> R<V<'ctx>> {
         match e {
             Expr::Literal(l) => {
                 let ty = self.ty_of(e)?;
@@ -781,6 +789,23 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
     }
 
+    /// Is the receiver an `Rc`/`Arc` (or goes through one)?
+    fn through_shared(&self, e: &Expr) -> bool {
+        let is_rc = |x: &Expr| {
+            let mut t = match self.ty_of(x) { Ok(t) => t, Err(_) => return false };
+            while let Ty::Ref(_, i) = t {
+                t = *i;
+            }
+            matches!(&t, Ty::Generic(n, _) if n == "Rc" || n == "Arc")
+        };
+        match e {
+            Expr::Paren(i) => self.through_shared(i),
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => is_rc(expr) || self.through_shared(expr),
+            Expr::Deref(inner) => is_rc(inner) || self.through_shared(inner),
+            other => is_rc(other),
+        }
+    }
+
     /// Does the place expression `e` live behind a reference / `borrow` parameter?
     fn root_is_borrowed(&self, e: &Expr) -> bool {
         match e {
@@ -1122,6 +1147,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     fn gen_arg(&mut self, p: &ParamInfo<'a>, arg: &Expr) -> R<V<'ctx>> {
         match p.mode {
             PMode::Value | PMode::Variadic => self.expr_as(arg, &p.ty),
+            // `borrow dyn Trait`: the argument is (or is coerced to) a `&dyn Trait` fat pointer
+            PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(_)) => self.expr(arg),
             PMode::Ref(want_mut) => {
                 let mut a = arg;
                 while let Expr::Paren(i) = a {
@@ -1145,7 +1172,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     /// Matches call arguments to parameters: positional first, then named
     /// (any order), defaults for the rest, extras into the variadic slice.
-    fn resolve_args(&mut self, fname: &str, params: &[ParamInfo<'a>], args: &[Arg]) -> R<Vec<V<'ctx>>> {
+    pub(super) fn resolve_args(&mut self, fname: &str, params: &[ParamInfo<'a>], args: &[Arg]) -> R<Vec<V<'ctx>>> {
         let n = params.len();
         let var_idx = params.iter().position(|p| p.mode == PMode::Variadic);
         let fixed_n = var_idx.unwrap_or(n);
@@ -1363,8 +1390,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 _ => break,
             }
         }
-        if let Ty::DynTrait(_) = base {
-            return unsupported("method calls on `dyn Trait` (dynamic dispatch)", 11);
+        if let Ty::DynTrait(tr) = &base {
+            let tr = tr.clone();
+            return self.dyn_method_call(receiver, &rty, &tr, name, args);
         }
         let tystr = base.to_string();
         let mut found = self.find_method(&tystr, name);
@@ -1391,6 +1419,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         }
         let recv: V<'ctx> = match kind {
+            PMode::Ref(true) if self.through_shared(receiver) => {
+                return Err(CgErr(format!("cannot call the `borrow mut self` method `{}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Phase 13)", tystr, name)));
+            }
             PMode::Ref(_) if boxed => {
                 // auto-deref through `Box<T>`: the receiver is the pointer to the content
                 let (p, t) = self.place_or_spill(receiver)?;

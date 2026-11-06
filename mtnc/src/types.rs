@@ -1060,6 +1060,8 @@ pub struct TypeChecker {
     pub final_pass: bool,
     /// `match` expressions (by address) whose scrutinee lives behind a reference: owning bindings are `&T`.
     pub match_by_ref: std::collections::HashSet<usize>,
+    /// Expressions (by address) coerced to a trait object: (source type, target type). Phase 11c C5.
+    pub dyn_coercions: HashMap<usize, (Ty, Ty)>,
     self_borrowed: bool,
     /// Type/const parameter names of the function currently being checked.
     cur_tparams: Vec<String>,
@@ -1325,6 +1327,7 @@ impl TypeChecker {
             method_instances: HashMap::new(),
             final_pass: false,
             match_by_ref: std::collections::HashSet::new(),
+            dyn_coercions: HashMap::new(),
             self_borrowed: false,
             cur_tparams: Vec::new(),
             cur_const_params: Vec::new(),
@@ -2160,6 +2163,13 @@ impl TypeChecker {
                 return self.zonk(&actual);
             }
         }
+        // Phase 11c C5: `Box<T>` -> `Box<dyn Trait>`, `&T` -> `&dyn Trait`, `&Box<dyn Trait>` -> `&dyn Trait`
+        if let Some(exp) = &expected_z {
+            if actual != Ty::Never && self.dyn_coercible(&actual, exp) {
+                self.dyn_coercions.insert(expr as *const Expr as usize, (actual.clone(), exp.clone()));
+                return exp.clone();
+            }
+        }
         let expected: Option<&Ty> = expected_z.as_ref();
         // Only numeric literals and `null` are excluded from this
         // blanket check -- `check_literal`'s `Int`/`IntHex`/`IntOct`/
@@ -2524,6 +2534,12 @@ impl TypeChecker {
                         }
                     }
                 }
+                if self.expr_through_shared(lhs) {
+                    self.errors.push(TypeError {
+                        message: "cannot assign through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Document 12/14; Document 6 §6)".into(),
+                        context: ctx.into(),
+                    });
+                }
                 self.check_expr(rhs, Some(&lt), env, ctx);
                 Ty::Unit
             }
@@ -2783,6 +2799,7 @@ impl TypeChecker {
                             if args.len() != 1 {
                                 self.errors.push(TypeError { message: format!("`Box::new` takes exactly one argument, found {}", args.len()), context: ctx.into() });
                             }
+                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(_)));
                             let mut it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
                             if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
                             return Ty::Generic("Box".into(), vec![GenericArg::Type(it)]);
@@ -3014,10 +3031,16 @@ impl TypeChecker {
                 let inner_expected = match expected {
                     // a slice target `&[T]` is reached by unsizing a fixed array, so the
                     // operand itself is NOT expected to be an unsized `[T]`
-                    Some(Ty::Ref(_, t)) if !matches!(**t, Ty::Array(_)) => Some((**t).clone()),
+                    Some(Ty::Ref(_, t)) if !matches!(**t, Ty::Array(_) | Ty::DynTrait(_)) => Some((**t).clone()),
                     _ => None,
                 };
                 let t = self.check_expr(inner, inner_expected.as_ref(), env, ctx);
+                if *mutable && self.expr_through_shared(inner) {
+                    self.errors.push(TypeError {
+                        message: "cannot `borrow mut` through an `Rc`/`Arc`: it gives shared, immutable access (Document 6 §6)".into(),
+                        context: ctx.into(),
+                    });
+                }
                 // Phase 11b M6: a mutable borrow `&mut x` / `borrow mut x` needs a `mut` binding.
                 if *mutable {
                     let mut root: &Expr = inner;
@@ -3663,6 +3686,36 @@ impl TypeChecker {
                 message: format!("invalid cast from `{}` to `{}`{} (Document 23 §17.9)", src, dst, hint),
                 context: ctx.into(),
             });
+        }
+    }
+
+    /// May a value of type `actual` be used where the trait-object type `exp` is expected?
+    fn dyn_coercible(&self, actual: &Ty, exp: &Ty) -> bool {
+        let boxed = |t: &Ty| -> Option<Ty> {
+            match t {
+                Ty::Generic(n, a) if n == "Box" && a.len() == 1 => match &a[0] { GenericArg::Type(i) => Some(i.clone()), _ => None },
+                _ => None,
+            }
+        };
+        match (actual, exp) {
+            (Ty::Ref(am, a), Ty::Ref(em, e)) => {
+                if *em && !*am {
+                    return false;
+                }
+                let Ty::DynTrait(tr) = &**e else { return false };
+                match &**a {
+                    Ty::DynTrait(_) => false,
+                    other => match boxed(other) {
+                        Some(Ty::DynTrait(t2)) => t2 == *tr,
+                        Some(_) => false,
+                        None => self.traits.contains_key(tr) && self.satisfies_bound(other, tr),
+                    },
+                }
+            }
+            _ => match (boxed(actual), boxed(exp)) {
+                (Some(c), Some(Ty::DynTrait(tr))) => !matches!(c, Ty::DynTrait(_)) && self.traits.contains_key(&tr) && self.satisfies_bound(&c, &tr),
+                _ => false,
+            },
         }
     }
 
@@ -4676,6 +4729,19 @@ impl TypeChecker {
                     false
                 }
             }
+            _ => false,
+        }
+    }
+
+    /// Does the place `e` go THROUGH an `Rc`/`Arc` (a field, element or `*` of one)? Such a place is
+    /// shared, so it cannot be written or mutably borrowed.
+    pub fn expr_through_shared(&self, e: &Expr) -> bool {
+        let shared = |x: &Expr| matches!(self.expr_types.get(&(x as *const Expr as usize)), Some(Ty::Generic(n, _)) if n == "Rc" || n == "Arc")
+            || matches!(self.expr_types.get(&(x as *const Expr as usize)), Some(Ty::Ref(_, i)) if matches!(&**i, Ty::Generic(n, _) if n == "Rc" || n == "Arc"));
+        match e {
+            Expr::Paren(i) => self.expr_through_shared(i),
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => shared(expr) || self.expr_through_shared(expr),
+            Expr::Deref(inner) => shared(inner) || self.expr_through_shared(inner),
             _ => false,
         }
     }

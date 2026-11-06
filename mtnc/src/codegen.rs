@@ -170,6 +170,13 @@ pub struct Codegen<'ctx, 'a> {
     /// `match` expressions (by address) matched through a reference: owning bindings are `&T` (types.rs).
     by_ref_matches: std::collections::HashSet<usize>,
     cur_match_by_ref: bool,
+    /// Expressions the checker coerced to a trait object: (source type, target type).
+    dyn_coercions: HashMap<usize, (Ty, Ty)>,
+    /// Trait name -> its methods in declaration order (the vtable slots).
+    trait_defs: HashMap<String, Vec<dynamic::TraitMethod>>,
+    /// (implementing type, trait, method) -> function key.
+    trait_impl_keys: HashMap<(String, String, String), String>,
+    vtables: HashMap<String, PointerValue<'ctx>>,
     drop_frames: Vec<drops::DropFrame<'ctx>>,
     drop_glues: HashMap<String, FunctionValue<'ctx>>,
     dead: bool,
@@ -284,6 +291,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             loops: Vec::new(),
             by_ref_matches: std::collections::HashSet::new(),
             cur_match_by_ref: false,
+            dyn_coercions: HashMap::new(),
+            trait_defs: HashMap::new(),
+            trait_impl_keys: HashMap::new(),
+            vtables: HashMap::new(),
             drop_frames: Vec::new(),
             drop_glues: HashMap::new(),
             dead: false,
@@ -384,6 +395,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ty::Array(_) => self.str_ty().into(),
                 // `&str` has the same `{ptr, len}` shape as a string value.
                 Ty::Str => self.str_ty().into(),
+                // `&dyn Trait`: a fat pointer `{ data, vtable }`
+                Ty::DynTrait(_) => self.fat_ty().into(),
                 _ => self.context.ptr_type(AddressSpace::default()).into(),
             },
             Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
@@ -392,6 +405,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.handle_ty().into()
             }
             Ty::Fn(..) => return unsupported("function values / closures", 12),
+            Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
             Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
@@ -659,6 +673,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.subst_self(resolve_type(t))
     }
 
+    /// The expressions the type checker coerced to a trait object.
+    pub fn set_dyn_coercions(&mut self, m: HashMap<usize, (Ty, Ty)>) {
+        self.dyn_coercions = m;
+    }
+
     /// The `match` expressions the type checker matched through a reference.
     pub fn set_by_ref_matches(&mut self, s: std::collections::HashSet<usize>) {
         self.by_ref_matches = s;
@@ -787,6 +806,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                             errors.push(format!("method `{}` is defined more than once", key));
                             continue;
                         }
+                        if let Some(tn) = &trait_name {
+                            self.trait_impl_keys.insert((tystr.clone(), tn.clone(), f.name.clone()), key.clone());
+                        }
                         let entry = self.methods.entry((tystr.clone(), f.name.clone())).or_default();
                         if trait_name.is_none() {
                             entry.insert(0, key.clone());
@@ -799,8 +821,37 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ItemKind::Trait(t) => {
                     // Default method bodies are copied into every implementing `impl`
                     // before type checking (`desugar::inline_default_methods`), so a
-                    // trait item itself generates no code (static dispatch only).
-                    let _ = t;
+                    // trait item itself generates no code; its method list (in declaration
+                    // order) is the layout of the vtables of `dyn Trait` (Phase 11c C5).
+                    let mut ms = Vec::new();
+                    for ti in &t.items {
+                        let TraitItem::Fn(f) = ti else { continue };
+                        let self_kind = f.params.first().filter(|p| p.name == "self").map(|p| match p.ownership {
+                            OwnershipMod::Borrow => PMode::Ref(false),
+                            OwnershipMod::BorrowMut => PMode::Ref(true),
+                            _ => PMode::Value,
+                        });
+                        let params: Vec<(String, Ty, PMode)> = f
+                            .params
+                            .iter()
+                            .filter(|p| p.name != "self")
+                            .map(|p| {
+                                let mode = if p.is_variadic {
+                                    PMode::Variadic
+                                } else {
+                                    match p.ownership {
+                                        OwnershipMod::Borrow => PMode::Ref(false),
+                                        OwnershipMod::BorrowMut => PMode::Ref(true),
+                                        _ => PMode::Value,
+                                    }
+                                };
+                                (p.name.clone(), resolve_type(&p.ty), mode)
+                            })
+                            .collect();
+                        let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+                        ms.push(dynamic::TraitMethod { name: f.name.clone(), self_kind, params, ret, generic: !f.generics.0.is_empty() });
+                    }
+                    self.trait_defs.insert(t.name.clone(), ms);
                 }
                 ItemKind::Const(c) => {
                     let ty = resolve_type(&c.ty);
@@ -975,6 +1026,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             match mode {
                 PMode::Value => lls.push(self.llty(&t)?.into()),
+                PMode::Ref(_) if matches!(t, Ty::DynTrait(_)) => {
+                    // `borrow dyn Trait`: a fat pointer
+                    lls.push(self.fat_ty().into());
+                }
                 PMode::Ref(_) => {
                     // the pointee must be a type we can represent
                     self.llty(&t)?;
@@ -1046,6 +1101,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let pv = val.get_nth_param(llidx).unwrap();
             llidx += 1;
             match p.mode {
+                PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(_)) => {
+                    // `borrow dyn Trait`: the local holds the fat pointer (a `&dyn Trait` value)
+                    let rt = Ty::Ref(false, Box::new(p.ty.clone()));
+                    let slot = self.declare_local(&p.name, &rt)?;
+                    self.builder.build_store(slot, pv)?;
+                    self.tail_params.push(TailSlot::Slot(slot));
+                }
                 PMode::Ref(_) => {
                     ref_params.push((self.tail_params.len(), p.name.clone(), p.ty.clone(), pv.into_pointer_value()));
                     self.tail_params.push(TailSlot::Slot(pv.into_pointer_value())); // replaced by a phi below
@@ -1140,6 +1202,7 @@ pub struct EnumLayoutRef<'ctx> {
 }
 
 mod drops;
+mod dynamic;
 mod expr;
 mod print;
 pub(crate) mod tail;
