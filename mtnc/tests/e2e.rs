@@ -366,7 +366,7 @@ fn try_blocks_may_assign_and_mutably_borrow_outer_locals() {
 fn break_leaving_a_try_block_is_still_a_clear_error() {
     let src = "enum E { Bad }\nfn chk(n: i32) -> Result<i32, E> { Ok(n) }\nfn main() { let mut i = 0; while i < 3 { try { chk(i)?; break; } catch (e) { } i += 1; } }\n";
     let err = build_must_fail(src);
-    assert!(err.contains("not yet supported by codegen"), "stderr: {}", err);
+    assert!(err.contains("leaves a `try` block") && !err.contains("Phase 11"), "stderr: {}", err);
 }
 
 #[test]

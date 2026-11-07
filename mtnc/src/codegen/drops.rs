@@ -349,7 +349,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.position_at_end(end);
             }
             Ty::Generic(n, _) => {
-                return unsupported(&format!("dropping a `{}` value", n), 11);
+                return Err(CgErr(format!("internal error: no drop glue is defined for the type `{}`", n)));
             }
             Ty::Tuple(ts) => {
                 let st = self.llty(ty)?;

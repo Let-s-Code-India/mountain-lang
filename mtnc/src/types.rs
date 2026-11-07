@@ -2294,7 +2294,7 @@ impl TypeChecker {
                 // Only a direct call `f::<T>(..)` is handled (in the Call
                 // arm); any other use of a turbofish path is not supported yet.
                 self.errors.push(TypeError {
-                    message: format!("a generic path `{}::<..>` is only supported as the callee of a call (not yet supported by codegen -- Phase 11)", path.join("::")),
+                    message: format!("a generic path `{}::<..>` is only supported as the callee of a call (using it as a function value is not yet supported by codegen — Phase 12)", path.join("::")),
                     context: ctx.into(),
                 });
                 Ty::Unit
@@ -3992,6 +3992,12 @@ impl TypeChecker {
             // (see `bind_pattern`). `let`-destructuring is still the
             // Phase 3 gap (only plain identifiers bind there).
             for pat in &arm.patterns {
+                if pattern_has_array(pat) {
+                    self.errors.push(TypeError {
+                        message: "array patterns are not yet supported (Document 25 §2.5 does not schedule them; proposed with the Phase 16 slice work)".into(),
+                        context: ctx.into(),
+                    });
+                }
                 self.bind_pattern(pat, &scrut_inner, env, by_ref);
             }
             if let Some(guard) = &arm.guard {
@@ -5283,5 +5289,13 @@ impl TypeChecker {
 impl Default for TypeChecker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn pattern_has_array(p: &Pattern) -> bool {
+    match p {
+        Pattern::Array(..) => true,
+        Pattern::Tuple(v) | Pattern::TupleStruct(_, v) | Pattern::Or(v) => v.iter().any(pattern_has_array),
+        _ => false,
     }
 }

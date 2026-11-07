@@ -354,7 +354,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Paren(inner) => self.expr(inner),
             Expr::Ident(name) => self.ident(e, name),
-            Expr::TurbofishPath { .. } => unsupported("unresolved generic path (internal: monomorphization should have removed it)", 11),
+            Expr::TurbofishPath { .. } => Err(CgErr("internal error: an unresolved generic path reached code generation (monomorphization should have removed it)".into())),
             Expr::Path(path) => {
                 let ty = self.ty_of(e)?;
                 if let [_, variant] = path.as_slice() {
@@ -691,7 +691,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Literal::Null => match ty {
                 Ty::RawPtr(..) => Ok(self.context.ptr_type(AddressSpace::default()).const_null().into()),
-                _ => unsupported("`null` outside a raw-pointer context", 11),
+                _ => Err(CgErr("`null` has no type here: it is only valid where a raw pointer type is expected (Document 23 §17.9)".into())),
             },
             _ => unreachable!(),
         }
@@ -914,7 +914,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let pv = self.expr(inner)?.into_pointer_value();
                 Ok((pv, ty))
             }
-            _ => unsupported("this assignment target", 11),
+            _ => Err(CgErr("invalid assignment target: the left side of `=` must be a variable, a field, an element or a `*` dereference (Document 4)".into())),
         }
     }
 
@@ -2487,7 +2487,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 Ok(if test { acc } else { t })
             }
-            Pattern::Array(..) => unsupported("array patterns", 11),
+            // FLAGGED: Document 25 §2.5 does not schedule array patterns; proposed with Phase 16 (slices / `Iterable`).
+            Pattern::Array(..) => unsupported("array patterns (not scheduled in Document 25 §2.5; proposed with the slice work)", 16),
         }
     }
 
@@ -2739,7 +2740,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return self.call_fn(&key, name, None, args, whole as *const Expr as usize);
                 }
                 if args.iter().any(|a| a.name.is_some()) {
-                    return unsupported("named arguments here", 11);
+                    return Err(CgErr(format!("named arguments are only allowed when calling a function, not `{}` (Document 10 §2)", name)));
                 }
                 if let Some((fields, true)) = self.structs.get(name.as_str()).cloned() {
                     if fields.len() != args.len() {
@@ -2842,7 +2843,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         return self.rc_count(&args[0].value, fname);
                     }
                     if matches!(tn.as_str(), "Rc" | "Arc" | "Weak") {
-                        return unsupported(&format!("`{}::{}` (heap / shared-ownership types)", tn, fname), 11);
+                        return Err(CgErr(format!("no associated function `{}::{}` exists (the pointer types have `new`, `clone`, `downgrade`, `upgrade`, `strongCount`, `weakCount`)", tn, fname)));
                     }
                     return Err(CgErr(format!("no associated function `{}::{}` found", tn, fname)));
                 }

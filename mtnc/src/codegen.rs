@@ -434,9 +434,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
-            Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
-            Ty::DynTrait(_) => return unsupported("`dyn Trait` (traits)", 11),
-            Ty::Null => return unsupported("`null`", 11),
+            Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => {
+                return Err(CgErr(format!("internal error: the type `{}` reached code generation without being monomorphized", ty)))
+            }
+            Ty::DynTrait(_) => return Err(CgErr("`dyn Trait` is unsized: use `Box<dyn Trait>` or `borrow dyn Trait` (Document 13 §1 point 4)".into())),
+            Ty::Null => return Err(CgErr("`null` has no type here: it is only valid where a raw pointer type is expected (Document 23 §17.9)".into())),
         })
     }
 
@@ -446,20 +448,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let variants = self.variants_of(ty).ok_or_else(|| CgErr(format!("`{}` is not an enum", ty)))?;
             let mut vsts = Vec::new();
             let mut max_size = 0u64;
+            let mut max_align = 8u64;
             for (_, fields) in &variants {
                 let mut fs = Vec::new();
                 for f in fields {
                     fs.push(self.llty(f)?);
                 }
                 let st = self.context.struct_type(&fs, false);
-                if self.td.get_abi_alignment(&st) > 8 {
-                    return unsupported("a 128-bit integer inside an enum payload", 11);
-                }
+                max_align = max_align.max(self.td.get_abi_alignment(&st) as u64);
                 max_size = max_size.max(self.td.get_abi_size(&st));
                 vsts.push(st);
             }
-            let words = max_size.div_ceil(8) as u32;
-            let payload = self.int_ty(64).array_type(words);
+            // The payload is an array of integers as wide as the strictest variant alignment (8 bytes,
+            // or 16 for a payload holding an `i128`), so every variant struct sits correctly aligned in it.
+            let unit = max_align.max(8);
+            let words = max_size.div_ceil(unit) as u32;
+            let payload = self.int_ty((unit * 8) as u32).array_type(words);
             let llty = self.context.struct_type(&[self.int_ty(32).into(), payload.into()], false);
             self.enum_layouts.insert(key.clone(), EnumLayout { llty, variants: vsts });
         }
@@ -765,7 +769,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 ItemKind::Struct(s) => {
                     if !s.generics.0.is_empty() {
-                        errors.push(format!("generic struct `{}`: generics (monomorphization) are not yet supported by codegen — Phase 11", s.name));
+                        errors.push(format!("internal error: generic struct `{}` reached code generation without being monomorphized", s.name));
                         continue;
                     }
                     if self.structs.contains_key(&s.name) || self.enums.contains_key(&s.name) {
@@ -789,7 +793,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 ItemKind::Enum(en) => {
                     if !en.generics.0.is_empty() {
-                        errors.push(format!("generic enum `{}`: generics (monomorphization) are not yet supported by codegen — Phase 11", en.name));
+                        errors.push(format!("internal error: generic enum `{}` reached code generation without being monomorphized", en.name));
                         continue;
                     }
                     if self.structs.contains_key(&en.name) || self.enums.contains_key(&en.name) {
@@ -808,11 +812,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 ItemKind::Impl(im) => {
                     if !im.generics.0.is_empty() {
-                        errors.push("generic `impl` blocks are not yet supported by codegen — Phase 11".into());
+                        errors.push("internal error: a generic `impl` block reached code generation without being monomorphized".into());
                         continue;
                     }
                     if !im.target.args.is_empty() {
-                        errors.push("`impl` of a generic type is not yet supported by codegen — Phase 11".into());
+                        errors.push("internal error: an `impl` of a generic type reached code generation without being monomorphized".into());
                         continue;
                     }
                     // An impl of a generic trait is told apart by its trait arguments
@@ -897,7 +901,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ItemKind::Static(st) => statics.push(st),
                 ItemKind::TypeAlias(a) => {
                     if !a.generics.0.is_empty() {
-                        errors.push(format!("generic type alias `{}` is not yet supported by codegen — Phase 11", a.name));
+                        errors.push(format!("internal error: generic type alias `{}` reached code generation without being expanded", a.name));
                     }
                 }
                 ItemKind::Mod(_) | ItemKind::Use(_) | ItemKind::Import(_) => errors.push("modules / `use` / `import` are not yet supported by codegen — Phase 14".into()),
@@ -1013,7 +1017,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return unsupported("`async fn`", 12);
         }
         if !f.generics.0.is_empty() {
-            return unsupported("generic functions", 11);
+            return Err(CgErr(format!("internal error: generic function `{}` reached code generation without being monomorphized", f.name)));
         }
         let Some(_) = &f.body else { return Err(CgErr("function without a body".into())) };
         self.cur_self = w.self_ty.clone();

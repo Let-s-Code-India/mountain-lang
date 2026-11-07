@@ -424,7 +424,7 @@ impl Free {
         };
         if !ok {
             self.errors.push(format!(
-                "`{}` that leaves a `try` block is not yet supported by codegen — Phase 11 (the desugared wrapper function cannot jump into the enclosing loop)",
+                "`{}` that leaves a `try` block is not supported (the `try` body becomes a separate function and cannot jump into the enclosing loop; not scheduled in Document 25 §2.5, flagged)",
                 what
             ));
         }

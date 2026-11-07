@@ -493,7 +493,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
                 Some(ty) => {
                     m.insert(p.clone(), ty);
                 }
-                None => return Err(vec![format!("error: cannot instantiate `{}` with type `{}` (not yet supported by codegen -- Phase 11)", fname, t)]),
+                None => return Err(vec![format!("error: cannot instantiate `{}` with type `{}`: that type cannot be written as a source type (Document 8)", fname, t)]),
             }
         }
         let mut inst = decl.clone();
@@ -544,7 +544,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
             }
             let arg_types: Option<Vec<Type>> = tys.iter().map(ty_to_type).collect();
             let Some(arg_types) = arg_types else {
-                return Err(vec![format!("error: cannot instantiate `{}` with type arguments ({}) (not yet supported by codegen -- Phase 11)", base, tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))]);
+                return Err(vec![format!("error: cannot instantiate `{}` with type arguments ({}): a type argument cannot be written as a source type (Document 8)", base, tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))]);
             };
             made.insert(mangled.clone());
             changed = true;
@@ -590,7 +590,7 @@ pub fn round(program: &mut Program, tc: &TypeChecker, made: &mut HashSet<String>
                             // A concrete argument (`impl C for Stack<i32>`): applies only to that instance.
                             let rt = resolve_type(ta);
                             if gnames.iter().any(|g| rt.to_string().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|tok| tok == g)) {
-                                return Err(vec![format!("error: `impl` with a type parameter nested inside an argument of `{}<..>` is not yet supported by codegen -- Phase 11", base)]);
+                                return Err(vec![format!("error: `impl` with a type parameter nested inside an argument of `{}<..>` is not supported (Document 8 §5; not scheduled in Document 25 §2.5, flagged)", base)]);
                             }
                             if rt != *ty {
                                 matches = false;
