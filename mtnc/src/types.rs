@@ -636,6 +636,8 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
                     let mut out = Vec::new();
                     for a in args {
                         match a {
+                            // `Box<dyn T>` names the trait object itself (the box is the pointer around it)
+                            Type::Dyn(dn, _) if is_heap_generic(n) => out.push(GenericArg::Type(Ty::DynTrait(dn.clone()))),
                             Type::ConstArg(e) => match CONSTS.with(|c| eval_const_int(e, &c.borrow())) {
                                 Some(v) => out.push(GenericArg::Const(v as i64)),
                                 None => return Ty::Named(n.clone()),
@@ -667,9 +669,14 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
             Ty::Array(Box::new(elem))
         }
         Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|x| resolve_type_depth(x, depth)).collect()),
-        Type::Ref { mutable, inner, .. } => Ty::Ref(*mutable, Box::new(resolve_type_depth(inner, depth))),
+        Type::Ref { mutable, inner, .. } => match &**inner {
+            Type::Dyn(dn, _) => Ty::Ref(*mutable, Box::new(Ty::DynTrait(dn.clone()))),
+            _ => Ty::Ref(*mutable, Box::new(resolve_type_depth(inner, depth))),
+        },
         Type::RawPtr { mutable, inner } => Ty::RawPtr(*mutable, Box::new(resolve_type_depth(inner, depth))),
-        Type::Dyn(n, _) => Ty::DynTrait(n.clone()),
+        // Doc 7 §4.5 / Doc 3 F / Doc 8 §6 (manager decision, Phase 11c): a `dyn Trait` used as a VALUE
+        // type (array element, by-value parameter, field, local) is an OWNED trait object = `Box<dyn Trait>`.
+        Type::Dyn(n, _) => Ty::Generic("Box".into(), vec![GenericArg::Type(Ty::DynTrait(n.clone()))]),
         Type::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| resolve_type_depth(x, depth)).collect(), Box::new(resolve_type_depth(r, depth))),
         Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type_depth(inner, depth))),
         Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type_depth(o, depth)), Box::new(resolve_type_depth(e, depth))),
@@ -1445,6 +1452,30 @@ impl TypeChecker {
             ItemKind::Struct(s) if it.attrs.iter().any(|a| a.name == "copy") => Some(s.name.clone()),
             _ => None,
         }).collect();
+        // Phase 11c C6: `@pack` / `@align(N)` (Document 13 §4.2/§4.3) are validated here.
+        for it in &items {
+            let is_struct = matches!(&it.kind, ItemKind::Struct(_));
+            let name = match &it.kind { ItemKind::Struct(s) => s.name.clone(), ItemKind::Enum(e) => e.name.clone(), _ => String::new() };
+            let has = |n: &str| it.attrs.iter().any(|a| a.name == n);
+            for a in &it.attrs {
+                let bad = |m: String| TypeError { message: m, context: name.clone() };
+                match a.name.as_str() {
+                    "pack" | "align" if !is_struct => self.errors.push(bad(format!("`@{}` applies to structs only (Document 13 §4)", a.name))),
+                    "pack" if !a.args.is_empty() => self.errors.push(bad("`@pack` takes no arguments (Document 13 §4.2)".into())),
+                    "align" => match a.args.as_slice() {
+                        [Expr::Literal(Literal::Int(s))] => match s.replace('_', "").parse::<u64>() {
+                            Ok(n) if n.is_power_of_two() && n <= 1 << 28 => {}
+                            _ => self.errors.push(bad(format!("`@align({})`: the alignment must be a power of two (Document 13 §4.3)", s))),
+                        },
+                        _ => self.errors.push(bad("`@align` takes one integer literal, e.g. `@align(64)` (Document 13 §4.3)".into())),
+                    },
+                    _ => {}
+                }
+            }
+            if has("pack") && has("align") {
+                self.errors.push(TypeError { message: "`@pack` and `@align(N)` cannot be combined on one struct (their layouts conflict)".into(), context: name.clone() });
+            }
+        }
         // Pass 1: register all struct/enum/trait data shapes and fn
         // signatures first, so forward references (a function defined
         // before a struct it uses, or mutual struct references) resolve
@@ -1675,6 +1706,39 @@ impl TypeChecker {
                                 ),
                                 context: format!("impl {} for {}", tn, target_name),
                             });
+                        }
+                    }
+                    // The impl's method must have the trait's shape (Phase 11c C6): same number of
+                    // parameters; for the compiler-known `Allocator`, whose methods the compiler calls
+                    // itself, the exact parameter/return types and a `borrow mut self` receiver.
+                    for (mname, sig) in &shape.methods {
+                        let Some(m) = methods.get(mname) else { continue };
+                        if self.final_pass && !sig.own.is_empty() {
+                            continue;
+                        }
+                        let ctx = format!("impl {} for {}", tn, target_name);
+                        if m.params.len() != sig.params.len() {
+                            self.errors.push(TypeError {
+                                message: format!("method `{}` of `impl {} for {}` takes {} parameter(s) but the trait declares {}", mname, tn, target_name, m.params.len(), sig.params.len()),
+                                context: ctx.clone(),
+                            });
+                        } else if tn == "Allocator" && (m.params != sig.params || m.ret != sig.ret) {
+                            self.errors.push(TypeError {
+                                message: format!("method `{}` of `impl Allocator for {}` must have the signature declared by `Allocator` (Document 13 §3.2: `alloc(borrow mut self, size: usize, align: usize) -> *mut u8`, `dealloc(borrow mut self, ptr: *mut u8, size: usize)`)", mname, target_name),
+                                context: ctx.clone(),
+                            });
+                        }
+                        if tn == "Allocator" {
+                            let recv = impl_decl.items.iter().find_map(|ii| match ii {
+                                ImplItem::Fn(f) if f.name == *mname => f.params.iter().find(|p| p.name == "self").map(|p| p.ownership.clone()),
+                                _ => None,
+                            });
+                            if recv != Some(OwnershipMod::BorrowMut) {
+                                self.errors.push(TypeError {
+                                    message: format!("method `{}` of `impl Allocator for {}` must take `borrow mut self` (Document 13 §3.2)", mname, target_name),
+                                    context: ctx,
+                                });
+                            }
                         }
                     }
                 }
@@ -2804,6 +2868,29 @@ impl TypeChecker {
                             if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
                             return Ty::Generic("Box".into(), vec![GenericArg::Type(it)]);
                         }
+                        // `Box::newIn(value, borrow allocator)` (Doc 13 §3.2): the box lives in the given allocator
+                        if tn == "Box" && fname == "newIn" && !self.structs.contains_key("Box") {
+                            let inner_exp = match expected {
+                                Some(Ty::Generic(n, a)) if n == "Box" && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
+                                _ => None,
+                            };
+                            if args.len() != 2 {
+                                self.errors.push(TypeError { message: format!("`Box::newIn` takes two arguments (the value and `borrow <allocator>`), found {}", args.len()), context: ctx.into() });
+                            }
+                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(_)));
+                            let mut it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
+                            if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
+                            let mut alloc_ty = Ty::Unit;
+                            if let Some(a) = args.get(1) {
+                                let at = self.check_expr(&a.value, None, env, ctx);
+                                match &at {
+                                    Ty::Ref(_, i) if self.satisfies_bound(i, "Allocator") => alloc_ty = (**i).clone(),
+                                    Ty::Ref(_, i) => self.errors.push(TypeError { message: format!("`{}` does not implement `Allocator` (needed by `Box::newIn`, Document 13 §3.2)", i), context: ctx.into() }),
+                                    other => self.errors.push(TypeError { message: format!("`Box::newIn` needs `borrow <allocator>` as its second argument, found `{}` (Document 13 §3.2)", other), context: ctx.into() }),
+                                }
+                            }
+                            return Ty::Generic("Box".into(), vec![GenericArg::Type(it), GenericArg::Type(alloc_ty)]);
+                        }
                         if matches!(tn.as_str(), "Rc" | "Arc") && fname == "new" && !self.structs.contains_key(tn.as_str()) {
                             let inner_exp = match expected {
                                 Some(Ty::Generic(n, a)) if n == tn && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
@@ -3693,7 +3780,14 @@ impl TypeChecker {
     fn dyn_coercible(&self, actual: &Ty, exp: &Ty) -> bool {
         let boxed = |t: &Ty| -> Option<Ty> {
             match t {
-                Ty::Generic(n, a) if n == "Box" && a.len() == 1 => match &a[0] { GenericArg::Type(i) => Some(i.clone()), _ => None },
+                Ty::Generic(n, a) if n == "Box" && !a.is_empty() => match &a[0] { GenericArg::Type(i) => Some(i.clone()), _ => None },
+                _ => None,
+            }
+        };
+        // the allocator argument of `Box<T, A>` (None for the default global allocator)
+        let alloc_of = |t: &Ty| -> Option<Ty> {
+            match t {
+                Ty::Generic(n, a) if n == "Box" && a.len() == 2 => match &a[1] { GenericArg::Type(i) => Some(i.clone()), _ => None },
                 _ => None,
             }
         };
@@ -3713,7 +3807,15 @@ impl TypeChecker {
                 }
             }
             _ => match (boxed(actual), boxed(exp)) {
-                (Some(c), Some(Ty::DynTrait(tr))) => !matches!(c, Ty::DynTrait(_)) && self.traits.contains_key(&tr) && self.satisfies_bound(&c, &tr),
+                (Some(c), Some(Ty::DynTrait(tr))) => alloc_of(actual) == alloc_of(exp) && !matches!(c, Ty::DynTrait(_)) && self.traits.contains_key(&tr) && self.satisfies_bound(&c, &tr),
+                // a concrete VALUE where an owned `dyn Trait` is expected: boxed implicitly (Doc 5 sub-typing via trait objects)
+                (None, Some(Ty::DynTrait(tr))) => {
+                    alloc_of(exp).is_none()
+                        && !matches!(actual, Ty::Ref(..) | Ty::Infer(_) | Ty::Never | Ty::Unit | Ty::DynTrait(_) | Ty::RawPtr(..))
+                        && !matches!(actual, Ty::Generic(n, _) if n == "Box")
+                        && self.traits.contains_key(&tr)
+                        && self.satisfies_bound(actual, &tr)
+                }
                 _ => false,
             },
         }

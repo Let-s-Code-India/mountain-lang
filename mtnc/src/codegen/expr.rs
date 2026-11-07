@@ -1,6 +1,7 @@
 //! Statements, expressions, patterns and control flow for `codegen.rs`.
 
 use super::*;
+use inkwell::values::{AsValueRef, BasicValue};
 
 /// A folded constant scalar (Phase 11b-1).
 #[derive(Clone, Copy, Debug)]
@@ -219,7 +220,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     pub(super) fn load(&mut self, p: PointerValue<'ctx>, ty: &Ty) -> R<V<'ctx>> {
         let lt = self.llty(ty)?;
-        Ok(self.builder.build_load(lt, p, "")?)
+        let v = self.builder.build_load(lt, p, "")?;
+        if self.packed_ptrs.contains(&(p.as_value_ref() as usize)) {
+            if let Some(i) = v.as_instruction_value() {
+                let _ = i.set_alignment(1);
+            }
+        }
+        Ok(v)
     }
 
     /// Evaluates `e`; a diverging (`!`) expression stands in as zero of `want`.
@@ -541,8 +548,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         let ut = self.usize_ty();
                         let lt = self.llty(&ty)?;
                         let (size, align) = (self.td.get_abi_size(&lt).max(1), (self.td.get_abi_alignment(&lt) as u64).max(1));
-                        let (_, fd) = self.alloc_fns();
-                        self.builder.build_call(fd, &[bptr.into(), ut.const_int(size, false).into(), ut.const_int(align, false).into()], "")?;
+                        if let Some(a) = super::drops::box_alloc_arg(&ity) {
+                            let bt = self.llty(&ity)?;
+                            let ap = self.builder.build_struct_gep(bt, bp, 1, "allocp")?;
+                            let alloc = self.builder.build_load(ptrt, ap, "alloc")?.into_pointer_value();
+                            self.call_allocator_dealloc(&a, alloc, bptr, ut.const_int(size, false))?;
+                        } else {
+                            let (_, fd) = self.alloc_fns();
+                            self.builder.build_call(fd, &[bptr.into(), ut.const_int(size, false).into(), ut.const_int(align, false).into()], "")?;
+                        }
                         self.mark_moved(bp, &ity)?;
                     }
                     return Ok(v);
@@ -874,7 +888,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let (bp, st_ty) = self.peel_box_place(bp, st_ty)?;
                 let (idx, fty) = self.field_index(&st_ty, name)?;
                 let st = self.llty(&st_ty)?;
-                Ok((self.builder.build_struct_gep(st, bp, idx, "fp")?, fty))
+                let fp = self.builder.build_struct_gep(st, bp, idx, "fp")?;
+                if let Ty::Named(sn) = &st_ty {
+                    if matches!(self.struct_layout.get(sn), Some((true, _))) {
+                        self.packed_ptrs.insert(fp.as_value_ref() as usize);
+                    }
+                }
+                Ok((fp, fty))
             }
             Expr::Index { expr: base, index } => self.index_place(base, index),
             Expr::Deref(inner) => {
@@ -1492,7 +1512,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 if self.needs_drop(&lty) {
                     self.drop_in_place(p, &lty)?;
                 }
-                self.builder.build_store(p, v)?;
+                let st = self.builder.build_store(p, v)?;
+                if self.packed_ptrs.contains(&(p.as_value_ref() as usize)) {
+                    let _ = st.set_alignment(1);
+                }
             }
             return Ok(());
         }
@@ -1513,7 +1536,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let r = self.expr_as(rhs, &lty)?;
         let cur = self.load(p, &lty)?;
         let nv = self.arith(bop, cur, r, &lty)?;
-        self.builder.build_store(p, nv)?;
+        let st = self.builder.build_store(p, nv)?;
+        if self.packed_ptrs.contains(&(p.as_value_ref() as usize)) {
+            let _ = st.set_alignment(1);
+        }
         Ok(())
     }
 
@@ -2775,6 +2801,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         let inner = inner.clone();
                         let v = self.expr_as(&args[0].value, &inner)?;
                         return self.box_new(&inner, v);
+                    }
+                    if tn == "Box" && fname == "newIn" {
+                        let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `Box::newIn` is not typed as a Box".into())) };
+                        let (Some(crate::types::GenericArg::Type(inner)), Some(crate::types::GenericArg::Type(a))) = (ga.first(), ga.get(1)) else {
+                            return Err(CgErr("internal: `Box::newIn` without its type arguments".into()));
+                        };
+                        let (inner, a) = (inner.clone(), a.clone());
+                        let v = self.expr_as(&args[0].value, &inner)?;
+                        let alloc = self.expr(&args[1].value)?.into_pointer_value();
+                        let ut = self.usize_ty();
+                        let lt = self.llty(&inner)?;
+                        let size = self.td.get_abi_size(&lt).max(1);
+                        let align = (self.td.get_abi_alignment(&lt) as u64).max(1);
+                        let p = self.call_allocator_alloc(&a, alloc, ut.const_int(size, false), ut.const_int(align, false))?;
+                        self.builder.build_store(p, v)?;
+                        let ptrt = self.context.ptr_type(AddressSpace::default());
+                        let st = self.context.struct_type(&[ptrt.into(), ptrt.into()], false);
+                        let mut agg = st.get_undef();
+                        agg = self.builder.build_insert_value(agg, p, 0, "data")?.into_struct_value();
+                        agg = self.builder.build_insert_value(agg, alloc, 1, "alloc")?.into_struct_value();
+                        return Ok(agg.into());
                     }
                     if tn == "String" && fname == "from" {
                         let at = self.ty_of(&args[0].value)?;

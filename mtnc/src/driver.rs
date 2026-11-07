@@ -25,6 +25,24 @@ pub struct Checked {
 /// checker. Returns every diagnostic found, never stops at the first stage's
 /// first error within a stage; later stages run only if earlier ones are clean
 /// (their results would be meaningless on a broken tree).
+/// The compiler-known `Allocator` trait (Document 13 §3.2). It needs no declaration in user code
+/// (`impl Allocator for ArenaAllocator` is written without one), so it is added to every program
+/// unless the program declares its own trait of that name.
+const PRELUDE: &str = "trait Allocator {\n    fn alloc(borrow mut self, size: usize, align: usize) -> *mut u8;\n    fn dealloc(borrow mut self, ptr: *mut u8, size: usize);\n}\n";
+
+fn inject_prelude(program: &mut crate::ast::Program) {
+    use crate::ast::ItemKind;
+    if program.items.iter().any(|i| matches!(&i.kind, ItemKind::Trait(t) if t.name == "Allocator")) {
+        return;
+    }
+    let (tokens, _) = lexer::tokenize(PRELUDE);
+    let (prelude, errs) = parse_program(tokens);
+    assert!(errs.is_empty(), "internal: the prelude does not parse");
+    let mut items = prelude.items;
+    items.append(&mut program.items);
+    program.items = items;
+}
+
 pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let (tokens, lex_errs) = lexer::tokenize(src);
     if !lex_errs.is_empty() {
@@ -34,6 +52,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| format!("error: {} --> {}", e.message, e.span)).collect());
     }
+    inject_prelude(&mut program);
     // Same-named nested items of different functions get distinct names first.
     crate::scope::scope_nested_items(&mut program);
     desugar::inline_generic_default_methods(&mut program);

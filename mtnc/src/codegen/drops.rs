@@ -275,7 +275,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.position_at_end(end);
             }
             Ty::Generic(n, args) if n == "Box" && matches!(args.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => {
-                self.dyn_box_glue(f, p)?;
+                let a = box_alloc_arg(ty);
+                self.dyn_box_glue(f, p, a)?;
             }
             Ty::Generic(n, args) if n == "Box" => {
                 let Some(crate::types::GenericArg::Type(inner)) = args.first() else {
@@ -294,7 +295,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let lt = self.llty(&inner)?;
                 let size = self.td.get_abi_size(&lt).max(1);
                 let align = (self.td.get_abi_alignment(&lt) as u64).max(1);
-                self.call_dealloc(boxed, ut.const_int(size, false), ut.const_int(align, false))?;
+                if let Some(a) = box_alloc_arg(ty) {
+                    // `Box<T, A>` frees through ITS allocator (Document 13 §3.2)
+                    let bt = self.llty(ty)?;
+                    let ap = self.builder.build_struct_gep(bt, p, 1, "allocp")?;
+                    let alloc = self.builder.build_load(ptrt, ap, "alloc")?.into_pointer_value();
+                    self.call_allocator_dealloc(&a, alloc, boxed, ut.const_int(size, false))?;
+                } else {
+                    self.call_dealloc(boxed, ut.const_int(size, false), ut.const_int(align, false))?;
+                }
                 self.builder.build_unconditional_branch(end)?;
                 self.builder.position_at_end(end);
             }
@@ -600,6 +609,28 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(p)
     }
 
+    /// `A::dealloc(alloc, data, size)` of a user `impl Allocator for A` (the trait method, called statically).
+    pub(super) fn call_allocator_dealloc(&mut self, a: &Ty, alloc: PointerValue<'ctx>, data: PointerValue<'ctx>, size: IntValue<'ctx>) -> R<()> {
+        let key = self.trait_impl_keys.get(&(a.to_string(), "Allocator".to_string(), "dealloc".to_string())).cloned();
+        let Some(k) = key else { return Err(CgErr(format!("`{}` does not implement `Allocator`", a))) };
+        let f = self.fns[&k].val;
+        self.builder.build_call(f, &[alloc.into(), data.into(), size.into()], "")?;
+        Ok(())
+    }
+
+    /// `A::alloc(alloc, size, align) -> *mut u8` of a user `impl Allocator for A`; a null result aborts.
+    pub(super) fn call_allocator_alloc(&mut self, a: &Ty, alloc: PointerValue<'ctx>, size: IntValue<'ctx>, align: IntValue<'ctx>) -> R<PointerValue<'ctx>> {
+        let key = self.trait_impl_keys.get(&(a.to_string(), "Allocator".to_string(), "alloc".to_string())).cloned();
+        let Some(k) = key else { return Err(CgErr(format!("`{}` does not implement `Allocator`", a))) };
+        let f = self.fns[&k].val;
+        let call = self.builder.build_call(f, &[alloc.into(), size.into(), align.into()], "")?;
+        let ValueKind::Basic(p) = call.try_as_basic_value() else { return Err(CgErr("internal: allocator result".into())) };
+        let p = p.into_pointer_value();
+        let isnull = self.builder.build_is_null(p, "oom")?;
+        self.panic_if(isnull, "allocator returned a null pointer (out of memory)")?;
+        Ok(p)
+    }
+
     /// `String::from(&str)`: a heap copy of the bytes.
     pub(super) fn string_from_str(&mut self, v: V<'ctx>) -> R<V<'ctx>> {
         let ut = self.usize_ty();
@@ -614,5 +645,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let p = p.into_pointer_value();
         self.builder.build_memcpy(p, 1, src, 1, n)?;
         self.build_handle(p, n, alloc_n)
+    }
+}
+
+/// The allocator type `A` of `Box<T, A>` (None for a plain `Box<T>`).
+pub(super) fn box_alloc_arg(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Generic(n, a) if n == "Box" && a.len() == 2 => match &a[1] {
+            crate::types::GenericArg::Type(t) => Some(t.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }

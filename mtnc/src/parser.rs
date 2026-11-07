@@ -1038,6 +1038,9 @@ impl Parser {
         if self.eat_kw(Keyword::Dyn) {
             let name = self.expect_word()?;
             let args = self.parse_generic_args_opt()?;
+            if !args.is_empty() {
+                return self.error(format!("not yet supported: `dyn {}<..>` (a generic trait object); the spec shows only non-generic traits behind `dyn`", name));
+            }
             return Ok(Type::Dyn(name, args));
         }
         if self.eat_kw(Keyword::Fn) {

@@ -193,3 +193,87 @@ fn one_vtable_per_type_and_trait_pair() {
     let text = ir(&prog("let a: Box<dyn Shape> = Box::new(Sq { s: 1 }); let b: Box<dyn Shape> = Box::new(Sq { s: 2 }); println(a.area() + b.area());"));
     assert_eq!(text.matches("@__mtn_vtable_Sq_Shape = ").count(), 1, "{}", text);
 }
+
+// ---- dyn Trait as a VALUE type = owned Box<dyn Trait> (manager decision, Doc 7 §4.5 / Doc 3 F / Doc 8 §6 / Doc 11 §6) ----
+
+const DRAWABLE: &str = "trait Drawable { fn draw(borrow self) -> i32; }\n\
+    struct Button { id: i32 }\nstruct Image { name: String, w: i32 }\n\
+    impl Drawable for Button { fn draw(borrow self) -> i32 { return self.id; } }\n\
+    impl Drawable for Image { fn draw(borrow self) -> i32 { return self.w * 10; } }\n";
+
+#[test]
+fn memory_example_dyn_values() {
+    let (o, c) = run_file(&example("dyn_values.mtn"));
+    assert_eq!((o.as_str(), c), ("131\n20\n7\n9\n-1\n", 0));
+}
+
+#[test]
+fn array_of_dyn_holds_different_concrete_types_and_drops_each_through_its_vtable() {
+    let src = format!("{}fn main() {{ let s: [dyn Drawable] = [Button {{ id: 1 }}, Image {{ name: String::from(\"a\"), w: 2 }}]; println(s[0].draw() + s[1].draw()); }}", DRAWABLE);
+    let (o, c) = run(&src);
+    assert_eq!((o.as_str(), c), ("21\n", 0));
+}
+
+#[test]
+fn by_value_dyn_parameter_accepts_a_concrete_value() {
+    let src = format!("{}fn render(s: dyn Drawable) -> i32 {{ return s.draw(); }}\nfn main() {{ println(render(Image {{ name: String::from(\"a\"), w: 4 }})); println(render(Button {{ id: 3 }})); }}", DRAWABLE);
+    let (o, c) = run(&src);
+    assert_eq!((o.as_str(), c), ("40\n3\n", 0));
+}
+
+#[test]
+fn by_value_dyn_parameter_accepts_an_existing_box_dyn() {
+    let src = format!("{}fn render(s: dyn Drawable) -> i32 {{ return s.draw(); }}\nfn main() {{ let b: Box<dyn Drawable> = Box::new(Button {{ id: 8 }}); println(render(b)); }}", DRAWABLE);
+    let (o, c) = run(&src);
+    assert_eq!((o.as_str(), c), ("8\n", 0));
+}
+
+#[test]
+fn dyn_struct_field_and_local_are_owned() {
+    let src = format!("{}struct W {{ d: dyn Drawable }}\nfn main() {{ let w = W {{ d: Image {{ name: String::from(\"x\"), w: 5 }} }}; let d: dyn Drawable = Button {{ id: 2 }}; println(w.d.draw() + d.draw()); }}", DRAWABLE);
+    let (o, c) = run(&src);
+    assert_eq!((o.as_str(), c), ("52\n", 0));
+}
+
+#[test]
+fn option_of_borrowed_dyn_is_a_nullable_fat_reference() {
+    let src = "trait F { fn code(borrow self) -> i32; fn cause(borrow self) -> Option<borrow dyn F>; }\n\
+        struct A { c: i32 }\nstruct B { c: i32, a: A }\n\
+        impl F for A { fn code(borrow self) -> i32 { return self.c; } fn cause(borrow self) -> Option<borrow dyn F> { return None; } }\n\
+        impl F for B { fn code(borrow self) -> i32 { return self.c; } fn cause(borrow self) -> Option<borrow dyn F> { return Some(borrow self.a); } }\n\
+        fn main() { let b = B { c: 1, a: A { c: 6 } }; match b.cause() { Some(x) => println(x.code()), None => println(0) } let a = A { c: 2 }; match a.cause() { Some(x) => println(x.code()), None => println(-1) } }";
+    let (o, c) = run(src);
+    assert_eq!((o.as_str(), c), ("6\n-1\n", 0));
+}
+
+#[test]
+fn array_element_that_does_not_implement_the_trait_is_rejected() {
+    let src = format!("{}struct Other {{ x: i32 }}\nfn main() {{ let s: [dyn Drawable] = [Button {{ id: 1 }}, Other {{ x: 2 }}]; }}", DRAWABLE);
+    rejected(&src);
+}
+
+#[test]
+fn by_value_dyn_argument_that_does_not_implement_the_trait_is_rejected() {
+    let src = format!("{}struct Other {{ x: i32 }}\nfn render(s: dyn Drawable) -> i32 {{ return s.draw(); }}\nfn main() {{ render(Other {{ x: 1 }}); }}", DRAWABLE);
+    rejected(&src);
+}
+
+#[test]
+fn borrowed_dyn_option_with_a_type_that_does_not_implement_the_trait_is_rejected() {
+    let src = "trait F { fn code(borrow self) -> i32; }\nstruct A { c: i32 }\nstruct N { c: i32 }\n\
+        impl F for A { fn code(borrow self) -> i32 { return self.c; } }\n\
+        fn pick(n: borrow N) -> Option<borrow dyn F> { return Some(n); }\nfn main() { }";
+    rejected(src);
+}
+
+#[test]
+fn generic_trait_object_is_a_clear_error() {
+    let m = rejected("trait G<T> { fn get(borrow self) -> i32; }\nfn f(x: borrow dyn G<i32>) { }\nfn main() { }");
+    assert!(m.contains("dyn G<..>"), "{}", m);
+}
+
+#[test]
+fn use_after_move_of_a_by_value_dyn_argument_is_rejected() {
+    let src = format!("{}fn render(s: dyn Drawable) -> i32 {{ return s.draw(); }}\nfn main() {{ let b: dyn Drawable = Button {{ id: 1 }}; render(b); render(b); }}", DRAWABLE);
+    rejected(&src);
+}

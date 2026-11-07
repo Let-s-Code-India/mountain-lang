@@ -144,6 +144,10 @@ pub struct Codegen<'ctx, 'a> {
     opts: Options,
 
     structs: HashMap<String, (Vec<(String, Ty)>, bool)>,
+    /// `@pack` (zero padding) / `@align(N)` of a struct: `(packed, alignment)` (Document 13 §4).
+    struct_layout: HashMap<String, (bool, u64)>,
+    /// Field addresses inside a packed struct: loads/stores through them are emitted with alignment 1.
+    packed_ptrs: std::collections::HashSet<usize>,
     enums: HashMap<String, Vec<(String, Vec<Ty>)>>,
     fns: HashMap<String, FnInfo<'ctx, 'a>>,
     /// (type name, method name) -> function keys, inherent methods first.
@@ -273,6 +277,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             types,
             opts,
             structs: HashMap::new(),
+            struct_layout: HashMap::new(),
+            packed_ptrs: std::collections::HashSet::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
             methods: HashMap::new(),
@@ -377,7 +383,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     for (_, t) in &fields {
                         fs.push(self.llty(t)?);
                     }
-                    self.context.struct_type(&fs, false).into()
+                    match self.struct_layout.get(n).copied() {
+                        // `@pack`: no padding, alignment 1
+                        Some((true, _)) => self.context.struct_type(&fs, true).into(),
+                        // `@align(N)`: a trailing zero-length array of an N-aligned vector type raises the
+                        // struct's alignment (and so its size) to N without moving any field
+                        Some((false, a)) if a > 1 => {
+                            let vt = self.context.i8_type().vec_type(a as u32);
+                            fs.push(vt.array_type(0).into());
+                            self.context.struct_type(&fs, false).into()
+                        }
+                        _ => self.context.struct_type(&fs, false).into(),
+                    }
                 } else if self.enums.contains_key(n) {
                     self.enum_layout(ty)?.llty.into()
                 } else {
@@ -405,6 +422,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.handle_ty().into()
             }
             Ty::Fn(..) => return unsupported("function values / closures", 12),
+            // `Box<T, A>` (Document 13 §3.2): `{ data, allocator }`; `Box<dyn Trait, A>`: `{ data, vtable, allocator }`.
+            // The data pointer is always the FIRST field, so code that only needs the pointer can load field 0.
+            Ty::Generic(n, a) if n == "Box" && a.len() == 2 => {
+                let p = self.context.ptr_type(AddressSpace::default());
+                if matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) {
+                    self.context.struct_type(&[p.into(), p.into(), p.into()], false).into()
+                } else {
+                    self.context.struct_type(&[p.into(), p.into()], false).into()
+                }
+            }
             Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => return unsupported("generics (monomorphization)", 11),
@@ -750,6 +777,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         StructBody::Tuple(ts) => (ts.iter().enumerate().map(|(i, t)| (i.to_string(), resolve_type(t))).collect(), true),
                         StructBody::Unit => (Vec::new(), false),
                     };
+                    let packed = item.attrs.iter().any(|a| a.name == "pack");
+                    let align = item.attrs.iter().find(|a| a.name == "align").and_then(|a| match a.args.first() {
+                        Some(Expr::Literal(Literal::Int(t))) => t.replace('_', "").parse::<u64>().ok(),
+                        _ => None,
+                    });
+                    if packed || align.is_some() {
+                        self.struct_layout.insert(s.name.clone(), (packed, align.unwrap_or(0)));
+                    }
                     self.structs.insert(s.name.clone(), (fields, is_tuple));
                 }
                 ItemKind::Enum(en) => {

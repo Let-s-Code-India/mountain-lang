@@ -106,13 +106,36 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let vt = self.vtable_for(a, tr)?;
                 self.build_fat(v, vt)
             }
-            (Ty::Generic(_, sa), Ty::Generic(_, da)) => {
+            (Ty::Generic(sn, sa), Ty::Generic(_, da)) if sn == "Box" => {
                 let (Some(crate::types::GenericArg::Type(c)), Some(crate::types::GenericArg::Type(Ty::DynTrait(tr)))) = (sa.first(), da.first()) else {
                     return Err(CgErr("internal: bad trait-object coercion".into()));
                 };
                 let (c, tr) = (c.clone(), tr.clone());
                 let vt = self.vtable_for(&c, &tr)?;
+                if da.len() == 2 {
+                    // `Box<C, A>` `{data, alloc}` -> `Box<dyn Trait, A>` `{data, vtable, alloc}`
+                    let sv = v.into_struct_value();
+                    let data = self.builder.build_extract_value(sv, 0, "data")?;
+                    let alloc = self.builder.build_extract_value(sv, 1, "alloc")?;
+                    let ptrt = self.context.ptr_type(AddressSpace::default());
+                    let st = self.context.struct_type(&[ptrt.into(), ptrt.into(), ptrt.into()], false);
+                    let mut agg = st.get_undef();
+                    agg = self.builder.build_insert_value(agg, data, 0, "data")?.into_struct_value();
+                    agg = self.builder.build_insert_value(agg, vt, 1, "vtable")?.into_struct_value();
+                    agg = self.builder.build_insert_value(agg, alloc, 2, "alloc")?.into_struct_value();
+                    return Ok(agg.into());
+                }
                 self.build_fat(v, vt)
+            }
+            // a concrete value -> owned `dyn Trait`: box it first
+            (conc, Ty::Generic(_, da)) => {
+                let Some(crate::types::GenericArg::Type(Ty::DynTrait(tr))) = da.first() else {
+                    return Err(CgErr("internal: bad trait-object coercion".into()));
+                };
+                let tr = tr.clone();
+                let p = self.box_new(conc, v)?;
+                let vt = self.vtable_for(conc, &tr)?;
+                self.build_fat(p, vt)
             }
             _ => Err(CgErr(format!("internal: cannot coerce `{}` to `{}`", src, dst))),
         }
@@ -120,7 +143,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     /// Drop glue of `Box<dyn Trait>`: run the concrete drop glue (from the vtable), then free the
     /// allocation with the size and alignment stored in the vtable.
-    pub(super) fn dyn_box_glue(&mut self, f: FunctionValue<'ctx>, p: PointerValue<'ctx>) -> R<()> {
+    pub(super) fn dyn_box_glue(&mut self, f: FunctionValue<'ctx>, p: PointerValue<'ctx>, alloc_ty: Option<Ty>) -> R<()> {
         let ptrt = self.context.ptr_type(AddressSpace::default());
         let ut = self.usize_ty();
         let fat = self.fat_ty();
@@ -152,8 +175,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let size = self.builder.build_load(ut, sp, "size")?.into_int_value();
         let align = self.builder.build_load(ut, ap, "align")?.into_int_value();
         // a zero-sized value was allocated with 1 byte
-        let (_, fd) = self.alloc_fns();
-        self.builder.build_call(fd, &[data.into(), size.into(), align.into()], "")?;
+        if let Some(a) = alloc_ty {
+            // `Box<dyn Trait, A>`: freed through ITS allocator, with the size the vtable records
+            let bt = self.context.struct_type(&[ptrt.into(), ptrt.into(), ptrt.into()], false);
+            let alp = self.builder.build_struct_gep(bt, p, 2, "allocp")?;
+            let alloc = self.builder.build_load(ptrt, alp, "alloc")?.into_pointer_value();
+            self.call_allocator_dealloc(&a, alloc, data, size)?;
+        } else {
+            let (_, fd) = self.alloc_fns();
+            self.builder.build_call(fd, &[data.into(), size.into(), align.into()], "")?;
+        }
         self.builder.build_unconditional_branch(end)?;
         self.builder.position_at_end(end);
         Ok(())
