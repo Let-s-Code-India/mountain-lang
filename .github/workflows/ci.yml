@@ -32,7 +32,7 @@ jobs:
       - name: Install LLVM 18 development packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev zlib1g-dev libffi-dev
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev zlib1g-dev libffi-dev valgrind
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,6 +44,13 @@ jobs:
         # --no-fail-fast: one failing test binary must not hide the results
         # of the remaining ones (every phase gets full results in one run).
         run: cargo test --verbose --no-fail-fast
+
+      - name: Memory examples under valgrind (no leaks, no invalid memory access)
+        # Phase 11 exit criterion: every program in examples/memory/ is built with
+        # mtnc and run under valgrind; any definite leak, invalid read/write/free
+        # or non-zero exit fails the job. `bash` is used on purpose: a script
+        # uploaded through the GitHub web UI loses its executable bit.
+        run: bash scripts/valgrind_memory_examples.sh target/debug/mtnc
 
       - name: Smoke test — mtnc --version
         run: cargo run -- --version
