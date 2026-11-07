@@ -1,0 +1,27 @@
+// Nested owned structs, a Box inside a struct, and a growable [T] of structs that own heap data.
+// Every heap buffer is released exactly once, at the end of its owner's scope (Doc 13 §2).
+struct Address { street: String, city: String }
+struct Person { name: String, address: Address, tags: [String] }
+struct Company { boss: Box<Person>, staff: [Person], name: String }
+
+fn person(name: String, street: String, n: i32) -> Person {
+    let mut tags = [String::from("t0")];
+    let mut i = 1;
+    while i < n {
+        tags = [String::from("a"), String::from("b"), String::from("c")];
+        i = i + 1;
+    }
+    return Person { name: name, address: Address { street: street, city: String::from("Hill") }, tags: tags };
+}
+
+fn main() {
+    let boss = Box::new(person(String::from("Ada"), String::from("1 Peak Rd"), 1));
+    let staff = [person(String::from("Bo"), String::from("2 Peak Rd"), 3), person(String::from("Cy"), String::from("3 Peak Rd"), 1)];
+    let c = Company { boss: boss, staff: staff, name: String::from("Summit") };
+    println(c.name);
+    println(c.boss.name);
+    println(c.boss.address.street);
+    println(c.staff[0].name);
+    println(c.staff[1].address.city);
+    println(c.staff[0].tags[2]);
+}
