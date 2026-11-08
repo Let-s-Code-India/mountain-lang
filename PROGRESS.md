@@ -30,6 +30,41 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 
 ---
 
+## Current state at a glance (consolidated by the manager, 2026-11-08)
+
+**Phases 1–11 are 🟢 (real CI logs). Phases 12–25 are ⚪ not started.** Latest confirmed CI run: **603 tests passed, 0 failed, 0 warnings, 29 test binaries; smoke tests green (`checked 51 file(s), 0 errors`, `Hello, Mountain!`); valgrind step green on all 9 `examples/memory/` programs.**
+
+| Phase | Status | Confirmed by (real CI) |
+|---|---|---|
+| 1 Scaffold + lexer | 🟢 | first green run: 29 unit + 6 integration |
+| 2 Parser | 🟢 | 57 lib + 6 integration + 6 `parser_doc24` |
+| 3 Core type system | 🟢 | Phase 4 log (110 tests) and every later log |
+| 4 Traits and `impl` | 🟢 | 110 tests |
+| 5 Generics | 🟢 | Phase 6 log (138) and later; exit criteria re-proven in 11b |
+| 6 Borrow checker | 🟢 | 138; correction confirmed in the Phase 7 log (17/17) |
+| 7 Functions and closures | 🟢 | 149 |
+| 8 Control flow | 🟢 | owner reported 186; verified through the Phase 9 log |
+| 9 Error handling | 🟢 | 243 |
+| 10 LLVM codegen + native backend | 🟢 | 278 |
+| 11a / 11b / 11c Memory management + codegen foundations | 🟢 | 308 / 413 / 603 (+ valgrind step) |
+| 12–25 | ⚪ | — |
+
+**Session practice (owner decision 2026-11-08):** one fresh chat per phase, and the previous phase's chat is deleted after the manager has approved that phase. The coding assistant keeps this file current while it works; the manager does one final consolidation per phase (this section and the two registers below). Per-phase work files (`WORKLOG_*.md`) are scratch notes: this file is the record.
+
+### Approval log (flagged items) — manager decisions
+Every item the coding assistant flagged "for sign-off" in Phases 1–11 has been decided. Approved as implemented unless a later phase replaced it: Phase 2 deviations 1–9 (now Document 23 §4 / §17); Phase 3 bidirectional checker; Phase 4 orphan-rule approximation (revisit in Phase 14); Phase 5 matmul special rule and unification hybrid (generalised in 11b); Phase 6 NLL tension (spec bug, Doc 6 §3.1 corrected) and `@copy` (Doc 23 §17.8); Phase 9 flagged interpretations (Doc 11 §8, §8.9); Phase 10 seven flagged items (Doc 17 §10); Phase 11a/11b/11c flagged interpretations (see their entries; 11c items: zero-slot ownership instead of drop flags, by-reference `match` binding, `Weak<T>`/`Weak<T, Arc>`, invented names `upgrade`/`strongCount`/`weakCount`, no user `Drop` trait, `dyn T` in value position = owned `Box<dyn T>`, `Box::newIn` taking a shared `borrow` allocator).
+
+### Open items register (carry forward — nothing here is hidden)
+1. **Move while borrowed (Phase 7 gap, Doc 6): a move is not checked against active borrows of the same place** (`let r = borrow x; let y = x; use(r)` is accepted). Memory-safety relevant. **Manager decision: close it in the first milestone of Phase 12**, with positive and rejection tests.
+2. **By-value parameter `mut`:** Doc 3 says `mut` may mark a function parameter, Doc 23's parameter grammar has no `mut x: T`; today by-value parameters are immutable. The manager will rule with a Doc 23 edit before Phase 12 starts.
+3. **impl method signatures vs the trait's:** only names and parameter counts are compared, not parameter and return types (Doc 7). To be scheduled by the manager (suggested: Phase 12 housekeeping).
+4. **Orphan rule** uses a one-file "package" approximation (Doc 7 §5) until the package system exists: revisit in **Phase 14**.
+5. **Language features that need later phases:** closures, generators, `async`, `spawn`, `actor`, `?`/`return`/`throw` inside closures (Phase 12); `channel`, `select`, `Atomic`, locks, interior mutability through `Rc`/`Arc`, `Rc` not rejected as non-`Send` (Phases 12–13); modules (14); `wasm32` target and the size-class allocator, Doc 13 §3.1 (15); the real prelude, `for` over growable arrays and `Iterable`, `.len()`/`push`/string operations, printing `&i32`/128-bit integers, array patterns `[a, b]`/`[first, ..rest]`, `Option`/`Result`/`Box`/`Rc` as library source (16); lint for non-tail recursion (23).
+6. **Unspecified in the 25 documents (not invented):** pointer arithmetic and pointer methods; a user `Drop` trait; Unicode identifier rules and string-escape validation (Phase 1); `dyn` behind `Rc`/`Arc` and `dyn Trait<T>`; `break`/`continue` leaving a `try` block. Each needs a document decision before it is built.
+7. **Smaller known limits (see the Phase 11b and 11c entries):** const expressions inside type arguments (`Matrix<f64, R*C, 1>`); later-use inference for const parameters; same-named associated types in two traits; `Stack<i32>::Item`; `impl<T> Foo<Vec<T>>`; temporaries live to the end of their statement; no move out of an array by indexing.
+8. **Document follow-ups for the manager:** merge into the documents the interpretations that are now implemented (`Weak<T, Arc>`, `dyn T` as a value type, `Rc`/`Arc` API names, `Allocator`/`Box<T, A>`) — Doc 6 §6, Doc 7 §4.5, Doc 13 §3.2.
+9. **Repo housekeeping:** add `/mtnc/examples/**/*.bin` to `.gitignore` (test helpers leave build outputs there); `PROGRESS.md` entries for Phases 1–8 keep their original narrative (including the CI failures and fixes) as history; the status lines above are authoritative.
+
 ## Phase 1 — Project Scaffold, `mountain.toml` Parsing, CLI Skeleton, Lexer
 
 **Status: 🟢 Complete — confirmed via real GitHub Actions CI run**
@@ -91,6 +126,7 @@ process with the user:
    the GitHub Actions run described in the handoff instructions given to
    the user. This phase is not being marked 🟢 until that real run is
    confirmed green, per explicit user instruction.
+   *(History note: that real run came back green — see the Status line.)*
 
 ### CI Run #1 — FAILED (real signal, as expected process)
 `cargo build` failed with 3 compile errors: E0428, E0308, E0618. Root cause
@@ -364,7 +400,7 @@ constructs. Still no real `cargo test` available in this sandbox.
   (`<<=`, `..=`, `??`, `?.`) — covered, tested. ✅
 - Invalid characters produce a `Diagnostic` + `Error` token and lexing
   **continues** (does not abort) — covered, tested explicitly. ✅
-- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+- **Confirmed by a real CI run** (see the Status line at the top of this phase). ✅
 
 ### Known gaps / explicitly deferred (not silently skipped)
 - No Parser yet — `build`/`check` only run the Lexer stage. Expected;
@@ -509,7 +545,7 @@ constantly) — not a parser implementation mistake so much as something
 the grammar itself needs to tolerate, which `expect_word()` now does
 uniformly rather than via scattered special cases.
 
-### Flagged deviations from Document 23 (need explicit sign-off)
+### Flagged deviations from Document 23 — ✅ APPROVED by the manager (2026-11-08); formalised in Document 23 §4 and §17
 Document 23 was treated as ground truth per this phase's instructions,
 but 6 concrete cases were found where Document 24's *required-to-parse*
 example code doesn't fit Document 23's literal grammar. Each is a small,
@@ -550,7 +586,7 @@ gap) rather than a silent reinterpretation:
    checking whether the first token after `{` looks like `word :`
    reliably distinguishes the two. Found while re-verifying Document 24
    §2/§6 after the `align`/`layout` fix let parsing reach further into
-   those examples. Needs explicit sign-off, like the others above.
+   those examples. ✅ Approved by the manager (2026-11-08), like the others above.
 8. **`Expr::EventHandler`** — Document 18 §5's `on: <eventName> =>
    <expression or closure>`, scoped to the `on:` argument label. Not a
    general expression production anywhere in Document 23. See CI-run
@@ -563,7 +599,7 @@ gap) rather than a silent reinterpretation:
    tuple-destructuring closure parameters. A genuine EBNF
    clarification worth formal note, not just a parser patch.
 
-### Known open gap — NOT resolved, explicit ask
+### Known open gap — ✅ RESOLVED: Document 23 §4 now defines `tensor_type` (`tensor<f32>[784, 128]`)
 **Document 24 §3's `tensor<f32>[784]` type syntax does not parse**, and
 unlike the cases above, there's no other spec document with a concrete
 example to ground a reasonable extension against — Document 8 §8 and
@@ -595,13 +631,12 @@ which one is intended and bake it into the parser unilaterally.
   one regression found and fixed — see the CI-run notes above).
 - Document 24 examples 1, 2, 4, 5, 6: all 5 gaps found by the second CI
   run traced and fixed (see CI-run section above) — expected to now
-  parse cleanly, **pending the next real `cargo test` confirmation**;
-  not claiming this as independently verified until that comes back.
+  parse cleanly — **confirmed by the real CI run (all 6 `parser_doc24` tests pass)**.
 - Document 24 example 3: expected to now correctly isolate *only* the
   flagged tensor-shape gap (the earlier `layers::Dense` multi-segment
   path failure that was masking this is fixed) — still blocked on your
   guidance for that one specific construct.
-- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+- **Confirmed by a real CI run** (see the Status line at the top of this phase). ✅
 
 ### `.github/workflows/ci.yml`
 `actions/checkout@v4` → `actions/checkout@v7` (see Housekeeping above).
@@ -614,7 +649,7 @@ test files.
 
 ## Phase 3 — Core Type System
 
-**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+**Status: 🟢 Complete — confirmed by real CI.** The Phase 4 CI log (110 tests) already contains the Phase 3 suites (`types_doc5` 26 + the type-checker unit tests in `lib`), all passing, and every later real CI log up to the latest (603 tests) re-runs them green. *(Original status when written: 🟡 pending CI.)*
 
 ### Scope (per Document 25 §2.3)
 Primitive types (Document 5 §2), the full 6-rule type-inference engine
@@ -647,7 +682,7 @@ not as a mandate for a specific algorithm, and full HM-style unification
 over type *variables* only becomes necessary once real generics exist to
 unify over (Phase 5, not this phase). Revisit if this proves
 insufficient once Phase 5 needs to infer through actual generic
-functions. Flagged for sign-off like every other deviation this phase.
+functions. Flagged for sign-off like every other deviation this phase. **✅ Approved by the manager (2026-11-08); the checker was later extended with real inference variables in Phase 11b.**
 
 ### A real bug found and fixed during this phase's own verification (not just claimed)
 Traced `let x: [i32] = [1.5];`-shaped cases by hand and found `check_expr`
@@ -741,13 +776,13 @@ reported twice with a less specific message the second time.
 
 - All 4 of Document 5 §7's official cases: implemented and tested, each
   with a positive counterpart proving the checker isn't just rejecting
-  everything. **Pending real `cargo test` confirmation.**
+  everything. **Confirmed by real CI.**
 - Ambiguous empty-array literal: produces a real, specific diagnostic
   (`"cannot infer type of empty array literal []..."`), not a silent
   default — tested both for the exact Document 5 §7 phrasing and a
   second, differently-shaped call site to confirm it's a general rule,
   not a pattern-matched special case.
-- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+- **Confirmed by a real CI run** (see the Status line at the top of this phase). ✅
 
 ### `.github/workflows/ci.yml`
 No changes needed — picks up `tests/types_doc5.rs` and the new `types.rs`
@@ -814,7 +849,7 @@ validate `import` targets either. This correctly rejects the two-
 foreign-things case Document 7 §8 describes and correctly allows both
 "trait local" and "type local" cases, but is necessarily a
 simplification until Phase 14's real package system exists to check
-against directly. Flagged for sign-off, same as every deviation before it.
+against directly. Flagged for sign-off, same as every deviation before it. **✅ Approved by the manager (2026-11-08); to be revisited with the real package system in Phase 14 (Open items register).**
 
 ### A real bug found and fixed during this phase's own verification (not just claimed)
 Hand-tracing the `dyn_dispatch_wrong_arg_type_rejected` test (`shape.scale(true)`
@@ -897,7 +932,7 @@ permissive behavior before finalizing this fix.
 - Orphan-rule violation: rejected, with a dedicated diagnostic message
   (`"orphan rule violation: ..."`), plus two positive counterparts
   (trait-local, type-local) and one confirming inherent impls aren't
-  subject to the rule at all. **Pending real `cargo test` confirmation.**
+  subject to the rule at all. **Confirmed by real CI.**
 - Static dispatch: resolves through concrete `impl` blocks (inherent and
   trait-provided), checks argument types, rejects undefined methods,
   and correctly orders inherent-over-trait precedence.
@@ -905,14 +940,14 @@ permissive behavior before finalizing this fix.
   (not any concrete impl), checks argument types, rejects undefined
   methods, and is confirmed (via a side-by-side test) to genuinely use a
   different resolution path than static dispatch, not the same one.
-- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+- **Confirmed by a real CI run** (see the Status line at the top of this phase). ✅
 
 ### `.github/workflows/ci.yml`
 No changes needed — picks up `tests/traits_impls.rs` automatically.
 
 ## Phase 5 — Generics
 
-**Status: 🟡 Code complete, extensively self-verified — pending real CI confirmation**
+**Status: 🟢 Complete — confirmed by real CI.** The Phase 6 CI log (138 tests) contains `generics` 12 passing; every later real CI log re-runs them green. The two Phase 5 exit criteria were re-proven by the general mechanism in Phase 11b: matmul inner-dimension mismatch rejected at compile time (`tests/const_generics.rs::matmul_with_mismatched_inner_dimension_is_rejected`) and no dynamic dispatch in generic-only code (`tests/mono.rs::generic_only_code_has_no_dynamic_dispatch`). *(Original status when written: 🟡 pending CI.)*
 
 ### Scope (per Document 25 §2.3)
 Monomorphization engine, `where`-clause trait bounds (single and
@@ -984,7 +1019,7 @@ struct carrying exactly two const-generic arguments (matching Document 8
 two const positions positionally (first = rows-analog, second =
 cols-analog) per that declaration's literal parameter order. Grounded
 directly in Document 8's own concrete example, not invented from
-nothing — but a real scope decision, flagged for sign-off.
+nothing — but a real scope decision, flagged for sign-off. **✅ Approved by the manager (2026-11-08); generalised in Phase 11b M4 (`matmul<const R, K, C>`), the special rule stays.**
 
 **Bidirectional/unification hybrid, not full generalized inference.**
 Consistent with Phase 3's earlier flagged choice (bidirectional checker,
@@ -1068,7 +1103,7 @@ here rather than silently carried forward unmentioned a third time.
   trusting either test.
 
 ### Known simplifications (flagged, not silently claimed as complete)
-- **Associated types are registered structurally but not semantically
+- *(Closed in Phase 11b M3.)* **Associated types are registered structurally but not semantically
   checked.** `TraitItem::AssocType`/`ImplItem::AssocType` parse and
   don't cause errors, but there's no completeness check (a trait
   declaring `type Item;` doesn't require an implementing `impl` to
@@ -1101,13 +1136,13 @@ here rather than silently carried forward unmentioned a third time.
   diagnostic; the valid, differently-shaped counterpart is correctly
   *accepted* with the *correct* result shape verified by a dedicated
   negative test (wrong-shape annotation on an otherwise-valid
-  multiplication is rejected). **Pending real `cargo test` confirmation.**
+  multiplication is rejected). **Confirmed by real CI.**
 - Zero-`dyn`-dispatch: demonstrated via `satisfies_bound`/`ty_lookup_name`
   having no code path that could succeed for `Ty::DynTrait` — a generic
   call's bound-check only passes when the substitution produced a
   concrete, registry-lookupable type, which is direct, checkable
   evidence the substitution never used the `dyn` machinery Phase 4 built.
-- **Not yet independently confirmed by a real `cargo test` run.** ⏳
+- **Confirmed by a real CI run** (see the Status line at the top of this phase). ✅
 
 ### `.github/workflows/ci.yml`
 No changes needed — picks up `tests/generics.rs` automatically.
@@ -1224,7 +1259,7 @@ for Phase 6 to have regressed anything that was previously green.
    `borrow`-argument passed at that call site; using it after any one
    of those sources has gone out of scope is rejected.
 
-### The §3.1/§3.2 tension — a real interpretive decision, flagged for sign-off
+### The §3.1/§3.2 tension — a real interpretive decision, flagged for sign-off — ✅ RESOLVED (it was a spec bug; Doc 6 §3.1 was corrected, see the post-review correction below)
 Document 6 §3.1's own example creates `ref1`/`ref2` (immutable borrows
 of `counter`) and states the following `borrow mut counter` (`ref3`)
 must be **rejected** — but `ref1`/`ref2` are never read again anywhere
@@ -1256,7 +1291,7 @@ tension between two of the document's own examples, not an arbitrary
 implementation detail — flagged explicitly for your sign-off**, same as
 prior phases' grounded-but-not-explicitly-spelled-out decisions.
 
-### Flagged decision: `@copy` struct-marking syntax
+### Flagged decision: `@copy` struct-marking syntax — ✅ APPROVED (recorded in Document 23 §17.8)
 Documents 3/6 define what the `copy` keyword *means* but never show a
 concrete syntax for marking a *struct* as Copy (only primitives are
 shown as inherently Copy). Grounded in the existing, already-parsing
@@ -1389,7 +1424,7 @@ No changes needed — picks up `tests/borrow_checks.rs` automatically
 **Original round (confirmed):** CI reported 138 total / 0 failures / 0
 warnings, with `borrow_checks` contributing 16.
 
-**This correction round (pending):** push this commit and check the
+**This correction round (confirmed by the Phase 7 CI log, `borrow_checks` 17/17):** push this commit and check the
 Actions log again. Expect `cargo build --verbose` still clean (0
 warnings — watch specifically for `borrow.rs`, since the `expr_reads_ident`
 Spawn/Select/Query change is new code, not just edited comments), and
@@ -1509,16 +1544,15 @@ that changed):**
 - Net: **17 tests** in `borrow_checks.rs` now (16 before, plus the one
   new confirming test) — **not yet independently confirmed by a real
   CI run; this correction was made in this same session, after the CI
-  result reported above.** ⏳
+  result reported above.** ✅ Confirmed afterwards by the Phase 7 CI log (`borrow_checks` 17/17, no regressions).
 
 ### Exit criteria — current status
 All five §8 cases (now matching the *corrected* §3.1) hand-traced
 correct, including the specific "not merely conservative" requirement —
 the implementation no longer has a conservative fallback anywhere in
-the borrow-aliasing/NLL logic. **Needs one more real CI run** to
-confirm the 17 (up from 16) `borrow_checks` tests pass and nothing
-else regressed, before Phase 6 can be called fully closed on this
-correction. Both decisions flagged in the original write-up above
+the borrow-aliasing/NLL logic. **Confirmed: the Phase 7 CI log (149 tests) shows
+`borrow_checks` 17/17 and no regressions, so Phase 6 is fully closed on this
+correction.** Both decisions flagged in the original write-up above
 remain **resolved** (the `@copy` syntax approved as-is; the NLL
 tension turned out to be a spec bug, now fixed upstream, with the
 implementation brought in line).
@@ -1610,7 +1644,7 @@ stack is popped, so its `mark_moved` call is never suppressed — the
 fix only ever removes a *premature*, mid-walk move-marking, never the
 final, correct one.
 
-### A third gap found, NOT fixed (out of Phase 7's scope, flagged rather than hidden)
+### A third gap found, NOT fixed (out of Phase 7's scope, flagged rather than hidden) — ⚠️ STILL OPEN (Open items register #1)
 While designing the test for the bug above, found that **this pass
 never checks a move against currently-active borrows of the same
 place** at all — `let r = borrow x; /* r still needed later */ let y =
@@ -1646,8 +1680,7 @@ regression — neither change alters any path those tests exercise
 Push and check the Actions log. Expect `cargo build --verbose` clean (0
 warnings), and `cargo test --verbose` showing the confirmed Phase 6
 counts unchanged (57 lib / 12 generics / 6 integration / 6
-parser_doc24 / 15 traits_impls / 26 types_doc5 / 17 borrow_checks — the
-last pending its own re-confirmation per the correction above) plus a
+parser_doc24 / 15 traits_impls / 26 types_doc5 / 17 borrow_checks — all confirmed by the Phase 7 CI log) plus a
 new `closures` binary reporting **10/10 passed**.
 
 ### Exit criteria — self-assessment
@@ -1673,7 +1706,7 @@ fixed (move-vs-active-borrow) — all three documented in `borrow.rs`
 itself and above, not left implicit.
 
 ## Phase 8 — Full Control Flow
-**Status: 🟢 Reported confirmed by the project owner: 186 tests, 0 failures, 0 warnings, run with `--no-fail-fast`** *(recorded at the start of Phase 9 from the owner's report; the raw CI log was not available in the Phase 9 session, so this line is attributed, not independently re-verified. The static `#[test]` count of the Phase 8 tree, 186, matches the reported figure.)*
+**Status: 🟢 Reported confirmed by the project owner: 186 tests, 0 failures, 0 warnings, run with `--no-fail-fast`** *(recorded at the start of Phase 9 from the owner's report; the raw CI log was not available in the Phase 9 session, so this line was attributed at the time; **the manager has since verified it independently: the Phase 9 CI log (243 tests, green) contains every Phase 8 suite (exhaustiveness 17, generators 5, control_flow 10, borrow_checks 19, ...).** The static `#[test]` count of the Phase 8 tree, 186, matches the reported figure.)*
 
 > **Correction recorded in Phase 9:** the paragraph below says `--no-fail-fast` was added to `ci.yml` permanently. The `ci.yml` in the Phase 8 zip did **not** contain it (its test step was plain `cargo test --verbose`). It was actually added in Phase 9 (see below).
 
@@ -2066,8 +2099,8 @@ fixed one more real instance proactively (tuple structs, Document 9
 §2.4's *other* worked example) before it could cause a second,
 separate failure report. The generator lowering+interpreter and the
 yield/borrow-checker interaction are untouched by this fix and remain
-hand-traced-only pending the six suites that haven't run yet in CI.
-**Not yet independently confirmed by real CI.** ⏳ Full accounting of
+hand-traced-only at the time; those suites have since run green in CI (Phase 9 log, 243 tests).
+**Confirmed by real CI (186 reported by the owner; independently verified through the Phase 9 log).** ✅ Full accounting of
 every bug found and fixed this phase (lexer, loop type-checking,
 exhaustiveness ×2) is in the correction section at the top of this
 entry and in `exhaustive.rs`'s own doc comments. One scope cut remains
@@ -2097,8 +2130,8 @@ flagged (`DoWhile` has no label field in the AST).
 ### 3. Exit criterion — what is and is not proven
 > "`try`/`catch`'s desugaring must produce byte-identical compiled output to the equivalent hand-written `?`-chain" — verify structural equivalence at the AST/type-checking level for now.
 
-- **Proven (pending CI):** `phase9_try_catch_matches_hand_written_question_chain` checks Document 11 §3's own example written both ways (hand-written `fn __try_block`-style function + `match`, and `try`/`catch`). Both must type-check clean and yield **identical `PropagationRecord` lists** (same sources, same target error type, same `From` conversions, same order) — 4 records, first 2 == last 2, with `IoError→ConfigError` converted and `ConfigError→ConfigError` identity. The decision logic was also executed in a Python model (`resolve_try_error_type`, 9 cases incl. the equivalence) — all agreed with the hand-traces.
-- **NOT proven — must be done in Phase 10:** (a) that the *generated IR* is byte-identical (no codegen exists); (b) I did **not** build a literal AST→AST desugaring pass (`try` → nested `fn` + `match`). The checker treats `try` natively and relies on the shared routing code + the record-equality test. Phase 10 should either lower `try` by literally desugaring before IR generation or diff the two IR outputs; either closes the criterion. Until then this criterion is *structurally supported*, not *confirmed*.
+- **Proven (CI-confirmed):** `phase9_try_catch_matches_hand_written_question_chain` checks Document 11 §3's own example written both ways (hand-written `fn __try_block`-style function + `match`, and `try`/`catch`). Both must type-check clean and yield **identical `PropagationRecord` lists** (same sources, same target error type, same `From` conversions, same order) — 4 records, first 2 == last 2, with `IoError→ConfigError` converted and `ConfigError→ConfigError` identity. The decision logic was also executed in a Python model (`resolve_try_error_type`, 9 cases incl. the equivalence) — all agreed with the hand-traces.
+- **Was NOT proven in Phase 9 — closed in Phase 10 (literal `try` desugaring + identical-IR test, CI-confirmed):** (a) that the *generated IR* is byte-identical (no codegen exists); (b) I did **not** build a literal AST→AST desugaring pass (`try` → nested `fn` + `match`). The checker treats `try` natively and relies on the shared routing code + the record-equality test. Phase 10 should either lower `try` by literally desugaring before IR generation or diff the two IR outputs; either closes the criterion. Until then this criterion is *structurally supported*, not *confirmed*.
 
 ### 4. Bugs / gaps found by tracing (each fixed at its root, then swept for siblings)
 1. **Numeric literal never checked against a non-numeric expected type** (latent since Phase 3): `check_expr` exempts int/float literals assuming `check_literal` adopted `expected`, true only for numeric `expected`. `let s: String = 5;` and `Err(5)` against `IoError` passed silently. Found by hand-tracing my own test `err_payload_of_wrong_type_rejected`. Fixed in `check_expr`; `Ty::TypeParam` deliberately exempt (an unannotated generic struct literal passes placeholder types — see `check_struct_lit`).
@@ -2111,7 +2144,7 @@ flagged (`DoWhile` has no label field in the AST).
 8. **Duplicate Option/Result variant table** (`exhaustive.rs` vs everywhere else) → single `builtin_variants`.
 9. **PROGRESS.md/`ci.yml` mismatch about `--no-fail-fast`** (section 0).
 
-### 5. Flagged spec interpretations — NEED YOUR SIGN-OFF
+### 5. Flagged spec interpretations — ✅ APPROVED by the manager; now Document 11 §8 / §8.9
 Written up as a proposed **Document 11 §8** in the delivered `11-error-handling.md` (project-knowledge copy is read-only here; please replace it). Summary:
 1. **`return` directly inside `try`** → compile error (Doc 11 §3's wrapper-fn desugaring would make it exit the wrapper; surface syntax suggests otherwise). Alternative: define it as returning from the enclosing function.
 2. **A `try` block's error type** when its `?`s differ → the first source type all others equal-or-`From`-convert into (reproduces §3's example). `From` is not transitive. No source at all → compile error (Doc 5 rule 6).
@@ -2125,6 +2158,7 @@ Written up as a proposed **Document 11 §8** in the delivered `11-error-handling
 - `?`/`return`/`throw` inside **closures** are not validated (closure return types untracked) — silent, not fabricated errors. `?` on an *unresolved* stdlib call is silent (Doc 24 §1's `parseJson(..)?`); a `try` whose only `?`s are unresolved gets no error-type check.
 - `assert` debug-only stripping / `ensure` always-present: type-level only; the runtime distinction is Phase 10 (nothing to strip yet). `recover` (Doc 11 §4) is Phase 12 (needs `spawn`/`actor`).
 - Nested item declarations inside blocks are still not checked (Phase 3 gap, unchanged).
+- *(Status update 2026-11-08: `.into()` was closed in Phase 11b M5; nested items in Phase 11a / 11b-1. Still open: `?`/`return`/`throw` inside closures (Phase 12); `let`-destructuring beyond plain identifiers and bare `return;` rules — see the Open items register.)*
 
 ### 7. Files changed
 `mtnc/src/types.rs` (bulk), `mtnc/src/exhaustive.rs` (shared table, 1 hunk), `mtnc/tests/error_handling.rs` (new), `.github/workflows/ci.yml` (`--no-fail-fast`), `PROGRESS.md`. **No AST/parser/lexer changes.**
@@ -2174,7 +2208,7 @@ Before IR generation `try { B } catch (e) { C }` becomes `match __try_block_N(<c
 6. **Checker: float literal suffix** `0.5f32` was ignored (typed `f64`); now honoured (Doc 2 §6.2).
 Sweeps: all existing `check_expr`/`check_binary` callers re-read; the full prior suite (243 tests) was re-run after each change.
 
-### 5. Flagged deviations / choices needing the owner's sign-off
+### 5. Flagged deviations / choices — ✅ all seven APPROVED (recorded in Document 17 §10)
 1. **`print`/`println`/`eprint`/`eprintln` as compiler intrinsics** until the Phase 16 prelude (as the prompt asked): ints, floats (printed with C `%g`), `bool`, `char` (UTF-8), and string values. A `String` is a static `{ptr, len}` view — no heap, no `+`, no `Display`. Marked in `codegen.rs`/`print.rs`; replace in Phase 16.
 2. **`mtnc build --emit-ir`** — a CLI flag the spec does not list; added so the IR can be inspected/tested. Remove if unwanted.
 3. **`fn main() -> Result<(), E>`** accepted (Err → exit 1); spec only shows it in Doc 19/24 examples.
@@ -2194,16 +2228,16 @@ Job `build-and-test` (runs on `ubuntu-24.04`):
 1. **Install LLVM 18 development packages** — must succeed.
 2. **Build** — no `warning:`/`error:` lines (target: 0 warnings).
 3. **Run test suite** — per-target `test result:` lines: lib 60, borrow_checks 19, closures 10, control_flow 10, **e2e 35**, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, parser_doc24 6, traits_impls 15, types_doc5 26 → **grand total 278, 0 failed**. (e2e invokes the real `mtnc` and the system `cc`.)
-4. **Smoke test — mtnc --version** — prints `mtnc 0.1.0 (Phase 10 — LLVM IR codegen + native backend)`.
+4. **Smoke test — mtnc --version** — prints `mtnc 0.1.0 (Phase 10 — LLVM IR codegen + native backend)` *(from Phase 11 the banner is `mtnc 1.0.0-dev (...)`)*.
 5. **Smoke test — mtnc check on the examples directory** — prints `mtnc check: checked 11 file(s), 0 errors`.
 6. **Smoke test — mtnc run examples/hello.mtn** — `expected: Hello, Mountain!` and `actual:   Hello, Mountain!`; the step fails on any mismatch.
 
 ### 9. Exit criterion (Doc 25, Phase 10)
 > A real `.mtn` program using only Phase 1–9 features compiles to a native binary and produces correct output when executed.
-Met locally: `mtnc run examples/hello.mtn` and the other 9 examples compile to native executables and print the asserted output. ⏳ pending the real CI run.
+Met locally: `mtnc run examples/hello.mtn` and the other 9 examples compile to native executables and print the asserted output. ✅ Confirmed by the real CI run (278 tests, smoke tests green).
 
 ## Phase 11 — Memory management internals + codegen foundations (delivered in three parts: 11a, 11b, 11c)
-The owner/manager split Phase 11 (it is too large for one delivery) into **11a** (foundations A), **11b** (generics and calls, itself split into **11b-1**, **11b-2** generics, **11b-3** raw pointers) and **11c** (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind CI step, arena benchmark). **Phase 11 stays 🟡 until 11c has a green CI log.** Each part is a separate zip + CI run + manager review.
+The owner/manager split Phase 11 (it is too large for one delivery) into **11a** (foundations A), **11b** (generics and calls, itself split into **11b-1**, **11b-2** generics, **11b-3** raw pointers) and **11c** (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind CI step, arena benchmark). **Phase 11 is 🟢: all three parts have real green CI logs (11a 308, 11b 413, 11c 603, and the final 11c run also has the valgrind step green).** Each part is a separate zip + CI run + manager review.
 
 ### Phase 11a — references, arrays/slices, impl blocks, const/static/type, nested items, named/default/variadic arguments
 **Status: 🟢 Confirmed by a real CI log (reviewed by the manager): 308 tests passed, 0 failed, 0 warnings** (lib 60, borrow_checks 19, closures 10, control_flow 10, e2e 50, error_handling 57, exhaustiveness 17, generators 5, generics 12, integration 6, phase11a 15, parser_doc24 6, traits_impls 15, types_doc5 26); smoke tests passed. The manager's decisions on the 11a flagged items: items 2, 3, 6 are fixed in 11b-1; item 1 (per-thread tables) accepted as an implementation detail; item 4 stays Phase 11c; item 5: Doc 23 §3 is ground truth for the variadic spelling (`...values: i32`), Doc 10 was corrected.
@@ -2219,7 +2253,7 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 
 **Type-checker changes (needed by the above; all 278 earlier tests still pass):** new `Ty::Fixed(T, N)` (size is a literal, a `const`, or constant arithmetic of those; any other size expression such as a const-generic one still resolves to the unsized `Array` as before); array literal checked against `[T; N]` (length mismatch is an error); `a[lo..hi]` types as the unsized slice place; `borrow` of a fixed array where `&[T]` is expected is the one unsizing coercion; `&mut T` accepted where `&T` is expected; a string literal is accepted as `&str`; `borrow` parameters have type `&T`/`&mut T` for *callers* (but plain `T` inside the function); variadic parameter is `&[T]` inside; parameter default values are type-checked; `const`/`static` are globals and their initializers are checked; type aliases expanded; associated-function calls `Type::f(..)`/`Self::f(..)` resolve; `Self { .. }` literals; trait default methods and primitive-type impls resolve in `resolve_method`; the range `1..n` takes its type from `n`. Type aliases and constant sizes live in per-thread tables filled by `register_item_context` (because `resolve_type` is a free function) — flagged below.
 
-**Flagged interpretations / approvals needed (11a):**
+**Flagged interpretations (11a) — all decided by the manager (see the Status line above):**
 1. **Per-thread alias/const tables** behind `resolve_type` (see above). Alternative: thread an environment through every `resolve_type` caller (large change).
 2. **Nested items share one namespace**; two functions that each declare a nested item with the same name are rejected ("defined more than once") instead of scoping them per function.
 3. **Default trait methods are inlined into top-level `impl` blocks only** (an `impl` nested inside a function does not get its defaults).
@@ -2246,7 +2280,7 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 
 **Other changes:** checker: `1..n` / expected-type flow (see above); `Ty` helpers unchanged. Removed the obsolete e2e tests `duplicate_nested_function_names_are_rejected` and `try_block_assigning_an_outer_local_is_a_clear_unsupported_error` (their behaviour was intentionally changed) and replaced them with the tests below.
 
-**Flagged interpretations / approvals needed (11b-1):**
+**Flagged interpretations (11b-1) — accepted by the manager; items 3 and 5 were closed later (tail call through `borrow` in 11c C1, `.into()` in 11b M5):**
 1. A nested item is visible in the **whole enclosing function body** (not only its own block); renaming happens **only on a name collision**.
 2. Constant folding is by the compiler in Rust (i128/f64, f32 results rounded to f32) rather than by LLVM's constant folder; `static` cannot read another `static` (only `const`s) — a `static` is a memory location, not a constant.
 3. A tail call whose `borrow`-parameter argument is a different place than the parameter itself is **not** turned into a jump (silently an ordinary call). Such calls are rare; making them loops needs re-bindable reference locals.
@@ -2265,7 +2299,7 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 - M4 (const generics, `[x; N]`): 🟢 375; smoke `checked 36 file(s)`.
 - M5 (generic traits, `From`/`Into`): 🟢 387; smoke `checked 38 file(s), 0 errors`.
 - M6 (`unsafe`, raw pointers, `alloc`/`dealloc`) and M7/11b as a whole: 🟢 **413 tests passed, confirmed by a real CI log (reviewed by the manager)**; smoke `checked 39 file(s), 0 errors`. (The first M6 CI run had 2 failures caused by a test-helper bug, fixed in checkpoint-M6b — see below.)
-- **Phase 11 as a whole stays 🟡 until 11c (drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, valgrind step, arena benchmark) has a green CI log.**
+- **Phase 11 as a whole: 🟢 (11c confirmed by a real CI log, see below).**
 
 **What was delivered**
 1. **Generics via AST-level monomorphization** (`src/mono.rs`): generic fns, structs, enums, impls, inline + `where` bounds, turbofish (Doc 23 §17.2), explicit and inferred type arguments. A fixpoint loop in `driver::check_source` (depth 32, cap 4096 instances; infinite instantiation is an error) clones and substitutes per instance (`pick$i32`, `Stack$i32`, `identity$3`, `Buf$f64_2`); codegen never sees generics. Only the first check reports errors on the original program; intermediate re-checks ignore transient errors; the final check reports.
@@ -2289,9 +2323,9 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 - Phase 5 matmul: `matmul<const R, K, C>` is the general mechanism; the `Matrix * Matrix` special rule stays.
 - A const-param-sized struct field is checked for its element type in round 0; the exact length is checked on the instance.
 - `Into` is built in over `From` and not user-implementable; the orphan rule stays (`impl From<Celsius> for f64` is rejected).
-- Item 2c (a method with its own `<U>` inside a generic impl): "not yet supported by codegen — Phase 11" (Doc 25 §2.5); known gap.
+- Item 2c (a method with its own `<U>` inside a generic impl): "not yet supported by codegen — Phase 11" (Doc 25 §2.5); known gap — **closed in 11c C1/C1b**.
 - Printing `&i32` is Phase 16. An integer-literal `let` binds `i32` at its first use when the variable is unbound; operators/field access on a still-unbound inference variable may reject.
-- **M6, needs sign-off:** `&mut x` / `borrow mut x` of a non-`mut` `let` binding is rejected (Mountain had no such rule; plain assignment to an immutable binding is still accepted — a pre-existing gap). Parameters and pattern bindings are not tracked. Pointer `==` was left as it was (untested). No `unsafe fn`.
+- **M6 — approved by the manager; the "pre-existing gap" (assignment to immutable bindings, parameters, pattern bindings) was closed in 11c C1:** `&mut x` / `borrow mut x` of a non-`mut` `let` binding is rejected (Mountain had no such rule; plain assignment to an immutable binding is still accepted — a pre-existing gap). Parameters and pattern bindings are not tracked. Pointer `==` was left as it was (untested). No `unsafe fn`.
 
 **Known limits / gaps**
 - Const expressions inside type arguments (`Matrix<f64, R*C, 1>`) are not parsed; no later-use inference for const params.
@@ -2304,8 +2338,10 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 
 **What the manager should read in the CI log (11b remaining)** — job `build-and-test`, step "Run tests" (`cargo test`) and the smoke step. Expected `test result:` lines: lib 60, assoc_types 8, borrow_checks 19, closures 10, const_generics 19, control_flow 10, e2e 64, error_handling 57, exhaustiveness 17, generators 5, generic_traits 11, generics 12, infer 8, integration 6, mono 19, parser_doc24 6, phase11a 15, **raw_pointers 26**, traits_impls 15, types_doc5 26 → **grand total 413, 0 failed, 0 warnings** (re-checked: 4 consecutive full runs in the sandbox, no flakiness). Smoke: `mtnc --version` → `mtnc 1.0.0-dev (Phase 11 — memory management + codegen foundations)`; `mtnc check examples` → **`checked 39 file(s), 0 errors`**; hello → `Hello, Mountain!`. A real CI log for M6/M7 is what turns M6 and 11b green.
 
-### Phase 11c — COMPLETE in the sandbox (C0–C7); 🟡 until the manager sees a real green CI log incl. the valgrind step (see `WORKLOG_11C.md`, `CI_SNIPPET_VALGRIND.md`)
-**Status: 🟡 pending real CI.** Delivered as checkpoints C1, C2, C4, C5, C6 (all ACCEPTED by the manager) and now `final-11c.zip`.
+### Phase 11c — 🟢 COMPLETE (C0–C7), confirmed by a real CI log including the valgrind step (see `WORKLOG_11C.md`)
+**Status: 🟢 Confirmed by a real CI log, reviewed by the manager (2026-11-08): 603 tests passed, 0 failed, 0 warnings across 29 test binaries; CI step "Memory examples under valgrind" passed (`valgrind clean`) for all 9 programs in `examples/memory/`; smoke: `checked 51 file(s), 0 errors`, `Hello, Mountain!`.** Delivered as checkpoints C1, C2, C4, C5, C6 (all ACCEPTED by the manager) and `final-11c.zip`.
+- **Manager verification record.** (1) The tree uploaded to GitHub is byte-identical to `final-11c.zip` (apart from `ci.yml`, see next point). (2) The first CI run after `final-11c` was green on tests but had no valgrind step (`ci.yml` was not in the zip; the valgrind test in `tests/c7_final.rs` skips itself when valgrind is not installed) — so the exit criterion was not yet proven by CI. (3) The manager prepared a `ci.yml` with `valgrind` in the apt list and a step `bash scripts/valgrind_memory_examples.sh target/debug/mtnc`; the owner installed it; the next CI run (all green) is the confirming run. `bash` is used because a script uploaded through the GitHub web UI loses its executable bit. (4) Independently, the manager built the tree with LLVM 18, ran all 9 programs under `valgrind --leak-check=full --show-leak-kinds=all`: every allocation freed, 0 errors; the full suite gave 603 passed; the arena benchmark gave default allocator 10.8 ms vs arena 5.0 ms.
+- **Housekeeping that remains for the owner:** the test helpers leave build outputs (`*.bin`) in `mtnc/examples/memory/`; they must never be committed. The `.gitignore` in the repo root now needs the line `/mtnc/examples/**/*.bin` (a ready file was supplied by the manager).
 - **C0:** statuses above updated (11b-1, M1–M6 all 🟢; 413 confirmed by CI).
 - **C1 (carry-over fixes), fresh sandbox numbers: 441 passed, 0 failed, 0 warnings** (lib 60, assoc_types 8, borrow_checks 19, **c1_carryover 29 (new)**, closures 10, const_generics 19, control_flow 10, e2e 64, error_handling 57, exhaustiveness 17, generators 5, generic_traits 11, generics 12, **infer 7 (−1)**, integration 6, mono 19, parser_doc24 6, phase11a 15, raw_pointers 26, traits_impls 15, types_doc5 26); `mtnc check examples` → `checked 41 file(s), 0 errors`.
   1. **Guaranteed tail call through `borrow`/`borrow mut`/`borrow self`** — `borrow` parameters are rebound through a phi at the loop head; depth 1,000,000 tested in debug and release (swapped places, `borrow mut` writes, method receiver, field of a borrow parameter). A tail call whose reference argument may point into the current frame is a clear compile error (no silent ordinary call). Flagged reading: the check is conservative (see WORKLOG_11C).
@@ -2316,18 +2352,16 @@ The owner/manager split Phase 11 (it is too large for one delivery) into **11a**
 - **C3 (drop glue + `Box<T>`) and C4 (`Rc`/`Arc`/`Weak`), delivered with checkpoint-C4: 514 passed, 0 failed, 0 warnings** (c3_drops 30, c4_rc 16; `checked 46 file(s), 0 errors`; valgrind-clean `examples/memory/`). Details, the flagged mechanism choice (zero-on-move instead of per-variable flags), the new by-reference `match` binding mode, the `Weak<T>` / `Weak<T, Arc>` decision, the invented API names (`upgrade`, `strongCount`, `weakCount`) and the carried gaps are in WORKLOG_11C.md "C3/C4 as built". **No user `Drop` trait: not specified in Doc 6/13.**
 - **C5 (`dyn Trait`) done, plus manager-required item 5 (assignment/`borrow mut` through `Rc`/`Arc` is a compile error) and a loop-move test: 535 passed, 0 failed, 0 warnings; `checked 47 file(s), 0 errors`.** Fat `{data, vtable}` pointers, vtable `{drop, size, align, methods..}`. Doc 9 says nothing about matching through a reference (by-reference binding is an accepted interpretation on Doc 9 §2.4 + Doc 6); Doc 6 §6 writes one `Weak<T>` (we split `Weak<T>`/`Weak<T, Arc>`; Phase 16 may unify); invented names `upgrade`/`strongCount`/`weakCount`; carried gaps: temporaries live to end of statement, no move out of an array by index, `for` over growable `[T]` = Phase 16, `Rc` not rejected as non-`Send` (Phase 12/13). See WORKLOG_11C.md.
 - **C6 done (plus the manager's `dyn`-as-value decision): 575 passed, 0 failed, 0 warnings; `checked 49 file(s), 0 errors`.** `Allocator` trait (compiler-known), `Box<T, A>` / `Box::newIn(value, borrow allocator)` freeing through its own allocator (also `Box<dyn T, A>`), `@pack` / `@align(N)` with layout tests. `dyn Trait` as a value type = owned `Box<dyn Trait>` (reading recorded: Doc 13 §1 point 4, Doc 7 §4.5, Doc 8 §6, Doc 3 F, Doc 11 §6 `Option<borrow dyn Error>`). Flags: `newIn` takes a shared `borrow` allocator although `alloc` is `borrow mut self` (the spec example does exactly this); a box does not track the arena's lifetime; Doc 13's `buffer: [u8]` arena needs Phase 16, the example uses `alloc`/`dealloc` intrinsics; new impl-vs-trait parameter-count check. Details in WORKLOG_11C.md.
-- **C7 (final), fresh numbers: 603 passed, 0 failed, 0 warnings, 31 test binaries** (lib 60, assoc_types 8, borrow_checks 19, c1_carryover 40, c2_handles 16, c3_drops 31, c4_rc 20, c5_dyn 27, c6_alloc 29, **c7_final 28 (new)**, rest unchanged); `mtnc check examples` -> **`checked 51 file(s), 0 errors`**.
-  - `examples/memory/` (11 programs, all valgrind-clean): nested_owned (nested owned structs, Box in struct, growable `[T]` of structs), drop_paths (conditional/partial/loop move, explicit drop), early_exits (`return`/`break`/`continue`/`?` with owned values), box_match_list, rc_weak (clone/drop, Weak upgrade -> None), arc_shared, dyn_shapes, dyn_values (`Box<dyn>` over several types, `[dyn T]`), arena_alloc (`Box::newIn`). Run by `tests/c7_final.rs` under valgrind (when installed) and by `scripts/valgrind_memory_examples.sh`.
-  - **valgrind CI step: NOT added to any ci.yml** (I have never seen the repo's real file). `CI_SNIPPET_VALGRIND.md` gives the exact lines to ADD (valgrind in apt + one step) and a reference-only complete file. **Owner: please paste your current `.github/workflows/ci.yml` into the chat.** My sandbox valgrind runs are not evidence for the manager; the CI step is.
-  - **Arena benchmark** (`c7_final::arena_allocator_beats_the_default_allocator...`): release build, 1,000,000 allocations, median of 15 runs, measured by the Rust harness; sandbox: default allocator 9.2 ms vs arena 4.4 ms (the test prints both and asserts arena < default).
+- **C7 (final), fresh numbers: 603 passed, 0 failed, 0 warnings, 29 test binaries** (lib 60, assoc_types 8, borrow_checks 19, c1_carryover 40, c2_handles 16, c3_drops 31, c4_rc 20, c5_dyn 27, c6_alloc 29, **c7_final 28 (new)**, rest unchanged); `mtnc check examples` -> **`checked 51 file(s), 0 errors`**.
+  - `examples/memory/` (9 programs — the earlier text said 11, a counting typo confirmed by the coding assistant — all valgrind-clean in CI): nested_owned (nested owned structs, Box in struct, growable `[T]` of structs), drop_paths (conditional/partial/loop move, explicit drop), early_exits (`return`/`break`/`continue`/`?` with owned values), box_match_list, rc_weak (clone/drop, Weak upgrade -> None), arc_shared, dyn_shapes, dyn_values (`Box<dyn>` over several types, `[dyn T]`), arena_alloc (`Box::newIn`). Run by `tests/c7_final.rs` under valgrind (when installed) and by `scripts/valgrind_memory_examples.sh`.
+  - **valgrind CI step: ADDED to `.github/workflows/ci.yml`** (see the manager verification record above) and green in CI. `CI_SNIPPET_VALGRIND.md` in the repo is now superseded.
+  - **Arena benchmark** (`c7_final::arena_allocator_beats_the_default_allocator...`): release build, 1,000,000 allocations, median of 15 runs, measured by the Rust harness; assistant's sandbox: default allocator 9.2 ms vs arena 4.4 ms; manager's machine: 10.8 ms vs 5.0 ms (the test prints both and asserts arena < default).
   - IR tests: drop glue once per type, free once per heap field (c3), mono de-dup (struct and function), self tail call is a loop (no self call in the IR), vtable layout, `Box::newIn` through the `Allocator` trait impl, plain `Box` still uses `__mtn_dealloc`. Exit-code tests: bounds panic 101 (growable and fixed), explicit panic 101, allocator out-of-memory 101, `?` with `From` with owned values. Rejection tests: use after move, `@copy` with a heap field, recursive struct without `Box`, unsafe-only operations outside `unsafe`, use after `drop(x)`, assignment to an immutable binding, assignment through `Rc`, wrong `Allocator` impls, bad `@pack`/`@align`.
   - **"not yet supported — Phase 11" audit: none left.** Messages that were really internal invariants ("generic reached codegen") are now `internal error:` text; user-facing ones were rewritten (`null` without a pointer type, invalid assignment target, named arguments to a non-function, unknown `Rc::`/`Arc::` function). A genuine limitation that was hidden behind "Phase 11" got FIXED: an `i128` inside an enum payload now works (payload alignment follows the strictest variant). Remaining "not yet supported" messages name phases from Doc 25 §2.5 (12, 13, 14, 16, 17, 18, 19).
   - **Limitations the spec does not schedule (flagged for the manager to place):** array patterns (`[a, b]`, `[first, ..rest]`; clear error, proposed with Phase 16 slices; note Doc 9's pattern grammar does not list them but Doc 23 does); `break`/`continue` leaving a `try` block (the `try` body is a separate function); an `impl` whose type parameter is nested inside an argument of a generic type; `.len()` on growable arrays (Phase 16, so examples pass counts explicitly); `dyn` behind `Rc`/`Arc` (Doc 13 §1.4 gap); `dyn Trait<T>` (spec shows none).
   - **Full list of 11c interpretations / flags** (each also in WORKLOG_11C.md): zero-slot ownership instead of drop flags; by-reference `match` binding mode (Doc 9 silent; rests on Doc 9 §2.4 + Doc 6); `Weak<T>` / `Weak<T, Arc>` (Doc 6 §6 writes one `Weak<T>`; Phase 16 may unify); invented names `upgrade`/`strongCount`/`weakCount` (+ camelCase API names); no user `Drop` trait (not specified); `dyn T` in value position = owned `Box<dyn T>` with implicit boxing of concrete values (manager decision); `Box::newIn` takes a shared `borrow` allocator although `alloc` is `borrow mut self` (the spec example), a box does not track the arena's lifetime; arena example uses `alloc`/`dealloc` intrinsics (Doc 13's `buffer: [u8]` needs Phase 16); impl-vs-trait parameter-count check added; field order is not reordered under default layout (Doc 13 §4.1 allows it); Doc 13 §3.1 size-class allocator = Phase 15 (the single `__mtn_alloc`/`__mtn_dealloc` interface is in place).
   - **Carried gaps:** temporaries live to the end of their statement; no move out of an array by indexing; `for` over growable `[T]` = Phase 16; `Rc` not rejected as non-`Send` (Phase 12/13); interior mutation through `Rc`/`Arc` arrives with `Atomic`/`Mutex` (Phase 13).
-- **Open items for the manager (C1):** (a) `final-11b.zip` has no `.github/workflows/ci.yml`; C7 will add the valgrind step to a recreated file — please diff with the repo's real one; (b) the parameter-`mut` grammar question above; (c) generic methods in traits.
+- **Open items from C1 — status:** (a) `ci.yml`: resolved (valgrind step added by the owner); (b) by-value parameter `mut` (Doc 3 says `mut` may mark a parameter; Doc 23 has no `mut x: T` form): still open, see the Open items register; (c) generic methods in traits: done in C1b.
 
-## Phases 11c – 25
-**Status: Phase 11c is complete in the sandbox; see "Phase 11c — COMPLETE" above (🟡 until a real green CI log).** (11c: drop glue, `Box`/`Rc`/`Arc`/`Weak`, `dyn`, allocators, `@pack`/`@align`, valgrind step, arena benchmark.)
-
-(Full phase table: see Document 25 §2.3.)
+## Phases 12 – 25 — ⚪ Not started
+Next is **Phase 12** (concurrency: closures, generators, `async`/`await`, `spawn`, `thread`, `actor`, `Send`/`Sync`; Doc 25 §2.3 and §2.5). Before it starts, the first milestone must close Open items register #1 and #2 (see above). The full phase table is in Document 25 §2.3.
