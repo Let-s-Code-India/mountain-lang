@@ -360,6 +360,15 @@ struct Free {
     assigned: HashSet<String>,
     loop_labels: Vec<Option<String>>,
     errors: Vec<String>,
+    /// jumps (is_break, label) that leave the block (Doc 12 §11.6)
+    escapes: Vec<(bool, Option<String>)>,
+}
+
+fn jump_targets_inner_loop(labels: &[Option<String>], label: &Option<String>) -> bool {
+    match label {
+        None => !labels.is_empty(),
+        Some(l) => labels.iter().any(|x| x.as_deref() == Some(l.as_str())),
+    }
 }
 
 impl Free {
@@ -418,15 +427,10 @@ impl Free {
     }
 
     fn check_jump(&mut self, label: &Option<String>, what: &str) {
-        let ok = match label {
-            None => !self.loop_labels.is_empty(),
-            Some(l) => self.loop_labels.iter().any(|x| x.as_deref() == Some(l.as_str())),
-        };
-        if !ok {
-            self.errors.push(format!(
-                "`{}` that leaves a `try` block is not supported (the `try` body becomes a separate function and cannot jump into the enclosing loop; not scheduled in Document 25 §2.5, flagged)",
-                what
-            ));
+        // A jump that leaves the `try` block (Doc 12 §11.6) is recorded; `lower_try` turns it
+        // into a control signal returned by the wrapper.
+        if !jump_targets_inner_loop(&self.loop_labels, label) {
+            self.escapes.push((what == "break", label.clone()));
         }
     }
 
@@ -511,11 +515,9 @@ impl Free {
             Expr::TryCatch { try_block, catch_var, catch_block } => {
                 // An inner `try` is its own wrapper later; for the OUTER
                 // wrapper its variables are still free uses of this block.
-                // Loops of the outer block do not extend into it (jumps
-                // cannot cross the inner wrapper either).
-                let saved = std::mem::take(&mut self.loop_labels);
+                // A jump inside it that leaves it may also leave the outer block (the inner
+                // `try` is lowered first into a block holding such a jump).
                 self.block(try_block);
-                self.loop_labels = saved;
                 self.scopes.push(HashSet::new());
                 self.scopes.last_mut().unwrap().insert(catch_var.clone());
                 self.block(catch_block);
@@ -662,7 +664,7 @@ impl Ctx<'_> {
         };
 
         // 1. Captured locals of the enclosing function.
-        let mut free = Free { scopes: vec![HashSet::new()], captured: Vec::new(), assigned: HashSet::new(), loop_labels: Vec::new(), errors: Vec::new() };
+        let mut free = Free { scopes: vec![HashSet::new()], captured: Vec::new(), assigned: HashSet::new(), loop_labels: Vec::new(), errors: Vec::new(), escapes: Vec::new() };
         if let Expr::TryCatch { try_block, .. } = &*e {
             free.block(try_block);
         }
@@ -679,7 +681,7 @@ impl Ctx<'_> {
             match ast_ty {
                 Some(t) => {
                     let ownership = if by_ref { OwnershipMod::BorrowMut } else { OwnershipMod::None };
-                    params.push(Param { ownership, name: name.clone(), is_variadic: false, ty: t, default: None });
+                    params.push(Param { ownership, name: name.clone(), is_variadic: false, ty: t, default: None, is_mut: false });
                     cap_names.push((name.clone(), by_ref));
                 }
                 None => self.errors.push(format!("cannot pass `{}` into the desugared `try` wrapper: its type is not supported by codegen yet", name)),
@@ -713,12 +715,30 @@ impl Ctx<'_> {
         // (moving the tail expression below would change its address).
         self.block(&mut try_block);
         Self::rewrite_throws_block(&mut try_block);
+        // Doc 12 §11.6: `break`/`continue` that leave the block become "set the control variable,
+        // return Ok(None)"; the caller acts on the signal after the call. Only then is the
+        // wrapper's value wrapped in an `Option`, so ordinary `try` blocks lower exactly as before.
+        let ctl_name = format!("__try_ctl_{}", n);
+        let mut jumps: Vec<(bool, Option<String>)> = Vec::new();
+        let has_escape = {
+            let mut labels: Vec<Option<String>> = Vec::new();
+            let mut errs = Vec::new();
+            rewrite_jumps_block(&mut try_block, &mut labels, &ctl_name, &mut jumps, &mut errs);
+            self.errors.append(&mut errs);
+            !jumps.is_empty()
+        };
         let tail = try_block.tail.take();
         let ok_value = match tail {
             Some(t) => *t,
             None => Expr::Tuple(Vec::new()),
         };
+        let ok_value = if has_escape { call("Some", vec![ok_value]) } else { ok_value };
         try_block.stmts.push(Stmt::Return(Some(call("Ok", vec![ok_value]))));
+        let ok_t = if has_escape { Type::Option(Box::new(ok_t)) } else { ok_t };
+        let mut params = params;
+        if has_escape {
+            params.push(Param { ownership: OwnershipMod::BorrowMut, name: ctl_name.clone(), is_variadic: false, ty: Type::Primitive("i32".into()), default: None, is_mut: false });
+        }
         let name = format!("__try_block_{}", n);
         self.new_fns.push(Item {
             attrs: Vec::new(),
@@ -745,19 +765,102 @@ impl Ctx<'_> {
             MatchArmBody::Expr(Box::new(Expr::Ident("__v".into())))
         };
         let ok_pat = if unit_valued || never_valued { Pattern::Wildcard } else { Pattern::Ident("__v".into()) };
-        *e = Expr::Match(Box::new(MatchExpr {
-            scrutinee: call(
-                &name,
-                cap_names
-                    .iter()
-                    .map(|(c, by_ref)| if *by_ref { Expr::Borrow { mutable: true, expr: Box::new(Expr::Ident(c.clone())) } } else { Expr::Ident(c.clone()) })
-                    .collect(),
-            ),
-            arms: vec![
-                MatchArm { patterns: vec![Pattern::TupleStruct("Ok".into(), vec![ok_pat])], guard: None, body: ok_arm_body },
-                MatchArm { patterns: vec![Pattern::TupleStruct("Err".into(), vec![Pattern::Ident(catch_var)])], guard: None, body: MatchArmBody::Block(catch_block) },
-            ],
+        let mut call_args: Vec<Expr> = cap_names
+            .iter()
+            .map(|(c, by_ref)| if *by_ref { Expr::Borrow { mutable: true, expr: Box::new(Expr::Ident(c.clone())) } } else { Expr::Ident(c.clone()) })
+            .collect();
+        if has_escape {
+            call_args.push(Expr::Borrow { mutable: true, expr: Box::new(Expr::Ident(ctl_name.clone())) });
+        }
+        let ok_pattern = if has_escape { Pattern::TupleStruct("Ok".into(), vec![Pattern::TupleStruct("Some".into(), vec![ok_pat])]) } else { Pattern::TupleStruct("Ok".into(), vec![ok_pat]) };
+        let mut arms = vec![MatchArm { patterns: vec![ok_pattern], guard: None, body: ok_arm_body }];
+        if has_escape {
+            // Ok(None): act on the recorded jump.
+            let mut stmts = Vec::new();
+            for (i, (is_break, label)) in jumps.iter().enumerate() {
+                let jump = if *is_break { Stmt::Break { label: label.clone(), value: None } } else { Stmt::Continue { label: label.clone() } };
+                stmts.push(Stmt::Expr(Expr::If(Box::new(IfExpr {
+                    cond: Expr::Binary { op: BinaryOp::EqEq, lhs: Box::new(Expr::Ident(ctl_name.clone())), rhs: Box::new(Expr::Literal(Literal::Int((i + 1).to_string()))) },
+                    then_block: Block { stmts: vec![jump], tail: None },
+                    else_branch: None,
+                }))));
+            }
+            let dispatch = Block { stmts, tail: Some(Box::new(call("panic", vec![Expr::Literal(Literal::Str("\"unreachable: unknown `try` jump\"".into()))]))) };
+            arms.push(MatchArm { patterns: vec![Pattern::TupleStruct("Ok".into(), vec![Pattern::Ident("None".into())])], guard: None, body: MatchArmBody::Block(dispatch) });
+        }
+        arms.push(MatchArm { patterns: vec![Pattern::TupleStruct("Err".into(), vec![Pattern::Ident(catch_var)])], guard: None, body: MatchArmBody::Block(catch_block) });
+        let m = Expr::Match(Box::new(MatchExpr { scrutinee: call(&name, call_args), arms }));
+        *e = if has_escape {
+            Expr::Block(Box::new(Block {
+                stmts: vec![Stmt::Let { mutable: true, pattern: Pattern::Ident(ctl_name.clone()), ty: Some(Type::Primitive("i32".into())), value: Some(Expr::Literal(Literal::Int("0".into()))) }],
+                tail: Some(Box::new(m)),
+            }))
+        } else {
+            m
+        };
+    }
+}
+
+/// Replaces the `break`/`continue` statements of a lowered `try` block that leave the block
+/// by `{ ctl = k; return Ok(None); }` (Doc 12 §11.6); `jumps` lists the distinct targets,
+/// `k` is the 1-based index.
+fn rewrite_jumps_block(b: &mut Block, labels: &mut Vec<Option<String>>, ctl: &str, jumps: &mut Vec<(bool, Option<String>)>, errs: &mut Vec<String>) {
+    for c in block_children_mut(b) {
+        match c {
+            ChildMut::E(x) => rewrite_jumps_expr(x, labels, ctl, jumps, errs),
+            ChildMut::B(bb) => rewrite_jumps_block(bb, labels, ctl, jumps, errs),
+        }
+    }
+    let old = std::mem::take(&mut b.stmts);
+    for s in old {
+        let (is_break, label) = match &s {
+            Stmt::Break { label, value } if !jump_targets_inner_loop(labels, label) => {
+                if value.is_some() {
+                    errs.push("`break` with a value cannot leave a `try` block (Document 12 §11.6)".into());
+                }
+                (true, label.clone())
+            }
+            Stmt::Continue { label } if !jump_targets_inner_loop(labels, label) => (false, label.clone()),
+            _ => {
+                b.stmts.push(s);
+                continue;
+            }
+        };
+        let k = match jumps.iter().position(|j| *j == (is_break, label.clone())) {
+            Some(i) => i + 1,
+            None => {
+                jumps.push((is_break, label.clone()));
+                jumps.len()
+            }
+        };
+        b.stmts.push(Stmt::Expr(Expr::Assign {
+            op: AssignOp::Eq,
+            lhs: Box::new(Expr::Ident(ctl.to_string())),
+            rhs: Box::new(Expr::Literal(Literal::Int(k.to_string()))),
         }));
+        b.stmts.push(Stmt::Return(Some(call("Ok", vec![Expr::Ident("None".into())]))));
+    }
+}
+
+fn rewrite_jumps_expr(e: &mut Expr, labels: &mut Vec<Option<String>>, ctl: &str, jumps: &mut Vec<(bool, Option<String>)>, errs: &mut Vec<String>) {
+    let pushed = if let Expr::Loop(l) = e {
+        let label = match l.as_ref() {
+            LoopExpr::Loop { label, .. } | LoopExpr::While { label, .. } | LoopExpr::For { label, .. } => label.clone(),
+            LoopExpr::DoWhile { .. } => None,
+        };
+        labels.push(label);
+        true
+    } else {
+        false
+    };
+    for c in expr_children_mut(e) {
+        match c {
+            ChildMut::E(x) => rewrite_jumps_expr(x, labels, ctl, jumps, errs),
+            ChildMut::B(bb) => rewrite_jumps_block(bb, labels, ctl, jumps, errs),
+        }
+    }
+    if pushed {
+        labels.pop();
     }
 }
 

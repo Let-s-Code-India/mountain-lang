@@ -513,7 +513,15 @@ impl Parser {
             let name = self.expect_word()?;
             self.expect_delim(Delim::Colon)?;
             let ty = self.parse_type()?;
-            return Ok(Param { ownership: OwnershipMod::None, name, is_variadic: true, ty, default: None });
+            return Ok(Param { ownership: OwnershipMod::None, name, is_variadic: true, ty, default: None, is_mut: false });
+        }
+        let mut is_mut = false;
+        if self.check_kw(Keyword::Mut) {
+            self.advance();
+            is_mut = true;
+            if self.check_kw(Keyword::Borrow) || self.check_kw(Keyword::Move) {
+                return self.error("`mut` cannot be combined with `borrow` or `move` on one parameter (write `borrow mut x: T` for a mutable borrow; Document 23 §17.11)");
+            }
         }
         let ownership = if self.eat_kw(Keyword::Borrow) {
             if self.eat_kw(Keyword::Mut) { OwnershipMod::BorrowMut } else { OwnershipMod::Borrow }
@@ -530,12 +538,12 @@ impl Parser {
             self.expect_word()?
         };
         if name == "self" {
-            return Ok(Param { ownership, name, is_variadic: false, ty: Type::Unit, default: None });
+            return Ok(Param { ownership, name, is_variadic: false, ty: Type::Unit, default: None, is_mut: false });
         }
         self.expect_delim(Delim::Colon)?;
         let ty = self.parse_type()?;
         let default = if self.eat_op(Op::Eq) { Some(self.parse_expr(0)?) } else { None };
-        Ok(Param { ownership, name, is_variadic: false, ty, default })
+        Ok(Param { ownership, name, is_variadic: false, ty, default, is_mut })
     }
 
     // ---------- struct/enum/trait/impl ----------

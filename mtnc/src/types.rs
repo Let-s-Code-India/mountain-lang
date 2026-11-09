@@ -322,6 +322,48 @@ fn ty_has_infer(t: &Ty) -> bool {
     !v.is_empty()
 }
 
+/// `true` when `t` still mentions a type parameter, an unresolved associated-type projection or
+/// an inference variable (so it cannot be compared for equality yet).
+fn ty_is_open(t: &Ty) -> bool {
+    match t {
+        Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) => true,
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::SymFixed(i, _) | Ty::Ref(_, i) | Ty::RawPtr(_, i) | Ty::OptionTy(i) => ty_is_open(i),
+        Ty::Tuple(v) => v.iter().any(ty_is_open),
+        Ty::ResultTy(a, b) => ty_is_open(a) || ty_is_open(b),
+        Ty::Fn(ps, r) => ps.iter().any(ty_is_open) || ty_is_open(r),
+        Ty::Generic(_, args) => args.iter().any(|a| matches!(a, GenericArg::Type(t) if ty_is_open(t))),
+        _ => false,
+    }
+}
+
+/// The trait declaration spells its own type as `Self` (a `Named("Self")` or marked parameter);
+/// replaces it by the implementing type.
+fn replace_named_self(t: &Ty, with: &Ty) -> Ty {
+    let r = |x: &Ty| Box::new(replace_named_self(x, with));
+    match t {
+        Ty::Named(n) if n == "Self" => with.clone(),
+        Ty::TypeParam(n) if n == "Self" => with.clone(),
+        Ty::Array(i) => Ty::Array(r(i)),
+        Ty::Fixed(i, n) => Ty::Fixed(r(i), *n),
+        Ty::Ref(m, i) => Ty::Ref(*m, r(i)),
+        Ty::RawPtr(m, i) => Ty::RawPtr(*m, r(i)),
+        Ty::OptionTy(i) => Ty::OptionTy(r(i)),
+        Ty::Tuple(v) => Ty::Tuple(v.iter().map(|x| replace_named_self(x, with)).collect()),
+        Ty::ResultTy(a, b) => Ty::ResultTy(r(a), r(b)),
+        Ty::Fn(ps, ret) => Ty::Fn(ps.iter().map(|x| replace_named_self(x, with)).collect(), r(ret)),
+        Ty::Generic(n, args) => Ty::Generic(
+            n.clone(),
+            args.iter()
+                .map(|a| match a {
+                    GenericArg::Type(t) => GenericArg::Type(replace_named_self(t, with)),
+                    c => c.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn ty_mentions_var(t: &Ty, id: u32) -> bool {
     let mut v = Vec::new();
     collect_unbound(t, &mut v);
@@ -1647,6 +1689,10 @@ impl TypeChecker {
                 substitute_type_params(&mark_type_params(resolve_type(ty), &["Self".to_string()]), &self_subst)
             };
 
+            let self_ty_for_sig = self_subst.get("Self").cloned().unwrap_or(Ty::Unit);
+            let impl_trait_args: Vec<Ty> = impl_decl.trait_ref.as_ref()
+                .map(|tr| tr.args.iter().map(resolve_type).collect::<Vec<Ty>>())
+                .unwrap_or_default();
             let methods: HashMap<String, FnSig> = impl_decl.items.iter().filter_map(|ii| match ii {
                 ImplItem::Fn(f) => {
                     let own = generic_names(&f.generics);
@@ -1722,6 +1768,32 @@ impl TypeChecker {
                                 message: format!("method `{}` of `impl {} for {}` takes {} parameter(s) but the trait declares {}", mname, tn, target_name, m.params.len(), sig.params.len()),
                                 context: ctx.clone(),
                             });
+                        } else if tn != "Allocator" {
+                            // Document 7 §9.6 (Phase 12 M0): parameter and return types must equal the
+                            // trait's after substituting `Self` and the trait's generic arguments.
+                            // Types that are still open (type parameters of a generic impl, associated
+                            // type projections) are not compared here.
+                            let mut subst: HashMap<String, Ty> = HashMap::new();
+                            subst.insert("Self".to_string(), self_ty_for_sig.clone());
+                            for (g, a) in shape.generics.iter().zip(impl_trait_args.iter()) {
+                                subst.insert(g.clone(), a.clone());
+                            }
+                            let exp_params: Vec<Ty> = sig.params.iter().map(|t| replace_named_self(&substitute_type_params(t, &subst), &self_ty_for_sig)).collect();
+                            let exp_ret = replace_named_self(&substitute_type_params(&sig.ret, &subst), &self_ty_for_sig);
+                            for (i, (have, want)) in m.params.iter().zip(exp_params.iter()).enumerate() {
+                                if !ty_is_open(have) && !ty_is_open(want) && have != want {
+                                    self.errors.push(TypeError {
+                                        message: format!("method `{}` of `impl {} for {}`: parameter {} has type `{}` but the trait declares `{}` (Document 7 §9.6)", mname, tn, target_name, i + 1, have, want),
+                                        context: ctx.clone(),
+                                    });
+                                }
+                            }
+                            if !ty_is_open(&m.ret) && !ty_is_open(&exp_ret) && m.ret != exp_ret {
+                                self.errors.push(TypeError {
+                                    message: format!("method `{}` of `impl {} for {}` returns `{}` but the trait declares `{}` (Document 7 §9.6)", mname, tn, target_name, m.ret, exp_ret),
+                                    context: ctx.clone(),
+                                });
+                            }
                         } else if tn == "Allocator" && (m.params != sig.params || m.ret != sig.ret) {
                             self.errors.push(TypeError {
                                 message: format!("method `{}` of `impl Allocator for {}` must have the signature declared by `Allocator` (Document 13 §3.2: `alloc(borrow mut self, size: usize, align: usize) -> *mut u8`, `dealloc(borrow mut self, ptr: *mut u8, size: usize)`)", mname, target_name),
@@ -1976,7 +2048,7 @@ impl TypeChecker {
                 env.insert(p.name.clone(), Ty::Ref(false, Box::new(Ty::Array(Box::new(pty)))));
             } else {
                 env.insert(p.name.clone(), pty);
-                if p.ownership == OwnershipMod::BorrowMut {
+                if p.ownership == OwnershipMod::BorrowMut || p.is_mut {
                     env.mark_mut(&p.name);
                 }
             }

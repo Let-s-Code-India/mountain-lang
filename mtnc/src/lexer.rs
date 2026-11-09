@@ -39,6 +39,8 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(src: &str) -> Self {
+        // Doc 2 §10.1: a leading byte-order mark is ignored.
+        let src = src.strip_prefix('\u{feff}').unwrap_or(src);
         Lexer {
             chars: src.chars().collect(),
             i: 0,
@@ -174,10 +176,26 @@ impl Lexer {
     fn lex_ident_or_keyword(&mut self) {
         let span = self.here();
         let start = self.i;
+        let mut bad: Option<(char, Span)> = None;
         while !self.at_end() && (self.peek(0).is_alphanumeric() || self.peek(0) == '_') {
+            if !self.peek(0).is_ascii() && bad.is_none() {
+                bad = Some((self.peek(0), self.here()));
+            }
             self.advance();
         }
         let text: String = self.chars[start..self.i].iter().collect();
+        if let Some((ch, at)) = bad {
+            // Doc 2 §10.2: identifiers are ASCII-only in version 1.0.
+            self.errors.push(Diagnostic::new(
+                format!(
+                    "identifiers may use only ASCII letters, digits and `_` -- non-ASCII text is allowed in strings, characters and comments (found `{}` in `{}`)",
+                    ch, text
+                ),
+                at,
+            ));
+            self.emit(TokenKind::Error(text), span);
+            return;
+        }
         match text.as_str() {
             "true" => self.emit(TokenKind::Bool(true), span),
             "false" => self.emit(TokenKind::Bool(false), span),
@@ -186,6 +204,57 @@ impl Lexer {
                 Some(kw) => self.emit(TokenKind::Keyword(kw), span),
                 None => self.emit(TokenKind::Ident(text), span),
             },
+        }
+    }
+
+    /// Validates one escape sequence of a string or character literal (Doc 2 §10.3); the
+    /// current character is the backslash. Consumes the escape (never a line break) and
+    /// reports a malformed one at the backslash's own position.
+    fn scan_escape(&mut self) {
+        let span = self.here();
+        let start = self.i;
+        self.advance(); // backslash
+        let mut ok = false;
+        if !self.at_end() && self.peek(0) != '\n' {
+            let c = self.advance();
+            match c {
+                'n' | 'r' | 't' | '\\' | '"' | '\'' | '0' => ok = true,
+                'x' => {
+                    let h1 = self.peek(0).to_digit(16);
+                    let h2 = self.peek(1).to_digit(16);
+                    if let (Some(a), Some(b)) = (h1, h2) {
+                        self.advance();
+                        self.advance();
+                        ok = a * 16 + b <= 0x7F;
+                    } else {
+                        // consume the hex digits that are there, for a precise message
+                        while self.peek(0).is_ascii_hexdigit() {
+                            self.advance();
+                        }
+                    }
+                }
+                'u' => {
+                    if self.peek(0) == '{' {
+                        self.advance();
+                        let mut digits = 0usize;
+                        let mut value: u32 = 0;
+                        while self.peek(0).is_ascii_hexdigit() && digits < 7 {
+                            value = value.saturating_mul(16).saturating_add(self.peek(0).to_digit(16).unwrap());
+                            digits += 1;
+                            self.advance();
+                        }
+                        if self.peek(0) == '}' {
+                            self.advance();
+                            ok = (1..=6).contains(&digits) && char::from_u32(value).is_some();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !ok {
+            let text: String = self.chars[start..self.i].iter().collect();
+            self.errors.push(Diagnostic::new(format!("unknown or malformed escape sequence `{}`", text), span));
         }
     }
 
@@ -274,10 +343,7 @@ impl Lexer {
         while !self.at_end() {
             let c = self.peek(0);
             if c == '\\' {
-                self.advance();
-                if !self.at_end() {
-                    self.advance(); // escaped char; validated later by the parser/semantic stage
-                }
+                self.scan_escape();
                 continue;
             }
             if c == '"' {
@@ -351,21 +417,34 @@ impl Lexer {
         self.advance(); // consume opening '
 
         if self.peek(0) == '\\' {
-            self.advance();
-            if !self.at_end() {
-                self.advance();
-            }
+            self.scan_escape();
             self.finish_char_literal(span, start);
+            return;
+        }
+        if self.peek(0) == '\'' {
+            // `''`: no character at all (Doc 2 §10.4)
+            self.advance();
+            self.errors.push(Diagnostic::new("character literal must contain exactly one character", span));
+            let text: String = self.chars[start..self.i].iter().collect();
+            self.emit(TokenKind::Error(text), span);
             return;
         }
 
         let c0 = self.peek(0);
-        if c0.is_alphabetic() || c0 == '_' {
+        if c0.is_ascii_alphabetic() || c0 == '_' {
             let ident_start = self.i;
-            while !self.at_end() && (self.peek(0).is_alphanumeric() || self.peek(0) == '_') {
+            while !self.at_end() && (self.peek(0).is_ascii_alphanumeric() || self.peek(0) == '_') {
                 self.advance();
             }
             let ident: String = self.chars[ident_start..self.i].iter().collect();
+            if ident.chars().count() > 1 && self.peek(0) == '\'' {
+                // `'ab'`: several characters in a character literal (Doc 2 §10.4)
+                self.advance();
+                let text: String = self.chars[start..self.i].iter().collect();
+                self.errors.push(Diagnostic::new("character literal must contain exactly one character", span));
+                self.emit(TokenKind::Error(text), span);
+                return;
+            }
             if ident.chars().count() == 1 && self.peek(0) == '\'' {
                 // Single identifier character immediately closed by a
                 // second `'` -- an ordinary char literal like `'a'`.
@@ -393,6 +472,21 @@ impl Lexer {
         if self.peek(0) == '\'' {
             self.advance();
             closed = true;
+        } else {
+            // more than one character before a closing quote on the same line (Doc 2 §10.4)?
+            let mut j = self.i;
+            while j < self.chars.len() && self.chars[j] != '\n' && self.chars[j] != '\'' {
+                j += 1;
+            }
+            if j < self.chars.len() && self.chars[j] == '\'' {
+                while self.i <= j {
+                    self.advance();
+                }
+                let text: String = self.chars[start..self.i].iter().collect();
+                self.errors.push(Diagnostic::new("character literal must contain exactly one character", span));
+                self.emit(TokenKind::Error(text), span);
+                return;
+            }
         }
         let text: String = self.chars[start..self.i].iter().collect();
         if !closed {

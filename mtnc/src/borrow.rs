@@ -405,6 +405,8 @@ impl BorrowChecker {
                 capture_stack: Vec::new(),
                 ctx: f.name.clone(),
                 errors: Vec::new(),
+                block_stack: Vec::new(),
+                next_serial: 0,
             };
             fc.scopes.push(Scope::default());
             for p in &f.params {
@@ -480,6 +482,19 @@ struct Scope {
 struct PlaceBorrows {
     shared: Vec<(String, usize)>,
     mutable: Option<(String, usize)>,
+    /// Phase 12 M0 (Document 6 §9.8, move while borrowed): one record per registered borrow,
+    /// remembering which block instance (`serial`) at which nesting depth the borrow was
+    /// declared in, so a later move can compare the borrow's last-use index with the
+    /// *current statement index of that same block* even when the move sits in a nested block.
+    records: Vec<BorrowRec>,
+}
+
+#[derive(Debug, Clone)]
+struct BorrowRec {
+    borrower: String,
+    last_use: usize,
+    depth: usize,
+    serial: usize,
 }
 
 /// Tracks which OUTER-scope bindings a closure currently being walked
@@ -509,6 +524,10 @@ struct FnChecker<'a> {
     capture_stack: Vec<CaptureFrame>,
     ctx: String,
     errors: Vec<BorrowError>,
+    /// One entry per block currently being checked: (unique serial of that block instance,
+    /// index of the statement being checked right now). Phase 12 M0.
+    block_stack: Vec<(usize, usize)>,
+    next_serial: usize,
 }
 
 impl<'a> FnChecker<'a> {
@@ -566,8 +585,36 @@ impl<'a> FnChecker<'a> {
                 }
             }
         }
+        self.check_move_against_borrows(name, false);
         if let Some(b) = self.lookup_mut(name) {
             b.moved = true;
+        }
+    }
+
+    /// Document 6 §9.8 (Phase 12 M0): moving a place while a borrow of it is still live (its
+    /// last use is at or after the statement doing the move) is a compile error. For a
+    /// `return x` the function ends, so only a borrow used *after* the returning statement
+    /// counts as live (`is_return`); everything else also counts a use inside the same
+    /// statement (`f(x, r)`).
+    fn check_move_against_borrows(&mut self, name: &str, is_return: bool) {
+        let Some(pb) = self.place_borrows.get(name) else { return };
+        let mut offender: Option<String> = None;
+        for rec in &pb.records {
+            let Some((serial, cur)) = self.block_stack.get(rec.depth).copied() else { continue };
+            if serial != rec.serial {
+                continue; // the block that declared this borrow has already ended
+            }
+            let live = if is_return { rec.last_use > cur } else { rec.last_use >= cur };
+            if live {
+                offender = Some(rec.borrower.clone());
+                break;
+            }
+        }
+        if let Some(who) = offender {
+            self.err(format!(
+                "cannot move `{}` while it is borrowed (via `{}`) -- the borrow is still used later (Document 6 §9.8)",
+                name, who
+            ));
         }
     }
 
@@ -664,6 +711,7 @@ impl<'a> FnChecker<'a> {
                 return;
             }
             self.place_borrows.get_mut(place).unwrap().mutable = Some((borrower.to_string(), last_use_idx));
+            self.record_borrow(place, borrower, last_use_idx);
         } else {
             if let Some(other) = existing_mutable {
                 self.err(format!(
@@ -673,19 +721,37 @@ impl<'a> FnChecker<'a> {
                 return;
             }
             self.place_borrows.get_mut(place).unwrap().shared.push((borrower.to_string(), last_use_idx));
+            self.record_borrow(place, borrower, last_use_idx);
         }
+    }
+
+    fn record_borrow(&mut self, place: &str, borrower: &str, last_use: usize) {
+        if self.block_stack.is_empty() {
+            return;
+        }
+        let depth = self.block_stack.len() - 1;
+        let serial = self.block_stack[depth].0;
+        let pb = self.place_borrows.entry(place.to_string()).or_default();
+        // keep the record list small: drop records of blocks that have ended
+        pb.records.push(BorrowRec { borrower: borrower.to_string(), last_use, depth, serial });
     }
 
     // ---- block/statement walking ----
 
     fn check_block(&mut self, block: &Block) {
         self.scopes.push(Scope::default());
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.block_stack.push((serial, 0));
         for (idx, stmt) in block.stmts.iter().enumerate() {
+            self.block_stack.last_mut().unwrap().1 = idx;
             self.check_stmt(stmt, block, idx);
         }
         if let Some(tail) = &block.tail {
+            self.block_stack.last_mut().unwrap().1 = block.stmts.len();
             self.check_expr(tail, block, block.stmts.len());
         }
+        self.block_stack.pop();
         self.scopes.pop();
     }
 
@@ -712,7 +778,10 @@ impl<'a> FnChecker<'a> {
                 }
             }
             Stmt::Expr(e) => self.check_expr(e, block, idx),
-            Stmt::Return(Some(e)) | Stmt::Yield(e) => self.check_expr(e, block, idx),
+            Stmt::Return(Some(e)) => {
+                self.check_return_value(e, block, idx);
+            }
+            Stmt::Yield(e) => self.check_expr(e, block, idx),
             Stmt::Break { value: Some(e), .. } => self.check_expr(e, block, idx),
             Stmt::Return(None) | Stmt::Break { value: None, .. } | Stmt::Continue { .. } | Stmt::Item(_) => {}
             Stmt::TargetBlock(_, b) => self.check_block(b),
@@ -1044,7 +1113,7 @@ impl<'a> FnChecker<'a> {
             }
             Expr::Return(inner) => {
                 if let Some(e) = inner {
-                    self.check_expr(e, block, idx);
+                    self.check_return_value(e, block, idx);
                 }
             }
             Expr::If(if_expr) => {
@@ -1129,6 +1198,25 @@ impl<'a> FnChecker<'a> {
             // criteria (Document 6 §8) never exercises them.
             Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_) => {}
         }
+    }
+
+    /// `return x;` moves `x` out of the function (Document 6 §4.1/§9.8): rejected when a borrow
+    /// of `x` is still used after this statement. The binding is not marked moved (the
+    /// function ends; a flow-insensitive mark would reject `if c { return x; } use(x)`).
+    fn check_return_value(&mut self, e: &Expr, block: &Block, idx: usize) {
+        if let Expr::Ident(name) = e {
+            self.use_ident(name);
+            let is_copy = self.lookup(name).map(|b| b.is_copy).unwrap_or(true);
+            let outer_closure = self
+                .capture_stack
+                .last()
+                .map_or(false, |f| self.lookup_scope_idx(name).map_or(false, |i| i < f.boundary_depth));
+            if !is_copy && !outer_closure {
+                self.check_move_against_borrows(name, true);
+            }
+            return;
+        }
+        self.check_expr(e, block, idx);
     }
 
     fn lookup_mut_or_insert(&mut self, name: &str, binding: Binding) {

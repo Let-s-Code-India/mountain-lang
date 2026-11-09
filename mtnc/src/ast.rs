@@ -129,6 +129,8 @@ pub struct Param {
     pub is_variadic: bool,
     pub ty: Type,
     pub default: Option<Expr>,
+    /// `mut x: T` by-value mutable parameter (Doc 23 §17.11, Phase 12 M0).
+    pub is_mut: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
