@@ -284,9 +284,17 @@ fn question_mark_on_unresolved_call_stays_silent() {
     assert_ok(&with_prelude("fn f() -> Result<i32, IoError> { let x = mystery()?; return Ok(1); }"));
 }
 
+// Phase 12 M1 (Document 10 §9.5): `?` inside a closure belongs to the closure, whose return type
+// is annotated or taken from the expected `fn` type. (Before Phase 12 this was not validated.)
 #[test]
-fn question_mark_inside_closure_is_not_validated_against_enclosing_fn() {
-    assert_ok(&with_prelude("fn f() { let g = || { let t = readFile(\"a\")?; }; }"));
+fn question_mark_inside_closure_belongs_to_the_closure() {
+    assert_rejected_with(
+        &with_prelude("fn f() { let g = || { let t = readFile(\"a\")?; }; }"),
+        "`?` inside a closure needs the closure's return type",
+    );
+    assert_ok(&with_prelude("fn f() { let g = || -> Result<i32, IoError> { let t = readFile(\"a\")?; Ok(1) }; }"));
+    // it is NOT checked against the enclosing function's return type
+    assert_ok(&with_prelude("fn f() -> i32 { let g = || -> Result<i32, IoError> { let t = readFile(\"a\")?; Ok(1) }; 3 }"));
 }
 
 // ============================================================

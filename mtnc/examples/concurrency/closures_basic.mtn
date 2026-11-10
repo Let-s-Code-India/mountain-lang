@@ -1,0 +1,48 @@
+// Document 10 section 4 and 5: closures, captures and function values.
+type MathOp = fn(i32, i32) -> i32;
+
+fn applyOp(a: i32, b: i32, op: MathOp) -> i32 {
+    return op(a, b);
+}
+
+fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn makeAdder(n: i32) -> fn(i32) -> i32 {
+    move |x: i32| x + n
+}
+
+fn twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(f(x))
+}
+
+struct Handler {
+    name: String,
+    run: fn(i32) -> i32,
+}
+
+fn main() {
+    println(applyOp(3, 4, add));
+    let double = |x: i32| -> i32 { x * 2 };
+    println(double(5));
+    let count = 7;
+    let showCount = || println(count);
+    showCount();
+    let mut total = 0;
+    let mut addToTotal = |x: i32| total += x;
+    addToTotal(3);
+    addToTotal(4);
+    println(total);
+    let add5 = makeAdder(5);
+    println(add5(10));
+    println(twice(|x| x * 3, 2));
+    println(applyOp(6, 7, |a, b| a * b));
+    let ops = [add, |a: i32, b: i32| a - b, |a: i32, b: i32| a * b];
+    let mut i = 0;
+    while i < 3 {
+        println(ops[i](10, 4));
+        i += 1;
+    }
+    let h = Handler { name: String::from("sq"), run: |x| x * x };
+    println(h.name);
+    println((h.run)(9));
+}

@@ -1,0 +1,16 @@
+// A closure whose body moves a captured value out can run only once; dropped unused it still frees.
+struct Config { name: String, level: i32 }
+
+fn take(c: Config) -> i32 {
+    println(c.name);
+    return c.level;
+}
+
+fn main() {
+    let a = Config { name: String::from("one shot"), level: 8 };
+    let once = move || take(a);
+    println(once());
+
+    let b = Config { name: String::from("never run"), level: 2 };
+    let skipped = move || take(b);
+}
