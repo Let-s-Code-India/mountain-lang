@@ -238,6 +238,10 @@ pub struct BorrowChecker {
     functions: HashMap<String, FnRefShape>,
     /// Addresses of expressions whose type owns heap memory (from the type checker, Phase 11c).
     owning: std::collections::HashSet<usize>,
+    /// Addresses of expressions of function type `fn(..) -> ..` (Phase 12 M1).
+    fn_exprs: std::collections::HashSet<usize>,
+    /// Capture analysis of every closure literal, by AST address (Phase 12 M1).
+    pub closure_info: HashMap<usize, ClosureInfo>,
     pub errors: Vec<BorrowError>,
 }
 
@@ -248,8 +252,15 @@ impl BorrowChecker {
             struct_fields: HashMap::new(),
             functions: HashMap::new(),
             owning: std::collections::HashSet::new(),
+            fn_exprs: std::collections::HashSet::new(),
+            closure_info: HashMap::new(),
             errors: Vec::new(),
         }
+    }
+
+    /// Tells the pass which expressions have a function type (Phase 12 M1).
+    pub fn set_fn_exprs(&mut self, fn_exprs: std::collections::HashSet<usize>) {
+        self.fn_exprs = fn_exprs;
     }
 
     /// Tells the pass which expressions have heap-owning types (so their values are move-tracked).
@@ -407,6 +418,8 @@ impl BorrowChecker {
                 errors: Vec::new(),
                 block_stack: Vec::new(),
                 next_serial: 0,
+                closure_info: HashMap::new(),
+                by_ref_closures: std::collections::HashSet::new(),
             };
             fc.scopes.push(Scope::default());
             for p in &f.params {
@@ -429,9 +442,14 @@ impl BorrowChecker {
                 );
             }
             fc.check_block(body);
-            fc.errors
+            // the function body's value leaves the function
+            if let Some(t) = &body.tail {
+                fc.forbid_escaping_borrowing_closure(t);
+            }
+            (fc.errors, fc.closure_info)
         };
-        self.errors.extend(fn_errors);
+        self.errors.extend(fn_errors.0);
+        self.closure_info.extend(fn_errors.1);
     }
 }
 
@@ -515,6 +533,32 @@ struct CaptureFrame {
     /// name -> needs_mut (true if assigned to anywhere in the body,
     /// via `=` or any compound-assignment operator).
     captures: HashMap<String, bool>,
+    /// First-use order of the captured names (deterministic environment layout, Phase 12 M1).
+    order: Vec<String>,
+    /// Captured names whose (non-`Copy`) value the body moves out.
+    moved: std::collections::HashSet<String>,
+}
+
+/// How a closure holds one captured variable (Document 10 §4.3, §9.5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CapMode {
+    /// A shared borrow of the variable.
+    Ref,
+    /// A mutable borrow: the closure writes the outer variable itself.
+    MutRef,
+    /// The value moves (or, for a `Copy` type, is copied) into the closure's environment.
+    Move,
+}
+
+/// What code generation needs to know about one closure literal (Phase 12 M1).
+#[derive(Debug, Clone)]
+pub struct ClosureInfo {
+    /// Captured variables in first-use order.
+    pub captures: Vec<(String, CapMode)>,
+    /// The body moves a captured value out, so the closure may be called only once.
+    pub once: bool,
+    /// The closure owns its environment (`move`, or a capture that had to be moved): move-only.
+    pub owning: bool,
 }
 
 struct FnChecker<'a> {
@@ -528,6 +572,10 @@ struct FnChecker<'a> {
     /// index of the statement being checked right now). Phase 12 M0.
     block_stack: Vec<(usize, usize)>,
     next_serial: usize,
+    /// Closure literals of this function by AST address (Phase 12 M1).
+    closure_info: HashMap<usize, ClosureInfo>,
+    /// Names bound to a closure that borrows locals of this function (`let f = || x;`).
+    by_ref_closures: std::collections::HashSet<String>,
 }
 
 impl<'a> FnChecker<'a> {
@@ -578,11 +626,15 @@ impl<'a> FnChecker<'a> {
         // a documented gap. A binding LOCAL to the closure itself
         // (its own params, or its own further-nested locals) is
         // unaffected and still moves normally.
-        if let Some(frame) = self.capture_stack.last() {
-            if let Some(idx) = self.lookup_scope_idx(name) {
-                if idx < frame.boundary_depth {
-                    return;
+        if let Some(idx) = self.lookup_scope_idx(name) {
+            let outer = self.capture_stack.last().map_or(false, |f| idx < f.boundary_depth);
+            if outer {
+                for frame in self.capture_stack.iter_mut() {
+                    if idx < frame.boundary_depth {
+                        frame.moved.insert(name.to_string());
+                    }
                 }
+                return;
             }
         }
         self.check_move_against_borrows(name, false);
@@ -618,6 +670,31 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// Document 6 §3.1 (Phase 12 M1): writing to a variable while a borrow of it (a `borrow`
+    /// binding, or a closure that captured it) is still used later is a compile error.
+    fn check_assign_against_borrows(&mut self, name: &str) {
+        if let Some(idx) = self.lookup_scope_idx(name) {
+            if self.capture_stack.last().map_or(false, |f| idx < f.boundary_depth) {
+                return; // a write from inside a closure body is that closure's own `MutRef` capture
+            }
+        }
+        let Some(pb) = self.place_borrows.get(name) else { return };
+        let mut offender: Option<String> = None;
+        for rec in &pb.records {
+            let Some((serial, cur)) = self.block_stack.get(rec.depth).copied() else { continue };
+            if serial == rec.serial && rec.last_use > cur {
+                offender = Some(rec.borrower.clone());
+                break;
+            }
+        }
+        if let Some(who) = offender {
+            self.err(format!(
+                "cannot assign to `{}` while it is borrowed (via `{}`) -- the borrow is still used later (Document 6 §3.1)",
+                name, who
+            ));
+        }
+    }
+
     /// If `name` resolves to a scope OUTER to any closure body
     /// currently being walked, records it as captured by every such
     /// enclosing closure (Document 10 §4.3). A no-op outside any
@@ -629,6 +706,9 @@ impl<'a> FnChecker<'a> {
         let Some(idx) = self.lookup_scope_idx(name) else { return };
         for frame in self.capture_stack.iter_mut() {
             if idx < frame.boundary_depth {
+                if !frame.captures.contains_key(name) {
+                    frame.order.push(name.to_string());
+                }
                 let entry = frame.captures.entry(name.to_string()).or_insert(false);
                 if mutated {
                     *entry = true;
@@ -750,6 +830,7 @@ impl<'a> FnChecker<'a> {
         if let Some(tail) = &block.tail {
             self.block_stack.last_mut().unwrap().1 = block.stmts.len();
             self.check_expr(tail, block, block.stmts.len());
+            self.note_closure_move_of(tail);
         }
         self.block_stack.pop();
         self.scopes.pop();
@@ -894,11 +975,17 @@ impl<'a> FnChecker<'a> {
             // is rejected by the SAME mechanism, not a separate
             // closure-specific escape hatch (Document 25 §2.3's Phase 7
             // exit criteria).
-            let captures = self.walk_closure_body_for_captures(c);
-            let sources: Vec<String> = if c.is_move { Vec::new() } else { captures.keys().cloned().collect() };
-            self.apply_closure_captures(c, captures, Some(name), block, idx);
-            let binding = Binding { is_copy: true, moved: false, borrow_sources: sources };
+            let (captures, moved) = self.walk_closure_body_for_captures(c);
+            let info = self.apply_closure_captures(init as *const Expr as usize, c, captures, moved, Some(name), block, idx);
+            let sources: Vec<String> =
+                info.captures.iter().filter(|(_, m)| *m != CapMode::Move).map(|(n, _)| n.clone()).collect();
+            // Phase 12 M1 (Document 10 §9.5): a closure that owns its environment is a move-only
+            // value; one that only borrows is freely copyable (it owns nothing).
+            let binding = Binding { is_copy: !info.owning, moved: false, borrow_sources: sources.clone() };
             self.install_binding(name, binding, new_scope);
+            if !sources.is_empty() {
+                self.by_ref_closures.insert(name.to_string());
+            }
             return;
         }
         self.check_expr(init, block, idx);
@@ -916,7 +1003,7 @@ impl<'a> FnChecker<'a> {
     /// could otherwise cause a false positive against the OUTER
     /// binding instead of correctly referring to the closure's own
     /// fresh one).
-    fn walk_closure_body_for_captures(&mut self, c: &ClosureExpr) -> HashMap<String, bool> {
+    fn walk_closure_body_for_captures(&mut self, c: &ClosureExpr) -> (Vec<(String, bool)>, std::collections::HashSet<String>) {
         self.scopes.push(Scope::default());
         let boundary_depth = self.scopes.len() - 1;
         for (pattern, ty) in &c.params {
@@ -929,14 +1016,48 @@ impl<'a> FnChecker<'a> {
                     .insert(pname, Binding { is_copy, moved: false, borrow_sources: Vec::new() });
             }
         }
-        self.capture_stack.push(CaptureFrame { boundary_depth, captures: HashMap::new() });
+        self.capture_stack.push(CaptureFrame {
+            boundary_depth,
+            captures: HashMap::new(),
+            order: Vec::new(),
+            moved: std::collections::HashSet::new(),
+        });
         match &c.body {
-            ClosureBody::Expr(e) => self.check_branch_expr(e),
-            ClosureBody::Block(b) => self.check_branch(b),
+            ClosureBody::Expr(e) => {
+                self.check_branch_expr(e);
+                self.note_closure_move_of(e);
+                self.forbid_escaping_borrowing_closure(e);
+            }
+            ClosureBody::Block(b) => {
+                self.check_branch(b);
+                if let Some(t) = &b.tail {
+                    self.forbid_escaping_borrowing_closure(t);
+                }
+            }
         }
         let frame = self.capture_stack.pop().unwrap();
         self.scopes.pop();
-        frame.captures
+        let ordered = frame.order.iter().map(|n| (n.clone(), *frame.captures.get(n).unwrap_or(&false))).collect();
+        (ordered, frame.moved)
+    }
+
+    /// A value `name` (an identifier used as a block's value or in `return`) leaves the closure
+    /// body: if it is a non-`Copy` capture, the body moves it out of the environment.
+    fn note_closure_move_of(&mut self, e: &Expr) {
+        let mut e = e;
+        while let Expr::Paren(i) = e {
+            e = i;
+        }
+        let Expr::Ident(name) = e else { return };
+        let Some(idx) = self.lookup_scope_idx(name) else { return };
+        if self.lookup(name).map_or(true, |b| b.is_copy) {
+            return;
+        }
+        for frame in self.capture_stack.iter_mut() {
+            if idx < frame.boundary_depth {
+                frame.moved.insert(name.clone());
+            }
+        }
     }
 
     /// Applies the captures collected by `walk_closure_body_for_captures`
@@ -944,38 +1065,146 @@ impl<'a> FnChecker<'a> {
     /// captured non-Copy binding (Document 10 §4.3 -- unconditional,
     /// regardless of whether the body only reads it); non-`move`
     /// closures register a borrow (shared if only ever read, mutable if
-    /// assigned to anywhere in the body) of each captured place.
+    /// assigned to anywhere in the body) of each captured place -- except a capture
+    /// the body moves out (Document 10 §9.5: non-`Copy` captures that must be owned),
+    /// which is moved into the closure like under `move`.
     /// `named_as` is the destination binding's name to compute a real,
     /// persistent last-use against (a closure bound via `let`/`=`) --
     /// or `None` for a closure literal used inline (e.g. passed
     /// directly as a call/method argument), whose borrows are then
     /// temporary and expire at the end of the current statement, the
     /// same as a bare `borrow x` call argument (Document 6 §3).
+    /// Records and returns the capture analysis for code generation.
     fn apply_closure_captures(
         &mut self,
+        key: usize,
         c: &ClosureExpr,
-        captures: HashMap<String, bool>,
+        captures: Vec<(String, bool)>,
+        moved: std::collections::HashSet<String>,
         named_as: Option<&str>,
         block: &Block,
         idx: usize,
-    ) {
+    ) -> ClosureInfo {
+        let mut info = ClosureInfo { captures: Vec::new(), once: false, owning: c.is_move };
         for (name, needs_mut) in captures {
-            if c.is_move {
-                let src_copy = self.lookup(&name).map(|b| b.is_copy).unwrap_or(true);
+            let src_copy = self.lookup(&name).map(|b| b.is_copy).unwrap_or(true);
+            let moves_out = moved.contains(&name) && !src_copy;
+            if c.is_move || moves_out {
                 if !src_copy {
                     self.mark_moved(&name);
                 }
+                if moves_out {
+                    info.once = true;
+                }
+                info.owning = true;
+                info.captures.push((name, CapMode::Move));
             } else {
                 let last_use = match named_as {
                     Some(dest) => compute_last_use(block, idx, dest),
                     None => idx,
                 };
-                self.register_borrow(&name, needs_mut, "<closure>", last_use, idx);
+                self.register_borrow(&name, needs_mut, named_as.unwrap_or("<closure>"), last_use, idx);
+                info.captures.push((name, if needs_mut { CapMode::MutRef } else { CapMode::Ref }));
             }
+        }
+        if info.captures.is_empty() {
+            info.owning = false; // nothing to own: a plain function value
+        }
+        self.closure_info.insert(key, info.clone());
+        info
+    }
+
+    /// Phase 12 M1: a closure that borrows variables of this function lives on this function's
+    /// frame, so it cannot be returned or stored in a value that may outlive them. A `move`
+    /// closure owns its captures and can.
+    fn forbid_escaping_borrowing_closure(&mut self, e: &Expr) {
+        match e {
+            Expr::Paren(i) => self.forbid_escaping_borrowing_closure(i),
+            Expr::Closure(_) => {
+                if let Some(info) = self.closure_info.get(&(e as *const Expr as usize)) {
+                    if let Some((n, _)) = info.captures.iter().find(|(_, m)| *m != CapMode::Move) {
+                        let n = n.clone();
+                        self.err(format!(
+                            "this closure borrows `{}`, which lives only in this function, so the closure cannot be returned or stored beyond it -- write `move |..| ..` to give the closure its own copy (Document 10 §4.3)",
+                            n
+                        ));
+                    }
+                }
+            }
+            Expr::Ident(n) => {
+                if self.by_ref_closures.contains(n.as_str()) && self.lookup(n).is_some() {
+                    let n = n.clone();
+                    self.err(format!(
+                        "`{}` is a closure that borrows local variables of this function, so it cannot be returned or stored beyond it -- write `move |..| ..` to give the closure its own copy (Document 10 §4.3)",
+                        n
+                    ));
+                }
+            }
+            Expr::Block(b) | Expr::Unsafe(b) => {
+                if let Some(t) = &b.tail {
+                    self.forbid_escaping_borrowing_closure(t);
+                }
+            }
+            Expr::If(i) => self.forbid_escaping_borrowing_closure_if(i),
+            Expr::Match(m) => {
+                for arm in &m.arms {
+                    match &arm.body {
+                        MatchArmBody::Expr(x) => self.forbid_escaping_borrowing_closure(x),
+                        MatchArmBody::Block(b) => {
+                            if let Some(t) = &b.tail {
+                                self.forbid_escaping_borrowing_closure(t);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Tuple(items) | Expr::Array(items) => {
+                for it in items {
+                    self.forbid_escaping_borrowing_closure(it);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields {
+                    self.forbid_escaping_borrowing_closure(v);
+                }
+            }
+            Expr::Call { callee, args } => {
+                let ctor = matches!(callee.as_ref(), Expr::Ident(n) if matches!(n.as_str(), "Some" | "Ok" | "Err") || n.chars().next().map_or(false, |c| c.is_uppercase()))
+                    || matches!(callee.as_ref(), Expr::Path(_));
+                if ctor || self.checker.fn_exprs.contains(&(e as *const Expr as usize)) {
+                    for a in args {
+                        self.forbid_escaping_borrowing_closure(&a.value);
+                    }
+                }
+            }
+            Expr::MethodCall { args, .. } => {
+                if self.checker.fn_exprs.contains(&(e as *const Expr as usize)) {
+                    for a in args {
+                        self.forbid_escaping_borrowing_closure(&a.value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn forbid_escaping_borrowing_closure_if(&mut self, i: &IfExpr) {
+        if let Some(t) = &i.then_block.tail {
+            self.forbid_escaping_borrowing_closure(t);
+        }
+        match &i.else_branch {
+            Some(ElseBranch::Block(b)) => {
+                if let Some(t) = &b.tail {
+                    self.forbid_escaping_borrowing_closure(t);
+                }
+            }
+            Some(ElseBranch::If(inner)) => self.forbid_escaping_borrowing_closure_if(inner),
+            None => {}
         }
     }
 
     fn install_binding(&mut self, name: &str, binding: Binding, new_scope: bool) {
+        self.by_ref_closures.remove(name);
         if new_scope {
             self.scopes.last_mut().unwrap().bindings.insert(name.to_string(), binding);
         } else {
@@ -1008,6 +1237,16 @@ impl<'a> FnChecker<'a> {
             .collect()
     }
 
+    fn check_if(&mut self, if_expr: &IfExpr, block: &Block, idx: usize) {
+        self.check_expr(&if_expr.cond, block, idx);
+        self.check_branch(&if_expr.then_block);
+        match &if_expr.else_branch {
+            Some(ElseBranch::Block(b)) => self.check_branch(b),
+            Some(ElseBranch::If(inner)) => self.check_if(inner, block, idx),
+            None => {}
+        }
+    }
+
     fn check_expr(&mut self, expr: &Expr, block: &Block, idx: usize) {
         match expr {
             Expr::Ident(name) => self.use_ident(name),
@@ -1019,6 +1258,9 @@ impl<'a> FnChecker<'a> {
                 for it in items {
                     self.check_expr(it, block, idx);
                 }
+                for it in items {
+                    self.forbid_escaping_borrowing_closure(it);
+                }
             }
             Expr::ArrayRepeat(x, _) => self.check_expr(x, block, idx),
             Expr::StructLit { fields, spread, .. } => {
@@ -1028,6 +1270,9 @@ impl<'a> FnChecker<'a> {
                 if let Some(s) = spread {
                     self.check_expr(s, block, idx);
                 }
+                for (_, v) in fields {
+                    self.forbid_escaping_borrowing_closure(v);
+                }
             }
             Expr::Binary { lhs, rhs, .. } => {
                 self.check_expr(lhs, block, idx);
@@ -1036,6 +1281,7 @@ impl<'a> FnChecker<'a> {
             Expr::Assign { op, lhs, rhs, .. } => {
                 if let Expr::Ident(name) = lhs.as_ref() {
                     if self.is_in_scope(name) {
+                        self.check_assign_against_borrows(name);
                         // Both `name = rhs` and every compound form
                         // (`name += rhs`, etc.) mutate `name` -- record
                         // that for Document 10 §4.3's capture-mode
@@ -1091,10 +1337,12 @@ impl<'a> FnChecker<'a> {
             Expr::Call { callee, args } => {
                 self.check_expr(callee, block, idx);
                 self.check_call_args(args, block, idx);
+                self.forbid_escaping_borrowing_closure(expr);
             }
             Expr::MethodCall { receiver, args, .. } => {
                 self.check_expr(receiver, block, idx);
                 self.check_call_args(args, block, idx);
+                self.forbid_escaping_borrowing_closure(expr);
             }
             Expr::Borrow { mutable, expr: inner } => {
                 // A bare `borrow x` / `borrow mut x` appearing OUTSIDE
@@ -1116,15 +1364,7 @@ impl<'a> FnChecker<'a> {
                     self.check_return_value(e, block, idx);
                 }
             }
-            Expr::If(if_expr) => {
-                self.check_expr(&if_expr.cond, block, idx);
-                self.check_branch(&if_expr.then_block);
-                match &if_expr.else_branch {
-                    Some(ElseBranch::Block(b)) => self.check_branch(b),
-                    Some(ElseBranch::If(inner)) => self.check_expr(&Expr::If(inner.clone()), block, idx),
-                    None => {}
-                }
-            }
+            Expr::If(if_expr) => self.check_if(if_expr, block, idx),
             Expr::Match(m) => {
                 self.check_expr(&m.scrutinee, block, idx);
                 for arm in &m.arms {
@@ -1164,8 +1404,8 @@ impl<'a> FnChecker<'a> {
                 // this statement (Document 6 §3's `printName(borrow
                 // alice)` temporary-borrow shape) rather than
                 // persistent ones tied to a binding's own last-use.
-                let captures = self.walk_closure_body_for_captures(c);
-                self.apply_closure_captures(c, captures, None, block, idx);
+                let (captures, moved) = self.walk_closure_body_for_captures(c);
+                self.apply_closure_captures(expr as *const Expr as usize, c, captures, moved, None, block, idx);
             }
             Expr::TryCatch { try_block, catch_block, .. } => {
                 self.check_branch(try_block);
@@ -1206,6 +1446,8 @@ impl<'a> FnChecker<'a> {
     fn check_return_value(&mut self, e: &Expr, block: &Block, idx: usize) {
         if let Expr::Ident(name) = e {
             self.use_ident(name);
+            self.note_closure_move_of(e);
+            self.forbid_escaping_borrowing_closure(e);
             let is_copy = self.lookup(name).map(|b| b.is_copy).unwrap_or(true);
             let outer_closure = self
                 .capture_stack
@@ -1217,6 +1459,7 @@ impl<'a> FnChecker<'a> {
             return;
         }
         self.check_expr(e, block, idx);
+        self.forbid_escaping_borrowing_closure(e);
     }
 
     fn lookup_mut_or_insert(&mut self, name: &str, binding: Binding) {
@@ -1273,9 +1516,17 @@ impl<'a> FnChecker<'a> {
         self.check_block(block);
     }
 
+    /// Checks a lone expression as its own block. The expression is checked in place (never
+    /// cloned): closure information is keyed by the address of the AST node (Phase 12 M1).
     fn check_branch_expr(&mut self, expr: &Expr) {
-        let empty_block = Block { stmts: Vec::new(), tail: Some(Box::new(expr.clone())) };
-        self.check_block(&empty_block);
+        let empty_block = Block { stmts: Vec::new(), tail: None };
+        self.scopes.push(Scope::default());
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.block_stack.push((serial, 0));
+        self.check_expr(expr, &empty_block, 0);
+        self.block_stack.pop();
+        self.scopes.pop();
     }
 }
 

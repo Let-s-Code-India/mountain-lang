@@ -61,6 +61,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let mut errors: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();
     let mut bc = BorrowChecker::new();
     bc.set_owning_exprs(tc.owning_expr_addrs());
+    bc.set_fn_exprs(tc.fn_expr_addrs());
     bc.check_program(&program);
     errors.extend(bc.errors.iter().map(|e| e.to_string()));
     if errors.is_empty() {
@@ -99,6 +100,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             let mut e2: Vec<String> = tc.errors.iter().map(|e| e.to_string()).collect();
             let mut bc2 = BorrowChecker::new();
             bc2.set_owning_exprs(tc.owning_expr_addrs());
+            bc2.set_fn_exprs(tc.fn_expr_addrs());
             bc2.check_program(&program);
             e2.extend(bc2.errors.iter().map(|e| e.to_string()));
             if !e2.is_empty() {
@@ -158,6 +160,12 @@ fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Mo
     let mut cg = Codegen::new(&context, "mountain", tm.get_target_data(), &tc.expr_types, &tc.impl_choice, opts.clone());
     cg.set_by_ref_matches(tc.match_by_ref.clone());
     cg.set_dyn_coercions(tc.dyn_coercions.clone());
+    // capture analysis of the final program (the AST was rewritten, so it is recomputed)
+    let mut cbc = BorrowChecker::new();
+    cbc.set_owning_exprs(tc.owning_expr_addrs());
+    cbc.set_fn_exprs(tc.fn_expr_addrs());
+    cbc.check_program(&program);
+    cg.set_closure_infos(cbc.closure_info.clone());
     cg.generate(&program)?;
     cg.module.set_triple(&TargetMachine::get_default_triple());
     cg.module.verify().map_err(|e| vec![format!("internal error: LLVM rejected the generated IR: {}", e.to_string())])?;

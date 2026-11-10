@@ -178,6 +178,10 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
             }
         },
         Expr::Block(b) | Expr::Unsafe(b) => out.push(ChildMut::B(b)),
+        Expr::Closure(c) => match &mut c.body {
+            ClosureBody::Expr(x) => out.push(ChildMut::E(x)),
+            ClosureBody::Block(b) => out.push(ChildMut::B(b)),
+        },
         Expr::Borrow { expr, .. } | Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Field { expr, .. } => out.push(ChildMut::E(expr)),
         Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs, .. } => {
             out.push(ChildMut::E(lhs));
@@ -267,6 +271,10 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
             }
         },
         Expr::Block(b) | Expr::Unsafe(b) => out.push(Child::B(b)),
+        Expr::Closure(c) => match &c.body {
+            ClosureBody::Expr(x) => out.push(Child::E(x)),
+            ClosureBody::Block(b) => out.push(Child::B(b)),
+        },
         Expr::Borrow { expr, .. } | Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Field { expr, .. } => out.push(Child::E(expr)),
         Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs, .. } => {
             out.push(Child::E(lhs));
@@ -354,6 +362,9 @@ fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
 /// Free-variable analysis of one `try` block (scoped: a `let` shadows only
 /// after its initializer, match-arm / `for` bindings only inside their body).
 struct Free {
+    callee_idents: Vec<(String, *const Expr)>,
+    /// Names of declared functions: a bare use of one is not a captured local (Phase 12 M1).
+    fn_names: HashSet<String>,
     scopes: Vec<HashSet<String>>,
     /// (name, address of the first `Expr::Ident` use)
     captured: Vec<(String, *const Expr)>,
@@ -436,14 +447,32 @@ impl Free {
 
     fn expr(&mut self, e: &Expr) {
         match e {
+            Expr::Closure(c) => {
+                // the closure's parameters are bound inside it
+                self.scopes.push(HashSet::new());
+                for (p, _) in &c.params {
+                    self.declare(p);
+                }
+                match &c.body {
+                    ClosureBody::Expr(x) => self.expr(x),
+                    ClosureBody::Block(b) => self.block(b),
+                }
+                self.scopes.pop();
+            }
             Expr::Ident(n) => {
-                if n.as_str() != "None" && !self.bound(n) && !self.captured.iter().any(|(c, _)| c == n) {
+                if n.as_str() != "None" && !self.bound(n) && !self.fn_names.contains(n.as_str()) && !self.captured.iter().any(|(c, _)| c == n) {
                     self.captured.push((n.clone(), e as *const Expr));
                 }
             }
             Expr::Call { callee, args } => {
-                // A bare-identifier callee names a function, not a local.
-                if !matches!(callee.as_ref(), Expr::Ident(_)) {
+                // A bare-identifier callee names a function -- or a local of function type, which
+                // is then captured like any other local (Phase 12 M1); `lower_try` decides which
+                // by the recorded type.
+                if let Expr::Ident(n) = callee.as_ref() {
+                    if !self.bound(n) && !self.fn_names.contains(n.as_str()) && !self.callee_idents.iter().any(|(c, _)| c == n) {
+                        self.callee_idents.push((n.clone(), callee.as_ref() as *const Expr));
+                    }
+                } else {
                     self.expr(callee);
                 }
                 for a in args {
@@ -571,6 +600,7 @@ pub fn ty_to_type(t: &Ty) -> Option<Type> {
             Type::Named(n.clone(), v)
         }
         Ty::Tuple(ts) => Type::Tuple(ts.iter().map(ty_to_type).collect::<Option<Vec<_>>>()?),
+        Ty::Fn(ps, r) => Type::Fn(ps.iter().map(ty_to_type).collect::<Option<Vec<_>>>()?, Box::new(ty_to_type(r)?)),
         Ty::OptionTy(i) => Type::Option(Box::new(ty_to_type(i)?)),
         Ty::ResultTy(o, e) => Type::Result(Box::new(ty_to_type(o)?), Box::new(ty_to_type(e)?)),
         Ty::Ref(m, i) => Type::Ref { lifetime: None, mutable: *m, inner: Box::new(ty_to_type(i)?) },
@@ -664,11 +694,17 @@ impl Ctx<'_> {
         };
 
         // 1. Captured locals of the enclosing function.
-        let mut free = Free { scopes: vec![HashSet::new()], captured: Vec::new(), assigned: HashSet::new(), loop_labels: Vec::new(), errors: Vec::new(), escapes: Vec::new() };
+        let mut free = Free { callee_idents: Vec::new(), fn_names: self.tc.function_names(), scopes: vec![HashSet::new()], captured: Vec::new(), assigned: HashSet::new(), loop_labels: Vec::new(), errors: Vec::new(), escapes: Vec::new() };
         if let Expr::TryCatch { try_block, .. } = &*e {
             free.block(try_block);
         }
         self.errors.append(&mut free.errors);
+        // locals of function type that are only ever called inside the block
+        for (n, ptr) in std::mem::take(&mut free.callee_idents) {
+            if matches!(self.tc.expr_types.get(&(ptr as usize)), Some(Ty::Fn(..))) && !free.captured.iter().any(|(c, _)| *c == n) {
+                free.captured.push((n, ptr));
+            }
+        }
         let mut params = Vec::new();
         let mut cap_names: Vec<(String, bool)> = Vec::new();
         for (name, ptr) in &free.captured {

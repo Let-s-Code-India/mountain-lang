@@ -36,7 +36,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return true;
         }
         match ty {
-            Ty::StringTy | Ty::Array(_) => true,
+            Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
             Ty::Generic(n, _) => crate::types::is_heap_generic(n),
             Ty::Tuple(ts) => ts.iter().any(|t| self.needs_drop_d(t, depth + 1)),
             Ty::Fixed(t, _) => self.needs_drop_d(t, depth + 1),
@@ -204,11 +204,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(f)
     }
 
-    fn glue_block(&self, f: FunctionValue<'ctx>, name: &str) -> BasicBlock<'ctx> {
+    pub(super) fn glue_block(&self, f: FunctionValue<'ctx>, name: &str) -> BasicBlock<'ctx> {
         self.context.append_basic_block(f, name)
     }
 
-    fn call_dealloc(&mut self, p: PointerValue<'ctx>, size: IntValue<'ctx>, align: IntValue<'ctx>) -> R<()> {
+    pub(super) fn call_dealloc(&mut self, p: PointerValue<'ctx>, size: IntValue<'ctx>, align: IntValue<'ctx>) -> R<()> {
         let (_, fd) = self.alloc_fns();
         self.builder.build_call(fd, &[p.into(), size.into(), align.into()], "")?;
         Ok(())
@@ -218,6 +218,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let ut = self.usize_ty();
         let ptrt = self.context.ptr_type(AddressSpace::default());
         match ty {
+            Ty::Fn(..) => self.fn_value_glue(f, p)?,
             Ty::StringTy => {
                 let ht = self.handle_ty();
                 let dp = self.builder.build_struct_gep(ht, p, 0, "dp")?;

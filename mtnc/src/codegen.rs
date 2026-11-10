@@ -190,6 +190,14 @@ pub struct Codegen<'ctx, 'a> {
     tail_calls: std::collections::HashSet<usize>,
     tail_loop: Option<BasicBlock<'ctx>>,
     tail_params: Vec<TailSlot<'ctx>>,
+    /// Closure capture analysis by AST address (Phase 12 M1, from `borrow.rs`).
+    closure_infos: HashMap<usize, crate::borrow::ClosureInfo>,
+    pending_closures: Vec<closure::PendingClosure<'ctx>>,
+    fn_thunks: HashMap<String, FunctionValue<'ctx>>,
+    closure_counter: usize,
+    closure_owner: String,
+    /// Locals of a closure body that are pointers to a borrowed outer variable.
+    ref_captured: std::collections::HashSet<usize>,
 }
 
 fn is_signed(t: &Ty) -> bool {
@@ -309,6 +317,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             tail_calls: std::collections::HashSet::new(),
             tail_loop: None,
             tail_params: Vec::new(),
+            closure_infos: HashMap::new(),
+            pending_closures: Vec::new(),
+            fn_thunks: HashMap::new(),
+            closure_counter: 0,
+            closure_owner: String::new(),
+            ref_captured: std::collections::HashSet::new(),
         }
     }
 
@@ -421,7 +435,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.llty(elem)?; // the element type must be representable
                 self.handle_ty().into()
             }
-            Ty::Fn(..) => return unsupported("function values / closures", 12),
+            // a function value: `{ code, env }` (Document 10 §9.5)
+            Ty::Fn(..) => self.fat_ty().into(),
             // `Box<T, A>` (Document 13 §3.2): `{ data, allocator }`; `Box<dyn Trait, A>`: `{ data, vtable, allocator }`.
             // The data pointer is always the FIRST field, so code that only needs the pointer can load field 0.
             Ty::Generic(n, a) if n == "Box" && a.len() == 2 => {
@@ -714,6 +729,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.by_ref_matches = s;
     }
 
+    /// The capture analysis of every closure literal (from `borrow.rs`, on the final program).
+    pub fn set_closure_infos(&mut self, m: HashMap<usize, crate::borrow::ClosureInfo>) {
+        self.closure_infos = m;
+    }
+
     pub fn generate(&mut self, program: &'a Program) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
         let items = crate::desugar::all_items(program);
@@ -742,6 +762,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         for w in &work {
             if let Err(e) = self.gen_fn(w) {
                 errors.push(format!("in `{}`: {}", w.key, e.0));
+            }
+        }
+        // closure bodies (a body may create further closures)
+        while let Some(pc) = self.pending_closures.pop() {
+            let owner = pc.owner.clone();
+            if let Err(e) = self.gen_closure_body(pc) {
+                errors.push(format!("in a closure inside `{}`: {}", owner, e.0));
             }
         }
         if errors.is_empty() {
@@ -1240,6 +1267,7 @@ pub struct EnumLayoutRef<'ctx> {
     pub variants: Vec<StructType<'ctx>>,
 }
 
+mod closure;
 mod drops;
 mod dynamic;
 mod expr;

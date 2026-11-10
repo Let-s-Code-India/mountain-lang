@@ -286,7 +286,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     /// Copies every pattern binding into a new local. Bindings that own heap memory are NOT yet
     /// owners (the arm's guard may still fail): `commit_binds` moves them out of the scrutinee.
-    fn materialize(&mut self, binds: Vec<Bind<'ctx>>) -> R<Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>> {
+    pub(super) fn materialize(&mut self, binds: Vec<Bind<'ctx>>) -> R<Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>> {
         let mut pending = Vec::new();
         for b in binds {
             if self.cur_match_by_ref && self.needs_drop(&b.ty) {
@@ -311,7 +311,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     /// The bindings now own their parts: zero the source parts and register the locals for drop.
-    fn commit_binds(&mut self, pending: Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>) -> R<()> {
+    pub(super) fn commit_binds(&mut self, pending: Vec<(PointerValue<'ctx>, PointerValue<'ctx>, Ty)>) -> R<()> {
         for (slot, src, ty) in pending {
             self.mark_moved(src, &ty)?;
             self.register_local_drop(slot, &ty);
@@ -571,7 +571,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ok(self.unit())
             }
             Expr::Range { .. } => unsupported("range values outside a `for` loop", 16),
-            Expr::Closure(_) => unsupported("closures", 12),
+            Expr::Closure(c) => self.gen_closure(e, c),
             Expr::Await(_) | Expr::Spawn { .. } => unsupported("`await`/`spawn` (async & concurrency)", 12),
             Expr::Select(_) => unsupported("`select` (channels)", 13),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
@@ -585,10 +585,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     fn ident(&mut self, e: &Expr, name: &str) -> R<V<'ctx>> {
         if let Some((p, t)) = self.lookup_local(name) {
             let v = self.load(p, &t)?;
+            // a function value moves out only when it owns its environment
+            if matches!(t, Ty::Fn(..)) {
+                self.fn_value_moved(p)?;
+                return Ok(v);
+            }
             // reading an owning local by value moves it out
             if self.needs_drop(&t) {
                 if self.is_ref_param_local(p, &t) {
                     return Err(CgErr(format!("cannot move `{}` out of a borrowed parameter", name)));
+                }
+                if self.ref_captured.contains(&(p.as_value_ref() as usize)) {
+                    return Err(CgErr(format!("cannot move `{}` out of a closure that only borrows it: write `move |..| ..` so the closure owns it", name)));
                 }
                 self.mark_moved(p, &t)?;
             }
@@ -616,7 +624,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return Err(CgErr("cannot determine the type of `None` here".into()));
         }
         if self.fns.contains_key(name) {
-            return unsupported("function values", 12);
+            return self.fn_item_value(name);
         }
         Err(CgErr(format!("undefined variable `{}`", name)))
     }
@@ -769,7 +777,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     // ---- places / assignment ---------------------------------------------
 
-    fn is_place_expr(&self, e: &Expr) -> bool {
+    pub(super) fn is_place_expr(&self, e: &Expr) -> bool {
         match e {
             Expr::Paren(i) => self.is_place_expr(i),
             Expr::Ident(n) => self.lookup_local(n).is_some() || self.statics.contains_key(n.as_str()),
@@ -848,7 +856,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok((p, ty))
     }
 
-    fn place(&mut self, e: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
+    pub(super) fn place(&mut self, e: &Expr) -> R<(PointerValue<'ctx>, Ty)> {
         match e {
             Expr::Ident(n) => {
                 if let Some(x) = self.lookup_local(n) {
@@ -1266,7 +1274,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// Is `p` (the address of local `name`) a parameter of the current function that
     /// carries a reference from the caller? (a `borrow` parameter, or a by-value
     /// parameter of reference type) -- such memory outlives the tail-call jump.
-    fn is_ref_param_local(&self, p: PointerValue<'ctx>, ty: &Ty) -> bool {
+    pub(super) fn is_ref_param_local(&self, p: PointerValue<'ctx>, ty: &Ty) -> bool {
         self.tail_params.iter().any(|slot| match slot {
             TailSlot::Phi(phi) => phi.as_basic_value().into_pointer_value() == p,
             TailSlot::Slot(sp) => *sp == p && matches!(ty, Ty::Ref(..)),
@@ -2388,7 +2396,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// Tests `pat` against the value stored at `place`; collects variable
     /// bindings. With `test == false` it only collects bindings (the caller
     /// already knows the pattern matches).
-    fn pat_test(&mut self, pat: &Pattern, place: PointerValue<'ctx>, ty: &Ty, binds: &mut Vec<Bind<'ctx>>, test: bool) -> R<IntValue<'ctx>> {
+    pub(super) fn pat_test(&mut self, pat: &Pattern, place: PointerValue<'ctx>, ty: &Ty, binds: &mut Vec<Bind<'ctx>>, test: bool) -> R<IntValue<'ctx>> {
         let t = self.int_ty(1).const_int(1, false);
         match pat {
             Pattern::Wildcard => Ok(t),
@@ -2722,6 +2730,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     fn call(&mut self, whole: &Expr, callee: &Expr, args: &[Arg]) -> R<V<'ctx>> {
         match callee {
             Expr::Ident(name) => {
+                if matches!(self.lookup_local(name), Some((_, Ty::Fn(..)))) {
+                    return self.call_value(callee, args);
+                }
                 let user_fn = self.fns.contains_key(name.as_str());
                 if !user_fn {
                     match name.as_str() {
@@ -2753,7 +2764,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return self.build_struct(&Ty::Named(name.clone()), vals);
                 }
                 if self.lookup_local(name).is_some() {
-                    return unsupported("calling a function value / closure", 12);
+                    return self.call_value(callee, args);
                 }
                 Err(CgErr(format!("unknown function `{}` (standard-library functions arrive with the prelude in Phase 16)", name)))
             }
@@ -2849,7 +2860,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 unsupported("calling a path (modules)", 14)
             }
-            _ => unsupported("calling a computed function value", 12),
+            _ => self.call_value(callee, args),
         }
     }
 

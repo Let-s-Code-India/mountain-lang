@@ -1062,8 +1062,8 @@ impl Parser {
                 }
             }
             self.expect_delim(Delim::RParen)?;
-            self.expect_op(Op::Arrow)?;
-            let ret = self.parse_type()?;
+            // `fn(A)` without `->` returns `()` (Document 10 §1: an omitted return type is `()`)
+            let ret = if self.eat_op(Op::Arrow) { self.parse_type()? } else { Type::Unit };
             return Ok(Type::Fn(params, Box::new(ret)));
         }
         if self.eat_kw(Keyword::Option) {

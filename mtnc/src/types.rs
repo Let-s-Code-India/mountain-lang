@@ -1077,6 +1077,8 @@ pub struct TypeChecker {
     loop_frames: Vec<LoopFrame>,
     /// Phase 9: stack of propagation targets (see `PropTarget`).
     prop_targets: Vec<PropTarget>,
+    /// Phase 12 M1: for each closure whose return type is not known up front, the type of its first `return <value>`.
+    closure_ret_seen: Vec<Option<Ty>>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
     /// the "unresolved, stay silent" result. `check_propagate` consults
     /// it to tell "`?` applied to an unresolvable stdlib call" (silent)
@@ -1364,6 +1366,7 @@ impl TypeChecker {
             unsafe_depth: 0,
             structs: HashMap::new(),
             enums: HashMap::new(),
+            closure_ret_seen: Vec::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
@@ -2386,6 +2389,19 @@ impl TypeChecker {
                     t.clone()
                 } else if self.cur_const_params.contains(name) {
                     Ty::Usize // a const generic parameter used as a value (Doc 8 §8)
+                } else if let Some(shape) = self.functions.get(name).cloned() {
+                    // Document 10 §5.1 / §9.5: a named function used as a value has the
+                    // function type `fn(A, B) -> R`.
+                    if !shape.generics.is_empty() {
+                        self.errors.push(TypeError {
+                            message: format!("generic function `{}` cannot be used as a value: call it, or wrap it in a closure that fixes its type arguments", name),
+                            context: ctx.into(),
+                        });
+                        self.saw_unresolved = true;
+                        expected.cloned().unwrap_or(Ty::Unit)
+                    } else {
+                        Ty::Fn(shape.params.clone(), Box::new(shape.ret.clone()))
+                    }
                 } else {
                     self.errors.push(TypeError {
                         message: format!("undefined variable `{}`", name),
@@ -2769,6 +2785,48 @@ impl TypeChecker {
                             return self.check_alloc_intrinsic(name, args, env, ctx);
                         }
                         _ => {}
+                    }
+                }
+                // Phase 12 M1: calling a value of function type -- a local variable (it shadows
+                // a function of the same name), a parenthesised/field/index/call result.
+                let value_callee = match callee.as_ref() {
+                    Expr::Ident(n) => env.get(n).is_some(),
+                    Expr::Paren(_) | Expr::Field { .. } | Expr::Index { .. } | Expr::Call { .. } => true,
+                    _ => false,
+                };
+                if value_callee {
+                    let ct = self.check_expr(callee, None, env, ctx);
+                    let ct = self.zonk(&ct);
+                    let fnty = match &ct {
+                        Ty::Fn(..) => Some(ct.clone()),
+                        Ty::Ref(_, i) if matches!(**i, Ty::Fn(..)) => Some((**i).clone()),
+                        _ => None,
+                    };
+                    match fnty {
+                        Some(Ty::Fn(ps, r)) => {
+                            if ps.len() != args.len() {
+                                self.errors.push(TypeError {
+                                    message: format!("a value of type `{}` takes {} argument(s), but {} were given", ct, ps.len(), args.len()),
+                                    context: ctx.into(),
+                                });
+                            }
+                            for (i, a) in args.iter().enumerate() {
+                                self.check_expr(&a.value, ps.get(i), env, ctx);
+                            }
+                            return *r;
+                        }
+                        _ => {
+                            for a in args {
+                                self.check_expr(&a.value, None, env, ctx);
+                            }
+                            if ct != Ty::Unit || !self.saw_unresolved {
+                                self.errors.push(TypeError {
+                                    message: format!("cannot call a value of type `{}`: only function values (`fn(..) -> ..`, closures) can be called", ct),
+                                    context: ctx.into(),
+                                });
+                            }
+                            return Ty::Unit;
+                        }
                     }
                 }
                 let (callee_name, explicit_targs): (Option<&String>, Vec<Type>) = match callee.as_ref() {
@@ -3244,7 +3302,7 @@ impl TypeChecker {
                 // the value's type is an error source for the block,
                 // exactly like the error type of a `?`.
                 let t = self.check_expr(inner, None, env, ctx);
-                if !self.record_try_source(t) && !self.top_is_opaque() {
+                if !self.record_try_source(t) {
                     self.errors.push(TypeError {
                         message: "`throw` is only valid inside a `try` block (Document 11 §3.1); outside one, return `Err(..)` instead".into(),
                         context: ctx.into(),
@@ -3269,25 +3327,7 @@ impl TypeChecker {
             // Phase 12/18/20/8) -- visited for sub-expression coverage
             // where cheap, but not fully type-checked here. Not silently
             // claimed as "checked".
-            Expr::Closure(c) => {
-                let mut inner_env = env.clone();
-                inner_env.loop_depth += 1; // a closure may run many times
-                inner_env.push();
-                for (pat, ty) in &c.params {
-                    if let Pattern::Ident(n) = pat {
-                        inner_env.insert(n.clone(), ty.as_ref().map(resolve_type).unwrap_or(Ty::Unit));
-                    }
-                }
-                // Phase 9: `?`/`return`/`throw` inside a closure body do
-                // not target the enclosing function.
-                self.prop_targets.push(PropTarget::Opaque);
-                match &c.body {
-                    ClosureBody::Expr(e) => { self.check_expr(e, None, &mut inner_env, ctx); }
-                    ClosureBody::Block(b) => { self.check_block(b, &mut inner_env, None, ctx); }
-                }
-                self.prop_targets.pop();
-                expected.cloned().unwrap_or(Ty::Unit)
-            }
+            Expr::Closure(c) => self.check_closure(c, expected, env, ctx),
             Expr::Loop(loop_expr) => self.check_loop(loop_expr, expected, env, ctx),
             Expr::TryCatch { try_block, catch_var, catch_block } => {
                 self.check_try_catch(expr as *const Expr as usize, try_block, catch_var, catch_block, expected, env, ctx)
@@ -3298,6 +3338,107 @@ impl TypeChecker {
                 expected.cloned().unwrap_or(Ty::Unit)
             }
         }
+    }
+
+
+    /// Phase 12 M1 (Document 10 §4, §9.5): a closure is a value of function type `fn(A, B) -> R`.
+    /// Parameter types come from annotations or from the expected `fn` type; the return type is
+    /// the annotation, the expected `fn` type's, or inferred from the body. `return`, `?` and
+    /// `throw` inside the body belong to the closure itself.
+    fn check_closure(&mut self, c: &ClosureExpr, expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        let exp_fn: Option<(Vec<Ty>, Ty)> = match expected.map(|e| self.zonk(e)) {
+            Some(Ty::Fn(ps, r)) => Some((ps, *r)),
+            Some(Ty::Ref(_, inner)) => match *inner {
+                Ty::Fn(ps, r) => Some((ps, *r)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((ps, _)) = &exp_fn {
+            if ps.len() != c.params.len() {
+                self.errors.push(TypeError {
+                    message: format!("closure takes {} parameter(s) but the expected function type `{}` has {}", c.params.len(), expected.unwrap(), ps.len()),
+                    context: ctx.into(),
+                });
+            }
+        }
+        let mut inner_env = env.clone();
+        inner_env.loop_depth += 1; // a closure may run many times
+        inner_env.push();
+        let mut param_tys: Vec<Ty> = Vec::new();
+        for (i, (pat, ann)) in c.params.iter().enumerate() {
+            let t = match (ann, exp_fn.as_ref().and_then(|(ps, _)| ps.get(i))) {
+                (Some(a), _) => resolve_type(a),
+                (None, Some(e)) => e.clone(),
+                (None, None) => {
+                    self.errors.push(TypeError {
+                        message: "cannot infer the type of a closure parameter: annotate it (`|x: i32| ..`) or use the closure where a `fn(..) -> ..` type is expected (Document 10 §4.2, §9.5)".into(),
+                        context: ctx.into(),
+                    });
+                    self.saw_unresolved = true;
+                    Ty::Unit
+                }
+            };
+            if let (Some(a), Some(e)) = (ann, exp_fn.as_ref().and_then(|(ps, _)| ps.get(i))) {
+                let at = resolve_type(a);
+                if &at != e && !ty_has_infer(e) {
+                    self.errors.push(TypeError {
+                        message: format!("closure parameter {} is annotated `{}` but the expected function type has `{}`", i + 1, at, e),
+                        context: ctx.into(),
+                    });
+                }
+            }
+            self.bind_pattern(pat, &t, &mut inner_env, false);
+            param_tys.push(t);
+        }
+        let known_ret: Option<Ty> = match (&c.return_type, &exp_fn) {
+            (Some(r), _) => Some(resolve_type(r)),
+            (None, Some((_, r))) => Some(r.clone()).filter(|r| !ty_has_infer(r)),
+            _ => None,
+        };
+        if let (Some(r), Some((_, er))) = (&c.return_type, &exp_fn) {
+            let r = resolve_type(r);
+            if &r != er && !ty_has_infer(er) {
+                self.errors.push(TypeError {
+                    message: format!("closure return type `{}` does not match the expected function type's `{}`", r, er),
+                    context: ctx.into(),
+                });
+            }
+        }
+        match &known_ret {
+            Some(r) => self.prop_targets.push(PropTarget::FnRet(r.clone())),
+            None => {
+                self.prop_targets.push(PropTarget::Opaque);
+                self.closure_ret_seen.push(None);
+            }
+        }
+        let body_ty: Option<Ty> = match &c.body {
+            ClosureBody::Expr(e) => Some(self.check_expr(e, known_ret.as_ref(), &mut inner_env, ctx)),
+            ClosureBody::Block(b) => self.check_block(b, &mut inner_env, known_ret.as_ref(), ctx),
+        };
+        self.prop_targets.pop();
+        let seen = if known_ret.is_none() { self.closure_ret_seen.pop().flatten() } else { None };
+        let ret = match known_ret {
+            Some(r) => {
+                let bt = body_ty.clone().unwrap_or(Ty::Unit);
+                let ok = bt == Ty::Never || bt == r || (ty_has_infer(&bt) || ty_has_infer(&r)) && self.unify_ty(&bt, &r);
+                // a block without a tail whose every path returns/diverges was typed `!` above
+                if !ok {
+                    self.errors.push(TypeError {
+                        message: format!("closure body has type `{}` but the closure's return type is `{}` (Document 10 §9.5)", bt, r),
+                        context: ctx.into(),
+                    });
+                }
+                r
+            }
+            None => match (body_ty, seen) {
+                (Some(t), _) if t != Ty::Never => t,
+                (_, Some(t)) => t,
+                (Some(t), None) => t,
+                (None, None) => Ty::Unit,
+            },
+        };
+        Ty::Fn(param_tys, Box::new(ret))
     }
 
     /// Phase 8 (Document 9 §3): full loop-form type-checking. Prior to
@@ -4518,7 +4659,7 @@ impl TypeChecker {
             Some(TargetView::Try) => {
                 self.record_try_source(err.clone());
             }
-            Some(TargetView::Opaque) => {}
+            Some(TargetView::Opaque) => self.closure_needs_ret_type("?", ctx),
             None => {
                 self.errors.push(TypeError {
                     message: "`?` used outside any function body".into(),
@@ -4526,6 +4667,13 @@ impl TypeChecker {
                 });
             }
         }
+    }
+
+    fn closure_needs_ret_type(&mut self, what: &str, ctx: &str) {
+        self.errors.push(TypeError {
+            message: format!("`{}` inside a closure needs the closure's return type: annotate it (`|x| -> Result<T, E> {{ .. }}`) or use the closure where a `fn(..) -> Result<T, E>` type is expected (Document 10 §9.5)", what),
+            context: ctx.into(),
+        });
     }
 
     /// Routes the `None` half of `?` on an `Option`.
@@ -4555,7 +4703,7 @@ impl TypeChecker {
                     context: ctx.into(),
                 });
             }
-            Some(TargetView::Opaque) => {}
+            Some(TargetView::Opaque) => self.closure_needs_ret_type("?", ctx),
             None => {
                 self.errors.push(TypeError {
                     message: "`?` used outside any function body".into(),
@@ -4687,8 +4835,17 @@ impl TypeChecker {
             }
             Some(TargetView::Opaque) | None => None,
         };
-        if let Some(e) = value {
-            self.check_expr(e, expected.as_ref(), env, ctx);
+        let opaque = matches!(self.top_target(), Some(TargetView::Opaque));
+        let vt = match value {
+            Some(e) => Some(self.check_expr(e, expected.as_ref(), env, ctx)),
+            None => Some(Ty::Unit),
+        };
+        if opaque {
+            if let (Some(slot), Some(t)) = (self.closure_ret_seen.last_mut(), vt) {
+                if slot.is_none() {
+                    *slot = Some(t);
+                }
+            }
         }
     }
 
@@ -4885,7 +5042,34 @@ impl TypeChecker {
 
     /// Addresses of the expressions whose type owns heap memory (for the borrow checker's move tracking).
     pub fn owning_expr_addrs(&self) -> std::collections::HashSet<usize> {
-        self.expr_types.iter().filter(|(_, t)| self.owns_heap(t, 0)).map(|(a, _)| *a).collect()
+        self.expr_types
+            .iter()
+            .filter(|(a, t)| {
+                if !self.owns_heap(t, 0) {
+                    return false;
+                }
+                // Phase 12 M1: a function VALUE that is a plain name (a function item or a local
+                // binding) or a closure literal does not by itself own anything new; whether a
+                // closure owns its environment is decided by `borrow.rs` (capture modes).
+                if matches!(t, Ty::Fn(..)) {
+                    // SAFETY: addresses in `expr_types` are the AST nodes of the checked program.
+                    let e: &Expr = unsafe { &*(**a as *const Expr) };
+                    return !matches!(e, Expr::Ident(_) | Expr::Closure(_) | Expr::Path(_));
+                }
+                true
+            })
+            .map(|(a, _)| *a)
+            .collect()
+    }
+
+    /// Names of the declared functions.
+    pub fn function_names(&self) -> std::collections::HashSet<String> {
+        self.functions.keys().cloned().collect()
+    }
+
+    /// Addresses of expressions whose type is a function type (Phase 12 M1).
+    pub fn fn_expr_addrs(&self) -> std::collections::HashSet<usize> {
+        self.expr_types.iter().filter(|(_, t)| matches!(t, Ty::Fn(..))).map(|(a, _)| *a).collect()
     }
 
     /// Does a value of `t` own heap memory (so that binding it by value would be a move)?
@@ -4894,7 +5078,7 @@ impl TypeChecker {
             return true;
         }
         match t {
-            Ty::StringTy | Ty::Array(_) => true,
+            Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
             Ty::Tuple(ts) => ts.iter().any(|x| self.owns_heap(x, depth + 1)),
             Ty::Fixed(x, _) => self.owns_heap(x, depth + 1),
