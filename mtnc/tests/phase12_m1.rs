@@ -472,3 +472,63 @@ fn generic_impl_signature_mismatch_is_not_caught_if_the_impl_is_never_instantiat
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "1\n");
 }
+
+// ---------------------------------------------------------------- M1 follow-up (manager decision, M2 brief)
+
+#[test]
+fn calling_through_a_borrowed_function_value_reuses_an_owning_closure() {
+    let src = "struct Cfg { n: i32 }\nfn applyN(f: borrow fn(i32) -> i32, n: i32, x: i32) -> i32 { if n == 0 { return x; } return applyN(f, n - 1, f(x)); }\nfn main() { let c = Cfg { n: 2 }; let g = move |x: i32| x + c.n; println(applyN(borrow g, 5, 1)); println(applyN(borrow g, 2, 1)); }";
+    assert_eq!(out(src), "11\n5\n");
+}
+
+#[test]
+fn borrowed_function_value_in_a_loop_and_passed_on() {
+    let src = "fn loopN(f: borrow fn(i32) -> i32, n: i32, x: i32) -> i32 { let mut v = x; let mut i = 0; while i < n { v = f(v); i += 1; } return v; }\nfn pass(f: borrow fn(i32) -> i32) -> i32 { loopN(f, 3, 1) }\nfn main() { let k = 2; let g = |x: i32| x * k; println(loopN(borrow g, 3, 1)); println(pass(borrow g)); let r = borrow g; println(r(10)); }";
+    assert_eq!(out(src), "8\n8\n20\n");
+}
+
+#[test]
+fn by_value_reuse_of_a_function_parameter_is_rejected_with_a_hint() {
+    rejects(
+        "struct C { v: i32 }\nfn applyN(f: fn(i32) -> i32, n: i32, x: i32) -> i32 { if n == 0 { return x; } return applyN(f, n - 1, f(x)); }\nfn main() { let c = C { v: 1 }; let g = move |x: i32| x + c.v; println(applyN(g, 3, 1)); }",
+        "pass `borrow f` to keep using the function value",
+    );
+}
+
+#[test]
+fn an_owning_closure_cannot_be_moved_out_of_a_borrow() {
+    rejects(
+        "fn takes(f: fn(i32) -> i32) -> i32 { f(1) }\nfn bad(f: borrow fn(i32) -> i32) -> i32 { takes(f) }\nfn main() { let k = 3; let g = move |x: i32| x + k; println(bad(borrow g)); }",
+        "found `&fn(i32) -> i32`",
+    );
+}
+
+#[test]
+fn functions_with_variadic_or_default_parameters_cannot_be_function_values() {
+    let msg = "functions with variadic or default parameters cannot be used as function values; wrap the call in a closure";
+    rejects("fn va(...xs: i32) -> i32 { 1 }\nfn main() { let f = va; println(f(1)); }", msg);
+    rejects("fn d(a: i32, b: i32 = 2) -> i32 { a + b }\nfn main() { let f = d; println(f(1, 2)); }", msg);
+    // the wrapper the message suggests works
+    assert_eq!(out("fn d(a: i32, b: i32 = 2) -> i32 { a + b }\nfn main() { let f = |a: i32| d(a); println(f(1)); }"), "3\n");
+}
+
+#[test]
+fn functions_with_borrow_parameters_are_function_values() {
+    assert_eq!(out("struct P { a: i32 }\nfn getA(borrow p: P) -> i32 { p.a }\nfn use(f: fn(borrow P) -> i32) -> i32 { let p = P { a: 9 }; f(borrow p) }\nfn main() { println(use(getA)); }"), "9\n");
+    assert_eq!(out("fn bump(borrow mut a: i32) { a += 1; }\nfn main() { let f = bump; let mut x = 4; f(borrow mut x); println(x); }"), "5\n");
+    assert_eq!(out("fn sum(borrow xs: [i32]) -> i32 { xs[0] + xs[1] }\nfn main() { let f = sum; let v = [5, 7]; println(f(borrow v)); }"), "12\n");
+}
+
+#[test]
+fn a_closure_moving_a_capture_into_a_struct_literal_owns_it() {
+    let src = "struct Cfg { n: i32 }\nstruct W { c: Cfg }\nfn main() { let c = Cfg { n: 1 }; let f = || W { c: c }; let w = f(); println(w.c.n); }";
+    assert_eq!(out(src), "1\n");
+}
+
+#[test]
+fn moving_a_variable_into_a_struct_tuple_or_array_literal_is_a_move() {
+    let pre = "struct Cfg { n: i32 }\nstruct W { c: Cfg }\n";
+    rejects(&format!("{}fn main() {{ let c = Cfg {{ n: 1 }}; let w = W {{ c: c }}; println(c.n); println(w.c.n); }}", pre), "use of moved value `c`");
+    rejects(&format!("{}fn main() {{ let c = Cfg {{ n: 1 }}; let t = (c, 1); println(c.n); }}", pre), "use of moved value `c`");
+    rejects(&format!("{}fn main() {{ let c = Cfg {{ n: 1 }}; let t = [c]; println(c.n); }}", pre), "use of moved value `c`");
+}

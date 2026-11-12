@@ -172,6 +172,11 @@ fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Mo
     f(&cg.module, &tm)
 }
 
+fn has_coroutines(m: &inkwell::module::Module) -> bool {
+    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("presplitcoroutine");
+    m.get_functions().any(|f| f.get_enum_attribute(inkwell::attributes::AttributeLoc::Function, kind).is_some())
+}
+
 /// The textual LLVM IR of `src` (used by tests and `mtnc build --emit-ir`).
 pub fn emit_ir(src: &str, opts: &Options) -> Result<String, Vec<String>> {
     with_module(src, opts, |m, _| Ok(m.print_to_string().to_string()))
@@ -182,8 +187,10 @@ pub fn emit_ir(src: &str, opts: &Options) -> Result<String, Vec<String>> {
 pub fn build_executable(src: &str, out: &Path, opts: &Options) -> Result<(), Vec<String>> {
     let obj = out.with_extension("o");
     with_module(src, opts, |m, tm| {
-        if opts.release {
-            m.run_passes("default<O2>", tm, inkwell::passes::PassBuilderOptions::create())
+        // generators are LLVM coroutines: the coroutine passes must run even without optimization
+        let pipeline = if opts.release { Some("default<O2>") } else if has_coroutines(m) { Some("default<O0>") } else { None };
+        if let Some(p) = pipeline {
+            m.run_passes(p, tm, inkwell::passes::PassBuilderOptions::create())
                 .map_err(|e| vec![format!("internal error: LLVM optimization failed: {}", e.to_string())])?;
         }
         tm.write_to_file(m, FileType::Object, &obj).map_err(|e| vec![format!("could not write the object file: {}", e.to_string())])

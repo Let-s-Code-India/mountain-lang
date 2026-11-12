@@ -349,6 +349,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.rc_release_weak(f, objt, obj, atomic, end)?;
                 self.builder.position_at_end(end);
             }
+            Ty::Generic(n, _) if n == "Generator" => self.generator_glue(f, p)?,
             Ty::Generic(n, _) => {
                 return Err(CgErr(format!("internal error: no drop glue is defined for the type `{}`", n)));
             }

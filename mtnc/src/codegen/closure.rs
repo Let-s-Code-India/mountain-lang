@@ -280,9 +280,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         if args.iter().any(|a| a.name.is_some()) {
             return Err(CgErr("named arguments are only allowed when calling a declared function, not a function value (Document 10 §2.2)".into()));
         }
-        let cty = self.ty_of(callee)?;
+        let written = self.ty_of(callee)?;
+        // calling through a borrowed function value (`borrow f`): auto-dereference, like method calls
+        let cty = match &written {
+            Ty::Ref(_, i) if matches!(**i, Ty::Fn(..)) => (**i).clone(),
+            other => other.clone(),
+        };
         let Ty::Fn(ptys, ret) = &cty else {
-            return Err(CgErr(format!("cannot call a value of type `{}`: only function values can be called", cty)));
+            return Err(CgErr(format!("cannot call a value of type `{}`: only function values can be called", written)));
         };
         let (ptys, ret) = (ptys.clone(), (**ret).clone());
         if args.len() != ptys.len() {
@@ -294,7 +299,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         let fv = if self.is_place_expr(c) {
             let (p, t) = self.place(c)?;
-            self.load(p, &t)?
+            if let Ty::Ref(_, inner) = &t {
+                // the slot holds a pointer to the function value
+                let rp = self.load(p, &t)?.into_pointer_value();
+                let inner = (**inner).clone();
+                self.load(rp, &inner)?
+            } else {
+                self.load(p, &t)?
+            }
+        } else if matches!(written, Ty::Ref(..)) {
+            let rp = self.expr(c)?.into_pointer_value();
+            self.load(rp, &cty)?
         } else {
             let v = self.expr(c)?;
             let p = self.spill_owned(v, &cty)?;
@@ -336,17 +351,64 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let i = &self.fns[name];
             (i.val, i.params.clone(), i.ret.clone(), i.self_kind)
         };
-        if self_kind.is_some() || params.iter().any(|p| p.mode != PMode::Value) {
-            return unsupported(&format!("using the function `{}` (it has `borrow`/variadic parameters) as a value", name), 12);
+        if params.iter().any(|p| p.mode == PMode::Variadic || p.default.is_some()) {
+            return Err(CgErr(format!(
+                "`{}`: functions with variadic or default parameters cannot be used as function values; wrap the call in a closure",
+                name
+            )));
         }
-        let ptys: Vec<Ty> = params.iter().map(|p| p.ty.clone()).collect();
+        if self_kind.is_some() {
+            return Err(CgErr(format!("`{}`: a method cannot be used as a function value; wrap the call in a closure", name)));
+        }
+        // a `borrow` parameter is passed through as the same opaque pointer (a `borrow dyn Trait`
+        // parameter as the same fat pointer): the function type spells it `&T`
+        let mut ptys: Vec<Ty> = Vec::new();
+        for p in &params {
+            ptys.push(match p.mode {
+                PMode::Ref(m) => Ty::Ref(m, Box::new(p.ty.clone())),
+                _ => p.ty.clone(),
+            });
+        }
+        for (p, t) in params.iter().zip(ptys.iter()) {
+            if let PMode::Ref(_) = p.mode {
+                let same = if matches!(p.ty, Ty::DynTrait(_)) || (matches!(p.ty, Ty::Array(_)) && p.mode == PMode::Ref(false)) {
+                    true
+                } else {
+                    self.llty(t)? == self.context.ptr_type(AddressSpace::default()).into()
+                };
+                if !same {
+                    return Err(CgErr(format!(
+                        "`{}`: its `borrow` parameter `{}` of type `{}` cannot be passed through a function value; wrap the call in a closure",
+                        name, p.name, p.ty
+                    )));
+                }
+            }
+        }
         let fty = self.fn_llty(&ptys, &ret)?;
         let t = self.module.add_function(&format!("__mtn_thunk_{}", Self::fn_symbol(name)), fty, None);
         self.fn_thunks.insert(name.to_string(), t);
         let saved = self.builder.get_insert_block();
         let entry = self.context.append_basic_block(t, "entry");
         self.builder.position_at_end(entry);
-        let args: Vec<BasicMetadataValueEnum> = (0..ptys.len()).map(|i| t.get_nth_param(1 + i as u32).unwrap().into()).collect();
+        let mut args: Vec<BasicMetadataValueEnum> = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let pv = t.get_nth_param(1 + i as u32).unwrap();
+            if matches!(p.ty, Ty::Array(_)) && p.mode == PMode::Ref(false) {
+                // `&[T]` slice view -> the opaque pointer to a `{ ptr, len, cap }` handle the function expects
+                let sv = pv.into_struct_value();
+                let data = self.builder.build_extract_value(sv, 0, "data")?;
+                let len = self.builder.build_extract_value(sv, 1, "len")?;
+                let ht = self.handle_ty();
+                let h = self.builder.build_alloca(ht, "slice_handle")?;
+                for (k, v) in [(0u32, data), (1, len), (2, len)] {
+                    let fp = self.builder.build_struct_gep(ht, h, k, "f")?;
+                    self.builder.build_store(fp, v)?;
+                }
+                args.push(h.into());
+            } else {
+                args.push(pv.into());
+            }
+        }
         let call = self.builder.build_call(val, &args, "")?;
         if ret == Ty::Never {
             self.builder.build_unreachable()?;

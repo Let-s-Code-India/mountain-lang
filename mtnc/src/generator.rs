@@ -310,3 +310,32 @@ impl Default for GeneratorState {
         Self::new()
     }
 }
+
+/// Does `block` contain a `yield` that belongs to the function that owns it (a `yield` inside
+/// a closure belongs to the closure, which cannot be a generator)? Phase 12 M2.
+pub fn block_has_yield(block: &Block) -> bool {
+    use crate::desugar::{block_children, Child};
+    fn child_has(c: Child<'_>) -> bool {
+        match c {
+            Child::E(e) => expr_has_yield(e),
+            Child::B(b) => block_has_yield(b),
+        }
+    }
+    // a statement-level `yield` is a `Stmt::Yield`
+    if block.stmts.iter().any(|s| matches!(s, Stmt::Yield(_))) {
+        return true;
+    }
+    block_children(block).into_iter().any(child_has)
+}
+
+fn expr_has_yield(e: &Expr) -> bool {
+    use crate::desugar::{expr_children, Child};
+    match e {
+        Expr::Yield(_) => true,
+        Expr::Closure(_) => false,
+        _ => expr_children(e).into_iter().any(|c| match c {
+            Child::E(x) => expr_has_yield(x),
+            Child::B(b) => block_has_yield(b),
+        }),
+    }
+}

@@ -142,7 +142,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.terminate();
                 Ok(())
             }
-            Stmt::Yield(_) => unsupported("generators (`yield`)", 12),
+            Stmt::Yield(e) => self.gen_yield(e),
             // Nested items were hoisted and registered with the module-level items.
             Stmt::Item(_) => Ok(()),
             Stmt::TargetBlock(kind, b) => {
@@ -191,6 +191,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     fn gen_return(&mut self, v: Option<&Expr>) -> R<()> {
+        if self.gen_ctx.is_some() {
+            // `return;` in a generator ends it (the checker rejected `return value;`)
+            return self.gen_finish_body();
+        }
         let ret = self.ret_ty.clone();
         let val = match v {
             Some(e) => Some(self.expr_as(e, &ret)?),
@@ -575,7 +579,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::Await(_) | Expr::Spawn { .. } => unsupported("`await`/`spawn` (async & concurrency)", 12),
             Expr::Select(_) => unsupported("`select` (channels)", 13),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
-            Expr::Yield(_) => unsupported("generators (`yield`)", 12),
+            Expr::Yield(inner) => {
+                self.gen_yield(inner)?;
+                Ok(self.unit())
+            }
             Expr::TryCatch { .. } => Err(CgErr("internal: a `try`/`catch` reached codegen without being desugared".into())),
             Expr::Throw(_) => Err(CgErr("`throw` outside a `try` block".into())),
             Expr::Styled { .. } | Expr::Layout { .. } | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => unsupported("UI expressions", 19),
@@ -1395,6 +1402,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let mut b0 = rty.clone();
             while let Ty::Ref(_, i) = b0 {
                 b0 = *i;
+            }
+            if let Some(item) = crate::types::generator_item(&b0) {
+                if name == "next" && args.is_empty() {
+                    let whole_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: the type checker recorded no type for a method call".into()))?;
+                    return self.generator_next(receiver, &item, &whole_ty);
+                }
+                return unsupported(&format!("`Generator::{}` (iterator adapters such as `.take(n)` arrive with the library)", name), 16);
             }
             if let Ty::Generic(gn, ga) = &b0 {
                 if matches!(gn.as_str(), "Rc" | "Arc" | "Weak") && matches!(name, "clone" | "downgrade" | "upgrade") {
@@ -2240,6 +2254,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         while let Expr::Paren(i) = it {
             it = i;
         }
+        if let Some(item) = self.ty_of(it).ok().and_then(|t| crate::types::generator_item(&t)) {
+            return self.gen_for_generator(label, pattern, it, body, &item);
+        }
+        if let Expr::MethodCall { receiver, name, .. } = it {
+            if self.ty_of(receiver).ok().and_then(|t| crate::types::generator_item(&t)).is_some() {
+                return unsupported(&format!("`Generator::{}` (iterator adapters such as `.take(n)` arrive with the library)", name), 16);
+            }
+        }
         let Expr::Range { lo, hi, inclusive } = it else {
             return unsupported("`for` over anything but an integer range (needs the `Iterable` trait)", 16);
         };
@@ -2301,6 +2323,64 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.builder.build_store(cur, next)?;
         self.builder.build_unconditional_branch(head)?;
         self.position(end);
+        Ok(self.unit())
+    }
+
+    /// `for x in <generator>`: the generator is moved into a hidden slot owned by the loop (dropped
+    /// when the loop ends, however it ends), each iteration resumes it and moves the item out.
+    fn gen_for_generator(&mut self, label: &Option<String>, pattern: &Pattern, iter: &Expr, body: &Block, item: &Ty) -> R<V<'ctx>> {
+        let gty = self.ty_of(iter)?;
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        self.push_scope();
+        let v = self.expr(iter)?;
+        let slot = self.declare_local("$for_gen", &gty)?;
+        self.builder.build_store(slot, v)?;
+        let (head, body_bb, end) = (self.new_block("gfor"), self.new_block("gfor_body"), self.new_block("gfor_end"));
+        self.builder.build_unconditional_branch(head)?;
+        self.position(head);
+        let hdl = self.builder.build_load(ptrt, slot, "hdl")?.into_pointer_value();
+        let (has, pp) = self.gen_poll(hdl, item)?;
+        self.builder.build_conditional_branch(has, body_bb, end)?;
+        self.position(body_bb);
+        let frames = self.drop_frames.len();
+        self.push_scope();
+        let val = self.load(pp, item)?;
+        let bound: R<()> = (|| {
+            match pattern {
+                Pattern::Ident(n) | Pattern::Mut(n) => {
+                    let s = self.declare_local(n, item)?;
+                    self.builder.build_store(s, val)?;
+                }
+                Pattern::Wildcard => {
+                    self.spill_owned(val, item)?;
+                }
+                other => {
+                    let tmp = self.spill_owned(val, item)?;
+                    let mut binds = Vec::new();
+                    self.pat_test(other, tmp, item, &mut binds, false)?;
+                    let pending = self.materialize(binds)?;
+                    self.commit_binds(pending)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = bound {
+            self.pop_scope(false)?;
+            self.pop_scope(false)?;
+            return Err(e);
+        }
+        self.loops.push(LoopCtx { label: label.clone(), break_bb: end, continue_bb: head, result: None, frames });
+        let r = self.gen_block(body);
+        self.loops.pop();
+        let ok = r.is_ok();
+        self.pop_scope(ok)?;
+        if let Err(e) = r {
+            self.pop_scope(false)?;
+            return Err(e);
+        }
+        self.builder.build_unconditional_branch(head)?;
+        self.position(end);
+        self.pop_scope(true)?;
         Ok(self.unit())
     }
 

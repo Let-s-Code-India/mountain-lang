@@ -648,7 +648,18 @@ pub fn register_item_context(items: &[&Item]) {
 
 /// `Box`/`Rc`/`Arc`/`Weak` are compiler-known generic heap types (Doc 6/13); they need no declaration.
 pub fn is_heap_generic(n: &str) -> bool {
-    matches!(n, "Box" | "Rc" | "Arc" | "Weak")
+    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator")
+}
+
+/// `Generator<T>` (Doc 9 §4): the owning handle of a heap-allocated generator frame.
+pub fn generator_item(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Generic(n, a) if n == "Generator" && a.len() == 1 => match &a[0] {
+            GenericArg::Type(x) => Some(x.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
@@ -1079,6 +1090,8 @@ pub struct TypeChecker {
     prop_targets: Vec<PropTarget>,
     /// Phase 12 M1: for each closure whose return type is not known up front, the type of its first `return <value>`.
     closure_ret_seen: Vec<Option<Ty>>,
+    /// The item type of the generator function being checked (Phase 12 M2).
+    cur_gen: Option<Ty>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
     /// the "unresolved, stay silent" result. `check_propagate` consults
     /// it to tell "`?` applied to an unresolvable stdlib call" (silent)
@@ -1367,6 +1380,7 @@ impl TypeChecker {
             structs: HashMap::new(),
             enums: HashMap::new(),
             closure_ret_seen: Vec::new(),
+            cur_gen: None,
             functions: HashMap::new(),
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
@@ -2057,10 +2071,45 @@ impl TypeChecker {
             }
         }
         let expected_ret = f.return_type.as_ref().map(|t| resolve_with_self(t));
+        // Phase 12 M2 (Doc 9 §4, §8.5): `fn g(..) -> Generator<T>` whose body contains `yield`
+        // is a generator function.
+        let gen_item = expected_ret.as_ref().and_then(generator_item).filter(|_| crate::generator::block_has_yield(body));
+        if gen_item.is_some() {
+            // the frame owns every parameter: a borrowed parameter could dangle after the call returns
+            for p in &f.params {
+                let what = if p.name == "self" { "`self`".to_string() } else { format!("parameter `{}`", p.name) };
+                if p.is_variadic {
+                    self.errors.push(TypeError {
+                        message: format!("generator function `{}`: variadic {} is not allowed; a generator owns all of its parameters (pass a `[T]` by value instead)", f.name, what),
+                        context: f.name.clone(),
+                    });
+                } else if matches!(p.ownership, OwnershipMod::Borrow | OwnershipMod::BorrowMut) {
+                    self.errors.push(TypeError {
+                        message: format!("generator function `{}`: {} is passed by `borrow`; a generator outlives the call and owns all of its parameters, so pass {} by value", f.name, what, if p.name == "self" { "`self`" } else { "it" }),
+                        context: f.name.clone(),
+                    });
+                }
+            }
+        }
         // Phase 9: `?`/`return` inside this body propagate to this
         // function's declared return type (Document 11 §2/§4).
         self.prop_targets.push(PropTarget::FnRet(expected_ret.clone().unwrap_or(Ty::Unit)));
-        self.check_block(body, &mut env, expected_ret.as_ref(), &f.name);
+        let saved_gen = std::mem::replace(&mut self.cur_gen, gen_item.clone());
+        if gen_item.is_some() {
+            // a generator body produces items with `yield`; it has no value of its own
+            let bt = self.check_block(body, &mut env, None, &f.name);
+            if let Some(t) = bt {
+                if t != Ty::Unit && t != Ty::Never {
+                    self.errors.push(TypeError {
+                        message: format!("generator function `{}`: the body ends with a value of type `{}`; a generator's items are produced with `yield` (end the last expression with `;`)", f.name, t),
+                        context: f.name.clone(),
+                    });
+                }
+            }
+        } else {
+            self.check_block(body, &mut env, expected_ret.as_ref(), &f.name);
+        }
+        self.cur_gen = saved_gen;
         self.prop_targets.pop();
         self.self_type = saved_self_type;
     }
@@ -2192,7 +2241,7 @@ impl TypeChecker {
                 self.check_return(inner.as_ref(), env, ctx);
             }
             Stmt::Yield(e) => {
-                self.check_expr(e, None, env, ctx);
+                self.check_yield(e, env, ctx);
             }
             Stmt::Break { label, value } => {
                 let target = self.find_loop_frame(label, ctx);
@@ -3154,6 +3203,26 @@ impl TypeChecker {
                     let inner = match ga.first() { Some(GenericArg::Type(t)) => Some(t.clone()), _ => None };
                     let is_arc_weak = gn == "Weak" && matches!(ga.get(1), Some(GenericArg::Type(Ty::Named(k))) if k == "Arc");
                     match (gn.as_str(), name.as_str(), inner) {
+                        ("Generator", "next", Some(t)) if args.is_empty() => {
+                            // `next` advances the generator: like a `borrow mut self` method it needs a `mut` binding
+                            let mut root: &Expr = receiver;
+                            loop {
+                                match root {
+                                    Expr::Paren(i) => root = i,
+                                    Expr::Field { expr, .. } | Expr::Index { expr, .. } => root = expr,
+                                    _ => break,
+                                }
+                            }
+                            if let Expr::Ident(n) = root {
+                                if env.is_immut(n) && !matches!(env.get(n), Some(Ty::Ref(..))) {
+                                    self.errors.push(TypeError {
+                                        message: format!("cannot call `next` on `{}`: it advances the generator, so `{}` must be declared `mut` (`let mut {}`)", n, n, n),
+                                        context: ctx.into(),
+                                    });
+                                }
+                            }
+                            return Ty::OptionTy(Box::new(t));
+                        }
                         ("Rc" | "Arc", "clone", Some(_)) if args.is_empty() => return raw_recv.clone(),
                         ("Rc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t)]),
                         ("Arc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t), GenericArg::Type(Ty::Named("Arc".into()))]),
@@ -3317,7 +3386,7 @@ impl TypeChecker {
             }
 
             Expr::Yield(inner) => {
-                self.check_expr(inner, None, env, ctx);
+                self.check_yield(inner, env, ctx);
                 Ty::Unit
             }
 
@@ -3405,6 +3474,7 @@ impl TypeChecker {
                 });
             }
         }
+        let saved_gen = self.cur_gen.take();
         match &known_ret {
             Some(r) => self.prop_targets.push(PropTarget::FnRet(r.clone())),
             None => {
@@ -3417,6 +3487,7 @@ impl TypeChecker {
             ClosureBody::Block(b) => self.check_block(b, &mut inner_env, known_ret.as_ref(), ctx),
         };
         self.prop_targets.pop();
+        self.cur_gen = saved_gen;
         let seen = if known_ret.is_none() { self.closure_ret_seen.pop().flatten() } else { None };
         let ret = match known_ret {
             Some(r) => {
@@ -3514,6 +3585,7 @@ impl TypeChecker {
                 // to know its element type is a documented gap, not a
                 // silent wrong answer -- see PROGRESS.md.
                 let elem_ty = match &iter_ty {
+                    t if generator_item(t).is_some() => generator_item(t).unwrap(),
                     Ty::Array(elem) => (**elem).clone(),
                     other => other.clone(),
                 };
@@ -3522,6 +3594,9 @@ impl TypeChecker {
                     if matches!(pattern, Pattern::Mut(_)) {
                         env.mark_mut(name);
                     }
+                } else if !matches!(pattern, Pattern::Wildcard) {
+                    // e.g. `for (a, b) in pairs()`: destructure the item
+                    self.bind_pattern(pattern, &elem_ty, env, false);
                 }
                 env.loop_depth += 1;
                 self.check_block(body, env, None, ctx);
@@ -4579,6 +4654,19 @@ impl TypeChecker {
         let operand_ty = self.check_expr(inner, None, env, ctx);
         let operand_unresolved = self.saw_unresolved;
         self.saw_unresolved = saved || operand_unresolved;
+        if self.cur_gen.is_some() && matches!(self.top_target(), Some(TargetView::Fn(_))) {
+            // Doc 9 §4 / §8.5 say general bodies support `?` but not what it does when the
+            // function returns `Generator<T>`: reported, not guessed (PROGRESS.md Phase 12 M2).
+            self.errors.push(TypeError {
+                message: "`?` inside a generator is not defined yet: a generator returns `Generator<T>`, not `Result`/`Option`, and Document 9 §4/§8.5 do not say where the error goes (pending a language decision, see PROGRESS.md Phase 12 M2)".into(),
+                context: ctx.into(),
+            });
+            return match operand_ty {
+                Ty::ResultTy(ok, _) => *ok,
+                Ty::OptionTy(some) => *some,
+                _ => expected.cloned().unwrap_or(Ty::Unit),
+            };
+        }
         match operand_ty {
             Ty::ResultTy(ok, err) => {
                 self.route_result_error(&err, ctx);
@@ -4823,7 +4911,55 @@ impl TypeChecker {
     /// against the enclosing function's declared return type.
     /// Bare `return;` is NOT validated against a non-unit return type
     /// (generators/async make that rule non-trivial) -- known gap.
+    /// `yield v;` (Doc 9 §4): only inside a generator function, and `v` must have the
+    /// generator's item type.
+    fn check_yield(&mut self, value: &Expr, env: &mut Env, ctx: &str) {
+        match self.cur_gen.clone() {
+            Some(item) if !matches!(self.top_target(), Some(TargetView::Try)) => {
+                let before = self.errors.len();
+                let t = self.check_expr(value, Some(&item), env, ctx);
+                if self.errors.len() > before {
+                    // the operand reported its own mismatch: say that it is the `yield` that failed
+                    let m = &mut self.errors[before].message;
+                    *m = format!("`yield` in a generator that yields `{}` (`-> Generator<{}>`): {}", item, item, m);
+                } else if t != item && t != Ty::Never && !(ty_has_infer(&t) || ty_has_infer(&item)) {
+                    self.errors.push(TypeError {
+                        message: format!("`yield` of a `{}` value in a generator that yields `{}` (`-> Generator<{}>`)", t, item, item),
+                        context: ctx.into(),
+                    });
+                } else if ty_has_infer(&t) || ty_has_infer(&item) {
+                    self.unify_ty(&t, &item);
+                }
+            }
+            Some(_) => {
+                self.check_expr(value, None, env, ctx);
+                self.errors.push(TypeError {
+                    message: "`yield` inside a `try` block is not supported: the block is lowered to a separate function (Document 11 §3); move the `yield` out of the `try`".into(),
+                    context: ctx.into(),
+                });
+            }
+            None => {
+                self.check_expr(value, None, env, ctx);
+                self.errors.push(TypeError {
+                    message: "`yield` outside a generator function: only a function declared `fn name(..) -> Generator<T>` can `yield` (a closure cannot be a generator) (Document 9 §4)".into(),
+                    context: ctx.into(),
+                });
+            }
+        }
+    }
+
     fn check_return(&mut self, value: Option<&Expr>, env: &mut Env, ctx: &str) {
+        if self.cur_gen.is_some() && matches!(self.top_target(), Some(TargetView::Fn(_))) {
+            // a generator's items are its `yield`s; `return;` just ends it
+            if let Some(e) = value {
+                self.check_expr(e, None, env, ctx);
+                self.errors.push(TypeError {
+                    message: "`return` with a value inside a generator: its items are produced with `yield`; use `return;` to end the generator early (Document 9 §4)".into(),
+                    context: ctx.into(),
+                });
+            }
+            return;
+        }
         let expected: Option<Ty> = match self.top_target() {
             Some(TargetView::Fn(t)) => Some(t),
             Some(TargetView::Try) => {

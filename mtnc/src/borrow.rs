@@ -420,6 +420,7 @@ impl BorrowChecker {
                 next_serial: 0,
                 closure_info: HashMap::new(),
                 by_ref_closures: std::collections::HashSet::new(),
+                ident_is_fn: false,
             };
             fc.scopes.push(Scope::default());
             for p in &f.params {
@@ -576,6 +577,7 @@ struct FnChecker<'a> {
     closure_info: HashMap<usize, ClosureInfo>,
     /// Names bound to a closure that borrows locals of this function (`let f = || x;`).
     by_ref_closures: std::collections::HashSet<String>,
+    ident_is_fn: bool,
 }
 
 impl<'a> FnChecker<'a> {
@@ -722,6 +724,14 @@ impl<'a> FnChecker<'a> {
     /// §4.3's capture-mode tracking all funnel through here so every
     /// place an identifier is actually *used* (not just declared) is
     /// covered uniformly.
+    /// `use_ident` for an identifier expression: a moved value of function type gets the hint
+    /// about `borrow` (Phase 12 M1 follow-up).
+    fn use_ident_expr(&mut self, e: &Expr, name: &str) {
+        self.ident_is_fn = self.checker.fn_exprs.contains(&(e as *const Expr as usize));
+        self.use_ident(name);
+        self.ident_is_fn = false;
+    }
+
     fn use_ident(&mut self, name: &str) {
         let (moved, sources) = match self.lookup(name) {
             Some(b) => (b.moved, b.borrow_sources.clone()),
@@ -729,8 +739,9 @@ impl<'a> FnChecker<'a> {
         };
         if moved {
             self.err(format!(
-                "use of moved value `{}` -- ownership was transferred to another binding and the original is no longer valid (Document 6 §2/§4)",
-                name
+                "use of moved value `{}` -- ownership was transferred to another binding and the original is no longer valid (Document 6 §2/§4){}",
+                name,
+                if self.ident_is_fn { format!("; pass `borrow {}` to keep using the function value", name) } else { String::new() }
             ));
         }
         for src in &sources {
@@ -862,7 +873,7 @@ impl<'a> FnChecker<'a> {
             Stmt::Return(Some(e)) => {
                 self.check_return_value(e, block, idx);
             }
-            Stmt::Yield(e) => self.check_expr(e, block, idx),
+            Stmt::Yield(e) => self.check_moving_operand(e, block, idx),
             Stmt::Break { value: Some(e), .. } => self.check_expr(e, block, idx),
             Stmt::Return(None) | Stmt::Break { value: None, .. } | Stmt::Continue { .. } | Stmt::Item(_) => {}
             Stmt::TargetBlock(_, b) => self.check_block(b),
@@ -1249,14 +1260,15 @@ impl<'a> FnChecker<'a> {
 
     fn check_expr(&mut self, expr: &Expr, block: &Block, idx: usize) {
         match expr {
-            Expr::Ident(name) => self.use_ident(name),
+            Expr::Ident(name) => self.use_ident_expr(expr, name),
             Expr::Literal(_) => {}
             Expr::Path(_) | Expr::TurbofishPath { .. } => {}
             Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
-            | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Deref(e) => self.check_expr(e, block, idx),
+            | Expr::Unary { expr: e, .. } | Expr::Deref(e) => self.check_expr(e, block, idx),
+            Expr::Yield(e) => self.check_moving_operand(e, block, idx),
             Expr::Tuple(items) | Expr::Array(items) => {
                 for it in items {
-                    self.check_expr(it, block, idx);
+                    self.check_moving_operand(it, block, idx);
                 }
                 for it in items {
                     self.forbid_escaping_borrowing_closure(it);
@@ -1265,7 +1277,7 @@ impl<'a> FnChecker<'a> {
             Expr::ArrayRepeat(x, _) => self.check_expr(x, block, idx),
             Expr::StructLit { fields, spread, .. } => {
                 for (_, v) in fields {
-                    self.check_expr(v, block, idx);
+                    self.check_moving_operand(v, block, idx);
                 }
                 if let Some(s) = spread {
                     self.check_expr(s, block, idx);
@@ -1384,7 +1396,8 @@ impl<'a> FnChecker<'a> {
                     self.check_branch(body);
                 }
                 LoopExpr::For { iter, body, .. } => {
-                    self.check_expr(iter, block, idx);
+                    // `for x in g` consumes a generator variable (it is moved into the loop)
+                    self.check_moving_operand(iter, block, idx);
                     self.check_branch(body);
                 }
                 LoopExpr::DoWhile { body, cond } => {
@@ -1471,6 +1484,22 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// An operand that is stored by value (struct field, tuple/array element): a bare non-`Copy`
+    /// identifier is moved into the new value (Document 6 §4.1) -- the same rule as a call
+    /// argument. (Phase 12 M1 follow-up: this was missing, so `let w = W { c: c }; use(c)` was
+    /// accepted and read a zeroed value.)
+    fn check_moving_operand(&mut self, e: &Expr, block: &Block, idx: usize) {
+        if let Expr::Ident(name) = e {
+            self.use_ident_expr(e, name);
+            let is_copy = self.lookup(name).map(|b| b.is_copy).unwrap_or(true);
+            if !is_copy {
+                self.mark_moved(name);
+            }
+        } else {
+            self.check_expr(e, block, idx);
+        }
+    }
+
     fn check_call_args(&mut self, args: &[Arg], block: &Block, idx: usize) {
         for arg in args {
             match &arg.value {
@@ -1484,6 +1513,7 @@ impl<'a> FnChecker<'a> {
                     }
                 }
                 Expr::Ident(name) => {
+                    self.use_ident_expr(&arg.value, name);
                     // A bare by-value identifier argument: moves the
                     // argument per Document 6 §4.1's `consume(alice)`
                     // example, UNLESS the callee's corresponding
@@ -1491,7 +1521,6 @@ impl<'a> FnChecker<'a> {
                     // handled by the `Expr::Borrow` arm above when the
                     // caller writes it explicitly) or the argument's
                     // own type is Copy.
-                    self.use_ident(name);
                     let is_copy = self.lookup(name).map(|b| b.is_copy).unwrap_or(true);
                     if !is_copy {
                         self.mark_moved(name);

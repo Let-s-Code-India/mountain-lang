@@ -198,6 +198,8 @@ pub struct Codegen<'ctx, 'a> {
     closure_owner: String,
     /// Locals of a closure body that are pointers to a borrowed outer variable.
     ref_captured: std::collections::HashSet<usize>,
+    /// State of the generator function being generated (Phase 12 M2).
+    gen_ctx: Option<generator::GenCtx<'ctx>>,
 }
 
 fn is_signed(t: &Ty) -> bool {
@@ -323,6 +325,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             closure_counter: 0,
             closure_owner: String::new(),
             ref_captured: std::collections::HashSet::new(),
+            gen_ctx: None,
         }
     }
 
@@ -1132,7 +1135,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.cur_fn = Some(val);
         self.cur_self = w.self_ty.clone();
         self.cur_key = w.key.clone();
-        self.tail_calls = crate::codegen::tail::tail_calls_of(body, is_unit_like(&ret));
+        let gen_item = crate::types::generator_item(&ret).filter(|_| crate::generator::block_has_yield(body));
+        self.tail_calls = if gen_item.is_some() { Default::default() } else { crate::codegen::tail::tail_calls_of(body, is_unit_like(&ret)) };
         self.tail_params = Vec::new();
         self.ret_ty = ret.clone();
         self.locals = vec![HashMap::new()];
@@ -1143,6 +1147,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.alloca_bb = Some(alloca_bb);
         let body_bb = self.context.append_basic_block(val, "body");
         self.position(body_bb);
+        if let Some(item) = &gen_item {
+            self.gen_prologue(item)?;
+        }
         let mut llidx = 0u32;
         let mut ref_params: Vec<(usize, String, Ty, PointerValue<'ctx>)> = Vec::new();
         if let Some(kind) = self_kind {
@@ -1191,6 +1198,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
             }
         }
+        if gen_item.is_some() {
+            // lazy start: the ramp returns the frame before the body runs; dropping a generator
+            // that never started drops the parameters it owns
+            self.gen_suspend(false, true)?;
+        }
         // A self-recursive call in tail position jumps back here (Document 10 §6).
         let loop_bb = self.new_block("tail_loop");
         let entry_edge = self.builder.get_insert_block().unwrap();
@@ -1206,7 +1218,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             self.tail_params[idx] = TailSlot::Phi(phi);
         }
         let (v, bty) = self.gen_block(body)?;
-        if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+        if gen_item.is_some() {
+            if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                if self.dead || bty == Ty::Never {
+                    self.builder.build_unreachable()?;
+                } else {
+                    self.gen_finish_body()?;
+                    self.builder.build_unreachable()?;
+                }
+            }
+            self.gen_close()?;
+        } else if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
             if self.dead || bty == Ty::Never {
                 self.builder.build_unreachable()?;
             } else if is_unit_like(&ret) {
@@ -1271,5 +1293,6 @@ mod closure;
 mod drops;
 mod dynamic;
 mod expr;
+mod generator;
 mod print;
 pub(crate) mod tail;
