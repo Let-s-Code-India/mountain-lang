@@ -493,7 +493,8 @@ fn check_subcommand_runs_the_whole_front_end() {
 #[test]
 fn unsupported_features_give_clear_codegen_errors_not_crashes() {
     let cases = [
-        ("fn main() { spawn { println(1); }; }\n", "Phase"),
+        // `spawn` itself is supported since Phase 12 M3; `await` stays unsupported until M4
+        ("fn main() { let x = await 1; }\n", "Phase"),
     ];
     for (src, needle) in cases {
         let err = build_must_fail(src);

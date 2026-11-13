@@ -244,8 +244,8 @@ fn rejects_borrow_parameters_naming_the_parameter() {
 }
 
 #[test]
-fn rejects_question_mark_inside_a_generator_with_a_clear_message() {
-    rejects("fn g() -> Generator<i32> { let r: Result<i32, String> = Ok(1); let v = r?; yield v; }\nfn main() { }", "`?` inside a generator is not defined yet");
+fn rejects_question_mark_inside_a_generator_with_the_decided_message() {
+    rejects("fn g() -> Generator<i32> { let r: Result<i32, String> = Ok(1); let v = r?; yield v; }\nfn main() { }", "`?` cannot be used inside a generator (its result is a `Generator`); yield the error instead");
 }
 
 #[test]
@@ -268,6 +268,54 @@ fn rejects_next_on_a_binding_that_is_not_mut() {
 fn adapters_are_reported_as_phase_16() {
     rejects("fn g() -> Generator<i32> { yield 1; }\nfn main() { for v in g().take(3) { println(v); } }", "not yet supported by codegen — Phase 16");
     rejects("fn g() -> Generator<i32> { yield 1; }\nfn main() { let mut x = g(); let y = x.take(3); }", "not yet supported by codegen — Phase 16");
+}
+
+#[test]
+fn match_idiom_yields_the_error_instead_of_question_mark() {
+    let src = r#"
+fn parse(n: i32) -> Result<i32, String> { if n < 3 { return Ok(n * 10); } return Err(String::from("bad")); }
+fn results() -> Generator<Result<i32, String>> {
+    let mut i = 0;
+    while i < 6 {
+        let r = parse(i);
+        match r {
+            Ok(v) => yield Ok(v),
+            Err(e) => { yield Err(e); return; }
+        }
+        i += 1;
+    }
+}
+fn main() {
+    for r in results() {
+        match r { Ok(v) => println(v), Err(e) => println(e) }
+    }
+}
+"#;
+    assert_eq!(out(src), "0\n10\n20\nbad\n");
+}
+
+#[test]
+fn rejects_throw_inside_a_generator() {
+    rejects("fn g() -> Generator<i32> { yield 1; throw String::from(\"x\"); }\nfn main() { }", "`throw`");
+}
+
+#[test]
+fn method_returning_a_generator_with_by_value_fields() {
+    let src = r#"
+struct Counter { start: i32, label: String }
+impl Counter {
+    fn up(self, n: i32) -> Generator<i32> {
+        let mut i = 0;
+        println(self.label);
+        while i < n { yield self.start + i; i += 1; }
+    }
+}
+fn main() {
+    let c = Counter { start: 5, label: String::from("go") };
+    for x in c.up(3) { println(x); }
+}
+"#;
+    assert_eq!(out(src), "go\n5\n6\n7\n");
 }
 
 // ---------------------------------------------------------------- IR
