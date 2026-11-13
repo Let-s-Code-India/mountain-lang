@@ -194,6 +194,7 @@ pub struct Codegen<'ctx, 'a> {
     closure_infos: HashMap<usize, crate::borrow::ClosureInfo>,
     pending_closures: Vec<closure::PendingClosure<'ctx>>,
     fn_thunks: HashMap<String, FunctionValue<'ctx>>,
+    task_thunks: HashMap<String, FunctionValue<'ctx>>,
     closure_counter: usize,
     closure_owner: String,
     /// Locals of a closure body that are pointers to a borrowed outer variable.
@@ -322,6 +323,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             closure_infos: HashMap::new(),
             pending_closures: Vec::new(),
             fn_thunks: HashMap::new(),
+            task_thunks: HashMap::new(),
             closure_counter: 0,
             closure_owner: String::new(),
             ref_captured: std::collections::HashSet::new(),
@@ -1263,7 +1265,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let bb = self.context.append_basic_block(w, "entry");
         self.cur_fn = Some(w);
         self.builder.position_at_end(bb);
+        // a program that uses tasks/threads starts the runtime first and waits for every task after `main`
+        let uses_rt = self.module.get_function("__mtn_rt_spawn").is_some() || self.module.get_function("__mtn_rt_spawn_os").is_some() || self.module.get_function("__mtn_rt_pin_to_core").is_some();
+        if uses_rt {
+            let init = self.get_extern("__mtn_rt_init", None, &[], false);
+            self.builder.build_call(init, &[], "")?;
+        }
         let call = self.builder.build_call(mainf, &[], "")?;
+        if uses_rt {
+            let sd = self.get_extern("__mtn_rt_shutdown", None, &[], false);
+            self.builder.build_call(sd, &[], "")?;
+        }
         let i32t = self.context.i32_type();
         match &ret {
             Ty::Unit | Ty::Never => {
@@ -1294,5 +1306,6 @@ mod drops;
 mod dynamic;
 mod expr;
 mod generator;
+mod task;
 mod print;
 pub(crate) mod tail;

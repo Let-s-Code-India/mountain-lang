@@ -1,0 +1,10 @@
+// thread::spawnOS (Doc 12 §11.3): a dedicated OS thread; pinToCore is a hint (no-op if refused).
+fn main() {
+    let t = thread::spawnOS(move || {
+        pinToCore(0);
+        6 * 7
+    });
+    println(t.join());
+    let s = thread::spawnOS(move || { String::from("from an OS thread") });
+    println(s.join());
+}

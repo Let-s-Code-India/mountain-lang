@@ -1585,12 +1585,18 @@ impl Parser {
         if self.check_kw(Keyword::Spawn) {
             self.advance();
             let is_move = self.eat_kw(Keyword::Move);
-            let body = if self.check_delim(Delim::LBrace) {
-                SpawnBody::Block(self.parse_block()?)
+            let operand = if self.check_delim(Delim::LBrace) {
+                let body = self.parse_block()?;
+                Expr::Closure(Box::new(ClosureExpr { is_move, params: Vec::new(), return_type: None, body: ClosureBody::Block(body) }))
+            } else if self.check_op(Op::Pipe) || self.check_op(Op::OrOr) {
+                Expr::Closure(Box::new(self.parse_closure_expr(is_move)?))
+            } else if is_move {
+                return self.error("expected `{` or a closure after `spawn move`");
             } else {
-                SpawnBody::Closure(Box::new(self.parse_closure_expr(false)?))
+                // `spawn call(..)`: a call whose type is a `Future<T>` (Doc 23 §17.16)
+                self.parse_postfix()?
             };
-            return Ok(Expr::Spawn { is_move, body });
+            return Ok(Expr::Spawn(Box::new(operand)));
         }
         if self.check_kw(Keyword::Select) {
             return self.parse_select_expr();
@@ -1605,6 +1611,12 @@ impl Parser {
             self.advance();
             let e = self.parse_expr(0)?;
             return Ok(Expr::Throw(Box::new(e)));
+        }
+        if self.check_kw(Keyword::Yield) {
+            // `yield v` as an expression (e.g. a `match` arm: `Ok(v) => yield Ok(v),`)
+            self.advance();
+            let e = self.parse_expr(0)?;
+            return Ok(Expr::Yield(Box::new(e)));
         }
         if self.check_kw(Keyword::Return) {
             self.advance();
@@ -1991,7 +2003,7 @@ enum StmtOrTail {
 
 fn is_block_like(e: &Expr) -> bool {
     matches!(e, Expr::If(_) | Expr::Match(_) | Expr::Loop(_) | Expr::Block(_)
-        | Expr::Spawn { .. } | Expr::Select(_) | Expr::TryCatch { .. } | Expr::Unsafe(_))
+        | Expr::Spawn(_) | Expr::Select(_) | Expr::TryCatch { .. } | Expr::Unsafe(_))
 }
 
 fn is_primitive_type_name(s: &str) -> bool {

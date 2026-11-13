@@ -536,12 +536,6 @@ pub enum ClosureBody {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SpawnBody {
-    Block(Block),
-    Closure(Box<ClosureExpr>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
     Ident(String),
@@ -575,7 +569,11 @@ pub enum Expr {
     Index { expr: Box<Expr>, index: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Arg> },
     MethodCall { receiver: Box<Expr>, name: String, args: Vec<Arg>, gens: Vec<Type> },
-    Spawn { is_move: bool, body: SpawnBody },
+    /// `spawn { .. }` / `spawn move { .. }` / `spawn [move] || { .. }` (Doc 23 §9; Phase 12 M3): the
+    /// operand is always a closure *expression* (a block is wrapped into a zero-parameter closure
+    /// by the parser, `move` sets its `is_move`), so the closure machinery handles captures,
+    /// environment and drops. `spawn <call>` (a `Future<T>`, M4) holds the call expression.
+    Spawn(Box<Expr>),
     Select(Vec<SelectArm>),
     Query(QueryExpr),
     Yield(Box<Expr>),

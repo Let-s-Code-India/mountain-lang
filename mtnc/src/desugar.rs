@@ -131,7 +131,7 @@ pub(crate) fn block_children(b: &Block) -> Vec<Child<'_>> {
 pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) => out.push(ChildMut::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Spawn(x) => out.push(ChildMut::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter_mut() {
                 out.push(ChildMut::E(x));
@@ -224,7 +224,7 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
 pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) => out.push(Child::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Spawn(x) => out.push(Child::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter() {
                 out.push(Child::E(x));
@@ -380,6 +380,26 @@ fn jump_targets_inner_loop(labels: &[Option<String>], label: &Option<String>) ->
         None => !labels.is_empty(),
         Some(l) => labels.iter().any(|x| x.as_deref() == Some(l.as_str())),
     }
+}
+
+/// Names of the outer variables a closure literal uses (parameters and its own locals excluded);
+/// used by the `Send` analysis of tasks (Phase 12 M3). Function names are not variables.
+pub(crate) fn closure_free_names(c: &ClosureExpr, fn_names: HashSet<String>) -> Vec<String> {
+    let mut free = Free { callee_idents: Vec::new(), fn_names, scopes: vec![HashSet::new()], captured: Vec::new(), assigned: HashSet::new(), loop_labels: Vec::new(), errors: Vec::new(), escapes: Vec::new() };
+    for (p, _) in &c.params {
+        free.declare(p);
+    }
+    match &c.body {
+        ClosureBody::Expr(x) => free.expr(x),
+        ClosureBody::Block(b) => free.block(b),
+    }
+    let mut names: Vec<String> = free.captured.iter().map(|(n, _)| n.clone()).collect();
+    for (n, _) in &free.callee_idents {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+    names
 }
 
 impl Free {

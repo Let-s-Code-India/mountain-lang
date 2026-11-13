@@ -1,0 +1,47 @@
+// spawn/join (Doc 12 §11.1-11.2): tasks return values, owned data moves in, tasks spawn tasks.
+fn square(n: i64) -> i64 { return n * n; }
+
+// divide and conquer: every call spawns two tasks and joins them (nested spawn + join)
+fn sum_range(lo: i64, hi: i64) -> i64 {
+    if hi - lo <= 8 {
+        let mut s: i64 = 0;
+        let mut i = lo;
+        while i < hi {
+            s = s + i;
+            i = i + 1;
+        }
+        return s;
+    }
+    let mid = lo + (hi - lo) / 2;
+    let left = spawn move || { sum_range(lo, mid) };
+    let right = spawn move || { sum_range(mid, hi) };
+    return left.join() + right.join();
+}
+
+fn main() {
+    let h = spawn move || { 40 + 2 };
+    println(h.join());
+
+    let name = String::from("mountain");
+    let hs = spawn move { name };
+    println(hs.join());
+
+    let a = spawn move || { square(3) };
+    let b = spawn move || { square(4) };
+    let c = spawn move || { square(5) };
+    println(a.join() + b.join() + c.join());
+
+    let outer = spawn {
+        let inner = spawn { 7 };
+        inner.join() * 6
+    };
+    println(outer.join());
+
+    println(sum_range(0, 1000));
+
+    let detached = spawn { 1 + 1 };
+    drop(detached);
+    // an unjoined handle whose result owns heap memory: the runtime frees the result
+    let detached_text = spawn move { String::from("never taken") };
+    drop(detached_text);
+}

@@ -15,6 +15,9 @@ use inkwell::OptimizationLevel;
 use std::path::Path;
 use std::process::Command;
 
+/// The C runtime for tasks and threads (Phase 12 M3), embedded in the compiler.
+const RUNTIME_C: &str = include_str!("../runtime/mtn_rt.c");
+
 /// A program that passed every front-end check.
 pub struct Checked {
     pub program: Program,
@@ -62,6 +65,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let mut bc = BorrowChecker::new();
     bc.set_owning_exprs(tc.owning_expr_addrs());
     bc.set_fn_exprs(tc.fn_expr_addrs());
+    bc.set_join_receivers(tc.join_receiver_addrs());
     bc.check_program(&program);
     errors.extend(bc.errors.iter().map(|e| e.to_string()));
     if errors.is_empty() {
@@ -101,6 +105,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             let mut bc2 = BorrowChecker::new();
             bc2.set_owning_exprs(tc.owning_expr_addrs());
             bc2.set_fn_exprs(tc.fn_expr_addrs());
+            bc2.set_join_receivers(tc.join_receiver_addrs());
             bc2.check_program(&program);
             e2.extend(bc2.errors.iter().map(|e| e.to_string()));
             if !e2.is_empty() {
@@ -164,6 +169,7 @@ fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Mo
     let mut cbc = BorrowChecker::new();
     cbc.set_owning_exprs(tc.owning_expr_addrs());
     cbc.set_fn_exprs(tc.fn_expr_addrs());
+    cbc.set_join_receivers(tc.join_receiver_addrs());
     cbc.check_program(&program);
     cg.set_closure_infos(cbc.closure_info.clone());
     cg.generate(&program)?;
@@ -186,17 +192,37 @@ pub fn emit_ir(src: &str, opts: &Options) -> Result<String, Vec<String>> {
 /// No file is written unless every stage succeeds.
 pub fn build_executable(src: &str, out: &Path, opts: &Options) -> Result<(), Vec<String>> {
     let obj = out.with_extension("o");
-    with_module(src, opts, |m, tm| {
+    let uses_rt = with_module(src, opts, |m, tm| {
+        let uses_rt = m.get_function("__mtn_rt_init").is_some();
         // generators are LLVM coroutines: the coroutine passes must run even without optimization
         let pipeline = if opts.release { Some("default<O2>") } else if has_coroutines(m) { Some("default<O0>") } else { None };
         if let Some(p) = pipeline {
             m.run_passes(p, tm, inkwell::passes::PassBuilderOptions::create())
                 .map_err(|e| vec![format!("internal error: LLVM optimization failed: {}", e.to_string())])?;
         }
-        tm.write_to_file(m, FileType::Object, &obj).map_err(|e| vec![format!("could not write the object file: {}", e.to_string())])
+        tm.write_to_file(m, FileType::Object, &obj).map_err(|e| vec![format!("could not write the object file: {}", e.to_string())])?;
+        Ok(uses_rt)
     })?;
-    // Linking: system C compiler driver, no LTO (see PROGRESS.md).
-    let status = Command::new("cc").arg(&obj).arg("-o").arg(out).status();
+    // Linking: system C compiler driver, no LTO (see PROGRESS.md). A program that uses tasks or
+    // threads also gets the C runtime (Phase 12 M3), compiled here into a private temp dir; other
+    // programs link exactly as before (no runtime, no `-pthread`).
+    let mut rt_dir = None;
+    let mut cmd = Command::new("cc");
+    cmd.arg(&obj);
+    if uses_rt {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("mtnc-rt-{}-{}", std::process::id(), COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("mtn_rt.c"), RUNTIME_C)) {
+            let _ = std::fs::remove_file(&obj);
+            return Err(vec![format!("could not write the runtime sources: {}", e)]);
+        }
+        cmd.arg(dir.join("mtn_rt.c")).args(["-O2", "-pthread", "-Wall", "-Wextra", "-Werror"]);
+        rt_dir = Some(dir);
+    }
+    let status = cmd.arg("-o").arg(out).status();
+    if let Some(d) = rt_dir {
+        let _ = std::fs::remove_dir_all(d);
+    }
     let _ = std::fs::remove_file(&obj);
     match status {
         Ok(s) if s.success() => Ok(()),

@@ -648,7 +648,7 @@ pub fn register_item_context(items: &[&Item]) {
 
 /// `Box`/`Rc`/`Arc`/`Weak` are compiler-known generic heap types (Doc 6/13); they need no declaration.
 pub fn is_heap_generic(n: &str) -> bool {
-    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator")
+    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator" | "JoinHandle")
 }
 
 /// `Generator<T>` (Doc 9 §4): the owning handle of a heap-allocated generator frame.
@@ -1092,6 +1092,8 @@ pub struct TypeChecker {
     closure_ret_seen: Vec<Option<Ty>>,
     /// The item type of the generator function being checked (Phase 12 M2).
     cur_gen: Option<Ty>,
+    /// Receivers of `JoinHandle::join` (it consumes the handle; Phase 12 M3).
+    join_receivers: std::collections::HashSet<usize>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
     /// the "unresolved, stay silent" result. `check_propagate` consults
     /// it to tell "`?` applied to an unresolvable stdlib call" (silent)
@@ -1381,6 +1383,7 @@ impl TypeChecker {
             enums: HashMap::new(),
             closure_ret_seen: Vec::new(),
             cur_gen: None,
+            join_receivers: std::collections::HashSet::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
@@ -2822,8 +2825,29 @@ impl TypeChecker {
                 // `panic`/`assert`/`ensure` yield to a user-declared
                 // function of the same name (they are ordinary prelude
                 // names, not reserved by the grammar).
+                if let Expr::Path(segs) = callee.as_ref() {
+                    if segs.len() == 2 && segs[0] == "thread" && segs[1] == "spawnOS" {
+                        if args.len() != 1 {
+                            self.errors.push(TypeError { message: format!("`thread::spawnOS` takes exactly one argument (a closure), found {}", args.len()), context: ctx.into() });
+                            return Ty::Generic("JoinHandle".into(), vec![GenericArg::Type(Ty::Unit)]);
+                        }
+                        return self.check_task_spawn(&args[0].value, "thread::spawnOS", env, ctx);
+                    }
+                }
                 if let Expr::Ident(name) = callee.as_ref() {
                     match name.as_str() {
+                        "pinToCore" if !self.functions.contains_key(name.as_str()) => {
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`pinToCore` takes exactly one argument (the core number, `usize`), found {}", args.len()), context: ctx.into() });
+                            }
+                            for a in args {
+                                let at = self.check_expr(&a.value, Some(&Ty::Usize), env, ctx);
+                                if at != Ty::Usize && !ty_has_infer(&at) && at != Ty::Never {
+                                    self.errors.push(TypeError { message: format!("`pinToCore` needs a `usize` core number, found `{}`", at), context: ctx.into() });
+                                }
+                            }
+                            return Ty::Unit;
+                        }
                         "Ok" | "Err" | "Some" => {
                             return self.check_variant_ctor(name, args, expected, env, ctx);
                         }
@@ -3203,6 +3227,14 @@ impl TypeChecker {
                     let inner = match ga.first() { Some(GenericArg::Type(t)) => Some(t.clone()), _ => None };
                     let is_arc_weak = gn == "Weak" && matches!(ga.get(1), Some(GenericArg::Type(Ty::Named(k))) if k == "Arc");
                     match (gn.as_str(), name.as_str(), inner) {
+                        ("JoinHandle", "join", Some(t)) if args.is_empty() => {
+                            self.join_receivers.insert(receiver.as_ref() as *const Expr as usize);
+                            return t;
+                        }
+                        ("JoinHandle", other, Some(_)) => {
+                            self.errors.push(TypeError { message: format!("`JoinHandle` has only `join()` (found `{}`)", other), context: ctx.into() });
+                            return Ty::Unit;
+                        }
                         ("Generator", "next", Some(t)) if args.is_empty() => {
                             // `next` advances the generator: like a `borrow mut self` method it needs a `mut` binding
                             let mut root: &Expr = receiver;
@@ -3401,7 +3433,8 @@ impl TypeChecker {
             Expr::TryCatch { try_block, catch_var, catch_block } => {
                 self.check_try_catch(expr as *const Expr as usize, try_block, catch_var, catch_block, expected, env, ctx)
             }
-            Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_)
+            Expr::Spawn(inner) => self.check_task_spawn(inner, "spawn", env, ctx),
+            Expr::Select(_) | Expr::Query(_)
             | Expr::Styled { .. } | Expr::Layout { .. }
             | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => {
                 expected.cloned().unwrap_or(Ty::Unit)
@@ -4658,7 +4691,7 @@ impl TypeChecker {
             // Doc 9 §4 / §8.5 say general bodies support `?` but not what it does when the
             // function returns `Generator<T>`: reported, not guessed (PROGRESS.md Phase 12 M2).
             self.errors.push(TypeError {
-                message: "`?` inside a generator is not defined yet: a generator returns `Generator<T>`, not `Result`/`Option`, and Document 9 §4/§8.5 do not say where the error goes (pending a language decision, see PROGRESS.md Phase 12 M2)".into(),
+                message: "`?` cannot be used inside a generator (its result is a `Generator`); yield the error instead: `match r { Ok(v) => yield Ok(v), Err(e) => { yield Err(e); return; } }`".into(),
                 context: ctx.into(),
             });
             return match operand_ty {
@@ -5203,6 +5236,11 @@ impl TypeChecker {
         self.functions.keys().cloned().collect()
     }
 
+    /// Receiver expressions of `JoinHandle::join` calls (Phase 12 M3).
+    pub fn join_receiver_addrs(&self) -> std::collections::HashSet<usize> {
+        self.join_receivers.clone()
+    }
+
     /// Addresses of expressions whose type is a function type (Phase 12 M1).
     pub fn fn_expr_addrs(&self) -> std::collections::HashSet<usize> {
         self.expr_types.iter().filter(|(_, t)| matches!(t, Ty::Fn(..))).map(|(a, _)| *a).collect()
@@ -5689,5 +5727,177 @@ fn pattern_has_array(p: &Pattern) -> bool {
         Pattern::Array(..) => true,
         Pattern::Tuple(v) | Pattern::TupleStruct(_, v) | Pattern::Or(v) => v.iter().any(pattern_has_array),
         _ => false,
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 12 M3: tasks, `Send` and `Sync` (Document 12 §11.2, §11.3, §11.7)
+// ---------------------------------------------------------------------------
+
+/// `JoinHandle<T>` (Doc 12 §11.2).
+pub fn join_handle_item(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Generic(n, a) if n == "JoinHandle" && a.len() == 1 => match &a[0] {
+            GenericArg::Type(x) => Some(x.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does `ty` contain a reference that is not a `'static` string view?
+fn ty_borrows(ty: &Ty) -> bool {
+    match ty {
+        Ty::Ref(_, i) => !matches!(**i, Ty::Str),
+        Ty::Array(i) | Ty::Fixed(i, _) | Ty::OptionTy(i) | Ty::RawPtr(_, i) => ty_borrows(i),
+        Ty::Tuple(v) => v.iter().any(ty_borrows),
+        Ty::ResultTy(a, b) => ty_borrows(a) || ty_borrows(b),
+        Ty::Generic(_, a) => a.iter().any(|g| matches!(g, GenericArg::Type(t) if ty_borrows(t))),
+        _ => false,
+    }
+}
+
+impl TypeChecker {
+    /// Why `ty` is not `Send` (Doc 12 §11.7), or `None` when it is. The text names the type.
+    pub fn not_send_reason(&self, ty: &Ty) -> Option<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.auto_trait_walk(ty, true, &mut seen).map(|(off, why)| {
+            if &off == ty {
+                format!("`{}` cannot be sent between threads: {}", ty, why)
+            } else {
+                format!("`{}` cannot be sent between threads: it contains `{}`: {}", ty, off, why)
+            }
+        })
+    }
+
+    /// `want_send`: check `Send` (true) or `Sync` (false). `Some((offending type, why))` on failure.
+    fn auto_trait_walk(&self, ty: &Ty, want_send: bool, seen: &mut std::collections::HashSet<String>) -> Option<(Ty, String)> {
+        let kind = if want_send { "Send" } else { "Sync" };
+        match ty {
+            Ty::RawPtr(..) => Some((ty.clone(), format!("a raw pointer is not `{}`", kind))),
+            Ty::DynTrait(n) => {
+                if want_send {
+                    Some((ty.clone(), format!("`dyn {}` carries no `+ Send` guarantee (Document 7 §9.10)", n)))
+                } else {
+                    None
+                }
+            }
+            Ty::Fn(..) => {
+                if want_send {
+                    Some((ty.clone(), "a function value may capture data that is not `Send`; give the task the closure literal itself".into()))
+                } else {
+                    None
+                }
+            }
+            Ty::Ref(_, inner) => {
+                // `borrow T` is `Send` iff `T` is `Sync`
+                self.auto_trait_walk(inner, false, seen)
+            }
+            Ty::Array(i) | Ty::Fixed(i, _) | Ty::OptionTy(i) => self.auto_trait_walk(i, want_send, seen),
+            Ty::Tuple(v) => v.iter().find_map(|t| self.auto_trait_walk(t, want_send, seen)),
+            Ty::ResultTy(a, b) => self.auto_trait_walk(a, want_send, seen).or_else(|| self.auto_trait_walk(b, want_send, seen)),
+            Ty::Generic(n, args) => {
+                let targs: Vec<&Ty> = args.iter().filter_map(|g| if let GenericArg::Type(t) = g { Some(t) } else { None }).collect();
+                match n.as_str() {
+                    "Rc" => Some((ty.clone(), format!("its reference count is not atomic (use `Arc<T>` to share between threads)"))),
+                    "Weak" => {
+                        let is_arc = matches!(args.get(1), Some(GenericArg::Type(Ty::Named(k))) if k == "Arc");
+                        if is_arc {
+                            targs.first().and_then(|t| self.auto_trait_walk(t, true, seen).or_else(|| self.auto_trait_walk(t, false, seen)))
+                        } else {
+                            Some((ty.clone(), "a weak pointer to an `Rc` shares a reference count that is not atomic".into()))
+                        }
+                    }
+                    "Arc" => {
+                        let inner = targs.first()?;
+                        // `Arc<T>` is Send and Sync iff `T` is Send + Sync
+                        self.auto_trait_walk(inner, true, seen).or_else(|| self.auto_trait_walk(inner, false, seen)).map(|(off, why)| {
+                            if &off == *inner {
+                                (ty.clone(), format!("`Arc<T>` needs `{}` to be `Send + Sync`, but {}", inner, why))
+                            } else {
+                                (off, why)
+                            }
+                        })
+                    }
+                    "Box" | "Generator" | "JoinHandle" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
+                    _ => {
+                        let key = format!("{}#{}", ty, kind);
+                        if !seen.insert(key) {
+                            return None;
+                        }
+                        if let Some(sh) = self.structs.get(n) {
+                            let subst = generic_subst(&sh.generics, args);
+                            return sh.fields.iter().find_map(|(_, ft)| self.auto_trait_walk(&substitute_type_params(ft, &subst), want_send, seen));
+                        }
+                        if let Some(en) = self.enums.get(n) {
+                            let subst = generic_subst(&en.generics, args);
+                            return en.variants.iter().find_map(|(_, fs)| fs.iter().find_map(|ft| self.auto_trait_walk(&substitute_type_params(ft, &subst), want_send, seen)));
+                        }
+                        None
+                    }
+                }
+            }
+            Ty::Named(n) => {
+                if !seen.insert(format!("{}#{}", n, kind)) {
+                    return None;
+                }
+                if let Some(sh) = self.structs.get(n) {
+                    return sh.fields.iter().find_map(|(_, ft)| self.auto_trait_walk(ft, want_send, seen));
+                }
+                if let Some(en) = self.enums.get(n) {
+                    return en.variants.iter().find_map(|(_, fs)| fs.iter().find_map(|ft| self.auto_trait_walk(ft, want_send, seen)));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// `spawn <closure>` and `thread::spawnOS(<closure>)` (Doc 12 §11.2, §11.3): the operand must be
+    /// a zero-parameter closure literal (a block is wrapped by the parser); the task's captured
+    /// variables and its result must be `Send` and may not borrow. Yields `JoinHandle<T>`.
+    fn check_task_spawn(&mut self, operand: &Expr, what: &str, env: &mut Env, ctx: &str) -> Ty {
+        let handle = |t: Ty| Ty::Generic("JoinHandle".into(), vec![GenericArg::Type(t)]);
+        let Expr::Closure(c) = operand else {
+            // a function item or a `Future<T>` call
+            let t = self.check_expr(operand, None, env, ctx);
+            let msg = match &t {
+                Ty::Fn(ps, r) if ps.is_empty() && (matches!(operand, Expr::Path(_)) || matches!(operand, Expr::Ident(n) if env.get(n).is_none())) => {
+                    return handle((**r).clone());
+                }
+                _ => format!("`{}` takes a block, a closure literal (`|| {{ .. }}`) or the name of a function, found a value of type `{}`; spawning a `Future<T>` call arrives with `async` (Phase 12, milestone M4)", what, t),
+            };
+            self.errors.push(TypeError { message: msg, context: ctx.into() });
+            return handle(Ty::Unit);
+        };
+        if !c.params.is_empty() {
+            self.errors.push(TypeError { message: format!("the closure given to `{}` takes no parameters, but it declares {}", what, c.params.len()), context: ctx.into() });
+        }
+        let ct = self.check_expr(operand, None, env, ctx);
+        let result = match self.zonk(&ct) {
+            Ty::Fn(_, r) => *r,
+            _ => Ty::Unit,
+        };
+        // captured variables
+        for name in crate::desugar::closure_free_names(c, self.function_names()) {
+            let Some(vt) = env.get(&name).cloned() else { continue };
+            let vt = self.zonk(&vt);
+            if ty_borrows(&vt) {
+                self.errors.push(TypeError {
+                    message: format!("`{}` has type `{}`, a borrowed reference: the task given to `{}` may outlive the data it borrows; give the task an owned value or an `Arc`", name, vt, what),
+                    context: ctx.into(),
+                });
+                continue;
+            }
+            if let Some(why) = self.not_send_reason(&vt) {
+                self.errors.push(TypeError { message: format!("{} (captured as `{}` by the task given to `{}`; Document 12 §11.7)", why, name, what), context: ctx.into() });
+            }
+        }
+        let result = self.zonk(&result);
+        if let Some(why) = self.not_send_reason(&result) {
+            self.errors.push(TypeError { message: format!("{} (it is the result of the task given to `{}`; Document 12 §11.7)", why, what), context: ctx.into() });
+        }
+        handle(result)
     }
 }

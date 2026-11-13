@@ -576,7 +576,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Range { .. } => unsupported("range values outside a `for` loop", 16),
             Expr::Closure(c) => self.gen_closure(e, c),
-            Expr::Await(_) | Expr::Spawn { .. } => unsupported("`await`/`spawn` (async & concurrency)", 12),
+            Expr::Await(_) => unsupported("`await` (async)", 12),
+            Expr::Spawn(inner) => self.gen_spawn(inner, false),
             Expr::Select(_) => unsupported("`select` (channels)", 13),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
             Expr::Yield(inner) => {
@@ -1409,6 +1410,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return self.generator_next(receiver, &item, &whole_ty);
                 }
                 return unsupported(&format!("`Generator::{}` (iterator adapters such as `.take(n)` arrive with the library)", name), 16);
+            }
+            if let Some(item) = crate::types::join_handle_item(&b0) {
+                if name == "join" && args.is_empty() {
+                    return self.gen_join(receiver, &item);
+                }
             }
             if let Ty::Generic(gn, ga) = &b0 {
                 if matches!(gn.as_str(), "Rc" | "Arc" | "Weak") && matches!(name, "clone" | "downgrade" | "upgrade") {
@@ -2820,6 +2826,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         "panic" => return self.gen_panic(args),
                         "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
                         "drop" => return self.gen_drop_call(args),
+                        "pinToCore" => return self.gen_pin_to_core(&args[0].value),
                         "assert" => return self.gen_assert(args),
                         "ensure" => return self.gen_ensure(whole, args),
                         "print" | "println" | "eprint" | "eprintln" => return self.gen_print(name, args),
@@ -2849,6 +2856,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Err(CgErr(format!("unknown function `{}` (standard-library functions arrive with the prelude in Phase 16)", name)))
             }
             Expr::Path(path) => {
+                if path.len() == 2 && path[0] == "thread" && path[1] == "spawnOS" && args.len() == 1 {
+                    return self.gen_spawn(&args[0].value, true);
+                }
                 if let [tn, fname] = path.as_slice() {
                     let ty = self.ty_of(whole)?;
                     // enum variant constructor `Enum::Variant(..)`

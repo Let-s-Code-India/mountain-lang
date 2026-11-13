@@ -240,6 +240,7 @@ pub struct BorrowChecker {
     owning: std::collections::HashSet<usize>,
     /// Addresses of expressions of function type `fn(..) -> ..` (Phase 12 M1).
     fn_exprs: std::collections::HashSet<usize>,
+    join_receivers: std::collections::HashSet<usize>,
     /// Capture analysis of every closure literal, by AST address (Phase 12 M1).
     pub closure_info: HashMap<usize, ClosureInfo>,
     pub errors: Vec<BorrowError>,
@@ -253,12 +254,17 @@ impl BorrowChecker {
             functions: HashMap::new(),
             owning: std::collections::HashSet::new(),
             fn_exprs: std::collections::HashSet::new(),
+            join_receivers: std::collections::HashSet::new(),
             closure_info: HashMap::new(),
             errors: Vec::new(),
         }
     }
 
     /// Tells the pass which expressions have a function type (Phase 12 M1).
+    pub fn set_join_receivers(&mut self, s: std::collections::HashSet<usize>) {
+        self.join_receivers = s;
+    }
+
     pub fn set_fn_exprs(&mut self, fn_exprs: std::collections::HashSet<usize>) {
         self.fn_exprs = fn_exprs;
     }
@@ -1350,9 +1356,21 @@ impl<'a> FnChecker<'a> {
                 self.check_expr(callee, block, idx);
                 self.check_call_args(args, block, idx);
                 self.forbid_escaping_borrowing_closure(expr);
+                if let Expr::Path(segs) = callee.as_ref() {
+                    if segs.len() == 2 && segs[0] == "thread" && segs[1] == "spawnOS" {
+                        if let Some(a) = args.first() {
+                            self.check_task_closure(&a.value, "thread::spawnOS");
+                        }
+                    }
+                }
             }
             Expr::MethodCall { receiver, args, .. } => {
-                self.check_expr(receiver, block, idx);
+                if self.checker.join_receivers.contains(&(receiver.as_ref() as *const Expr as usize)) {
+                    // `JoinHandle::join` consumes the handle: a second `join` is a use after move
+                    self.check_moving_operand(receiver, block, idx);
+                } else {
+                    self.check_expr(receiver, block, idx);
+                }
                 self.check_call_args(args, block, idx);
                 self.forbid_escaping_borrowing_closure(expr);
             }
@@ -1449,7 +1467,27 @@ impl<'a> FnChecker<'a> {
             // later phases (spawn/select/query — Phase 12/18/20); still
             // safe to leave unchecked here since Phase 6's exit
             // criteria (Document 6 §8) never exercises them.
-            Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_) => {}
+            Expr::Spawn(inner) => {
+                self.check_expr(inner, block, idx);
+                self.check_task_closure(inner, "spawn");
+            }
+            Expr::Select(_) | Expr::Query(_) => {}
+        }
+    }
+
+    /// A closure handed to `spawn` / `thread::spawnOS` becomes a task that may outlive the frame it
+    /// was written in (Doc 10 §4.3, Doc 12 §11.7): it may not borrow a local of that frame.
+    fn check_task_closure(&mut self, inner: &Expr, what: &str) {
+        let Expr::Closure(_) = inner else { return };
+        let key = inner as *const Expr as usize;
+        let Some(info) = self.closure_info.get(&key).cloned() else { return };
+        for (name, mode) in &info.captures {
+            if !matches!(mode, CapMode::Move) {
+                self.err(format!(
+                    "this task may outlive `{}`: the closure given to `{}` borrows the local `{}`; write `move` (the task then owns its own copy or the moved value)",
+                    name, what, name
+                ));
+            }
         }
     }
 
@@ -1714,7 +1752,8 @@ fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
         // Conservatively "might read anything" -- see this function's
         // doc comment above for why `false` here would now be a real
         // soundness gap rather than merely a precision cost.
-        Expr::Spawn { .. } | Expr::Select(_) | Expr::Query(_) => true,
+        Expr::Spawn(inner) => expr_reads_ident(inner, name),
+        Expr::Select(_) | Expr::Query(_) => true,
     }
 }
 

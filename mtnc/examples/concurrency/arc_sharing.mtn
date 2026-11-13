@@ -1,0 +1,19 @@
+// Several tasks read one value through Arc (Doc 12 §11.7: Arc<T> is Send when T is Send + Sync).
+fn main() {
+    let shared = Arc::new(String::from("shared text"));
+    let nums = Arc::new(100);
+    let s1 = shared.clone();
+    let n1 = nums.clone();
+    let t1 = spawn move { *n1 + 1 };
+    let s2 = shared.clone();
+    let n2 = nums.clone();
+    let t2 = spawn move { *n2 + 2 };
+    let t3 = spawn move { s2 };
+    let t4 = spawn move { s1 };
+    println(t1.join() + t2.join());
+    let a = t3.join();
+    let b = t4.join();
+    println(*a);
+    println(*b);
+    println(Arc::strongCount(borrow shared));
+}
