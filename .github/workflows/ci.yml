@@ -52,6 +52,12 @@ jobs:
         # uploaded through the GitHub web UI loses its executable bit.
         run: bash scripts/valgrind_memory_examples.sh target/debug/mtnc
 
+      - name: Concurrency examples under valgrind (no leaks, no invalid memory access)
+        # Phase 12: every program in examples/concurrency/ (closures, generators, tasks,
+        # threads, async) is built with mtnc and run under valgrind. `bash` on purpose
+        # (the web upload loses the executable bit).
+        run: bash scripts/valgrind_concurrency_examples.sh target/debug/mtnc
+
       - name: Smoke test — mtnc --version
         run: cargo run -- --version
 
