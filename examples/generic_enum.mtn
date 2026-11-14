@@ -1,0 +1,24 @@
+enum Maybe<T> { Just(T), Nothing }
+enum Either<L, R> { Left(L), Right(R) }
+fn describe(m: Maybe<i32>) -> i32 {
+    match m {
+        Maybe::Just(v) => v,
+        Maybe::Nothing => 0,
+    }
+}
+fn main() {
+    let a = Maybe::Just(5);
+    let b: Maybe<i32> = Maybe::Nothing;
+    println(describe(a));
+    println(describe(b));
+    let f = Maybe::Just(2.5);
+    match f {
+        Maybe::Just(x) => println(x),
+        Maybe::Nothing => println(0.0),
+    }
+    let e: Either<i32, f64> = Either::Right(1.5);
+    match e {
+        Either::Left(l) => println(l),
+        Either::Right(r) => println(r),
+    }
+}

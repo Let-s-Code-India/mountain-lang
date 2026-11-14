@@ -1,0 +1,20 @@
+fn identity<const N: usize>() -> [i32; N] { return [0; N]; }
+fn total<const N: usize>(a: [i32; N]) -> i32 {
+    let mut s = 0;
+    let mut i: usize = 0;
+    while i < N { s += a[i]; i += 1; }
+    return s;
+}
+fn fill<T, const N: usize>(x: T) -> [T; N] { return [x; N]; }
+fn main() {
+    let z: [i32; 3] = identity();
+    println(z[2]);
+    let w = identity::<5>();
+    println(w[4]);
+    let a: [i32; 4] = [1, 2, 3, 4];
+    println(total(a));
+    let f: [f64; 2] = fill(1.5);
+    println(f[1]);
+    let g = fill::<i32, 3>(9);
+    println(g[0] + g[2]);
+}

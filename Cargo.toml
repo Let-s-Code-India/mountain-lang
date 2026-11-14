@@ -1,0 +1,23 @@
+[package]
+name = "mtnc"
+version = "1.0.0-dev"
+edition = "2021"
+description = "Compiler for the Mountain programming language (mtnc)"
+
+# Dependencies: `inkwell` (safe LLVM bindings, mandated by Document 25 §1) is the
+# only external crate. It needs LLVM 18 (set LLVM_SYS_181_PREFIX; CI installs
+# llvm-18-dev). Everything else (lexer, parser, checkers, TOML subset) is
+# hand-written.
+
+[dependencies]
+inkwell = { version = "0.10", features = ["llvm18-1"] }
+
+[[bin]]
+name = "mtnc"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3

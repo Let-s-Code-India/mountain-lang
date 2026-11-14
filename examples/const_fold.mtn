@@ -1,0 +1,15 @@
+// `static` initializers with constant arithmetic and comparisons.
+const BASE: i32 = 6;
+const SMALL: u8 = 200;
+static A: i32 = BASE * 7 - 2;
+static B: u8 = SMALL + 55;
+static C: bool = BASE > 3 && !(SMALL == 0);
+static D: f64 = 1.5 * 4.0 + 0.5;
+static E: i64 = (1 << 40) | 5;
+static F: u32 = 7 as u32 * 3;
+static G: i32 = -BASE;
+static H: [i32; 2] = [BASE + 1, BASE * 2];
+static I: (i32, bool) = (BASE % 4, 3 < 2);
+fn main() {
+    println(A); println(B); println(C); println(D); println(E); println(F); println(G); println(H[0] + H[1]); println(I.0); println(I.1);
+}

@@ -1,0 +1,40 @@
+// `?`, `return` of a value and Result in async code (Doc 11 §3, Doc 12 §11.4).
+async fn half(n: i32) -> Result<i32, String> {
+    await yieldNow();
+    if n % 2 != 0 {
+        return Err(String::from("odd number"));
+    }
+    return Ok(n / 2);
+}
+
+async fn quarter(n: i32) -> Result<i32, String> {
+    let h = await half(n)?;
+    let q = await half(h)?;
+    return Ok(q);
+}
+
+async fn report(n: i32) {
+    match await quarter(n) {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+}
+
+async fn run() -> Result<(), String> {
+    let ok = await quarter(12)?;
+    println(ok);
+    let bad = await quarter(10)?;
+    println(bad);
+    return Ok(());
+}
+
+async fn main() {
+    await report(8);
+    await report(6);
+    await report(7);
+    // `?` inside `run` stops at the first Err and hands it back here
+    match await run() {
+        Ok(_) => println(0),
+        Err(e) => println(e),
+    }
+}

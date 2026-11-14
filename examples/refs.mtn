@@ -1,0 +1,40 @@
+// References (Document 6 §3, Document 10 §2): `borrow` / `borrow mut` parameters.
+struct Counter {
+    value: i32,
+    label: i32,
+}
+
+fn read_only(borrow c: Counter) -> i32 {
+    c.value + c.label
+}
+
+fn bump(borrow mut c: Counter) {
+    c.value += 1;
+}
+
+fn add_to(borrow mut n: i32, by: i32) {
+    n += by;
+}
+
+fn swap_fields(borrow mut c: Counter) {
+    let t = c.value;
+    c.value = c.label;
+    c.label = t;
+}
+
+fn main() {
+    let mut c = Counter { value: 10, label: 3 };
+    println(read_only(borrow c));
+    bump(borrow mut c);
+    bump(borrow mut c);
+    println(c.value);
+    let mut total = 100;
+    add_to(borrow mut total, 5);
+    add_to(borrow mut total, 7);
+    println(total);
+    swap_fields(borrow mut c);
+    println(c.value);
+    println(c.label);
+    let r = borrow c;
+    println(r.value + r.label);
+}

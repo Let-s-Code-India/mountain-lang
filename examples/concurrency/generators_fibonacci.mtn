@@ -1,0 +1,28 @@
+// Document 9 §4: a generator suspends at each `yield` and resumes on the next `next()`.
+fn fibonacci() -> Generator<u64> {
+    let mut a: u64 = 0;
+    let mut b: u64 = 1;
+    loop {
+        yield a;
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+}
+
+fn main() {
+    let mut n = 0;
+    for value in fibonacci() {
+        println(value);
+        n += 1;
+        if n == 10 {
+            break;
+        }
+    }
+    let mut g = fibonacci();
+    g.next();
+    match g.next() {
+        Some(v) => println(v),
+        None => println("finished"),
+    }
+}

@@ -1,0 +1,71 @@
+enum Shape { Named(String), Pair(String, String), Empty }
+struct Node { val: i32, next: Option<Box<Node>> }
+struct Wrap { inner: Box<Person> }
+struct Person { name: String, age: i32 }
+
+fn describe(s: Shape) -> i32 {
+    match s {
+        Shape::Named(n) => { println(n); return 1; }
+        Shape::Pair(a, b) => { println(a); return 2; }
+        Shape::Empty => 0,
+    }
+}
+
+fn peek(s: borrow Shape) -> i32 {
+    match s {
+        Shape::Named(_) => 1,
+        _ => 2,
+    }
+}
+
+fn build(n: i32) -> Option<Box<Node>> {
+    if n == 0 { return None; }
+    return Some(Box::new(Node { val: n, next: build(n - 1) }));
+}
+
+fn length(head: borrow Option<Box<Node>>) -> i32 {
+    match head {
+        Some(b) => 1 + length(borrow b.next),
+        None => 0,
+    }
+}
+
+fn parse(n: i32) -> Result<String, i32> {
+    if n < 0 { return Err(n); }
+    return Ok(String::from("fine"));
+}
+
+fn tryit(n: i32) -> Result<i32, i32> {
+    let keep = String::from("keep");
+    let s = parse(n)?;
+    println(s);
+    println(keep);
+    return Ok(1);
+}
+
+fn acc(n: i32, s: String) -> i32 {
+    if n == 0 { return 0; }
+    return acc(n - 1, s);
+}
+
+fn main() {
+    println(describe(Shape::Named(String::from("n"))));
+    println(describe(Shape::Pair(String::from("p"), String::from("q"))));
+    println(describe(Shape::Empty));
+    let sh = Shape::Named(String::from("keepme"));
+    println(peek(borrow sh));
+    let list = build(5);
+    println(length(borrow list));
+    let w = Wrap { inner: Box::new(Person { name: String::from("w"), age: 9 }) };
+    println(w.inner.age);
+    println(w.inner.name);
+    let bx = Box::new(Person { name: String::from("moved"), age: 1 });
+    let p2 = *bx;
+    println(p2.name);
+    match tryit(1) { Ok(x) => println(x), Err(e) => println(e) }
+    match tryit(0 - 5) { Ok(x) => println(x), Err(e) => println(e) }
+    println(acc(1000, String::from("tail")));
+    let mut q = Person { name: String::from("old"), age: 2 };
+    q.name = String::from("new");
+    println(q.name);
+}

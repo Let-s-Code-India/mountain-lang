@@ -1,0 +1,41 @@
+// A closure that owns a String / Box / Rc is move-only and drops its captures exactly once.
+struct Config { name: String, level: i32 }
+
+fn make(n: String, l: i32) -> Config {
+    return Config { name: n, level: l };
+}
+
+fn consume(f: fn() -> i32) -> i32 {
+    return f();
+}
+
+fn main() {
+    // an owned struct (with a String inside) moved into a closure that is called twice
+    let c = make(String::from("cfg"), 3);
+    let level = move || c.level;
+    println(level());
+    println(level());
+
+    // an owned Box captured by move
+    let b = Box::new(make(String::from("boxed"), 41));
+    let inc = move || b.level + 1;
+    println(inc());
+
+    // a closure passed by value to a callee that drops it
+    let t = make(String::from("passed"), 9);
+    let f = move || t.level;
+    println(consume(f));
+
+    // a closure dropped without ever being called
+    let u = make(String::from("never called"), 1);
+    let unused = move || u.level;
+
+    // Rc: the closure owns one count, which is released when the closure is dropped
+    let r = Rc::new(make(String::from("shared"), 5));
+    let r2 = r.clone();
+    println(Rc::strongCount(borrow r));
+    let g = move || r2.level + 1;
+    println(g());
+    drop(g);
+    println(Rc::strongCount(borrow r));
+}

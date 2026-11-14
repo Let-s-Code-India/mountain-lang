@@ -1,0 +1,23 @@
+// Arc: atomic counts, clone/drop, Weak<T, Arc> upgrade after the last strong owner is gone.
+struct Config { name: String, level: i32 }
+
+fn level(c: borrow Arc<Config>) -> i32 { return c.level; }
+
+fn main() {
+    let s = Arc::new(Config { name: String::from("cfg"), level: 3 });
+    let t = s.clone();
+    let aw: Weak<Config, Arc> = s.downgrade();
+    println(Arc::strongCount(borrow s));
+    println(level(borrow t));
+    drop(t);
+    println(Arc::strongCount(borrow s));
+    match aw.upgrade() {
+        Some(x) => println(x.name),
+        None => println(0),
+    }
+    drop(s);
+    match aw.upgrade() {
+        Some(x) => println(1),
+        None => println(0),
+    }
+}

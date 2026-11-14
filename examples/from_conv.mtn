@@ -1,0 +1,53 @@
+// `?` with `From` error conversion (Document 11 §2), also inside `try` and for `Option`.
+enum IoError { NotFound, Denied(i32) }
+enum ParseError { Bad(i32) }
+enum AppError { Io(i32), Parse(i32) }
+impl From<IoError> for AppError {
+    fn from(e: IoError) -> AppError {
+        match e { IoError::NotFound => AppError::Io(0), IoError::Denied(c) => AppError::Io(c) }
+    }
+}
+impl From<ParseError> for AppError {
+    fn from(e: ParseError) -> AppError { match e { ParseError::Bad(n) => AppError::Parse(n) } }
+}
+fn read(k: i32) -> Result<i32, IoError> { if k == 0 { return Err(IoError::NotFound); } if k < 0 { return Err(IoError::Denied(k)); } Ok(k) }
+fn parse(v: i32) -> Result<i32, ParseError> { if v > 100 { return Err(ParseError::Bad(v)); } Ok(v + 1) }
+fn load(k: i32) -> Result<i32, AppError> {
+    let a = read(k)?;
+    let b = parse(a * 10)?;
+    Ok(b)
+}
+fn code(r: Result<i32, AppError>) -> i32 {
+    match r { Ok(v) => v, Err(AppError::Io(c)) => 1000 + c, Err(AppError::Parse(n)) => 2000 + n }
+}
+fn finish(a: i32) -> Result<i32, AppError> {
+    let b = parse(a * 10)?;
+    Ok(b)
+}
+fn guarded(k: i32) -> i32 {
+    try {
+        let a = read(k)?;
+        let b = finish(a)?;
+        b
+    } catch (e) {
+        match e { AppError::Io(c) => 500 + c, AppError::Parse(n) => 600 + n }
+    }
+}
+fn first(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+    let x = a?;
+    let y = b?;
+    Some(x + y)
+}
+fn main() {
+    println(code(load(3)));
+    println(code(load(0)));
+    println(code(load(-7)));
+    println(code(load(20)));
+    println(guarded(2));
+    println(guarded(-3));
+    println(guarded(50));
+    println(first(Some(1), Some(2)) ?? -1);
+    println(first(None, Some(2)) ?? -1);
+    let e = AppError::from(ParseError::Bad(4));
+    println(code(Err(e)));
+}

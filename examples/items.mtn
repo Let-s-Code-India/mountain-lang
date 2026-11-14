@@ -1,0 +1,30 @@
+// const, static, type items and items nested inside functions (Document 3 Category A).
+const LIMIT: i32 = 10;
+const DOUBLE_LIMIT: i32 = LIMIT * 2;
+static GREETING: &str = "static string";
+static PRIMES: [i32; 4] = [2, 3, 5, 7];
+static ORIGIN: (i32, i32) = (3, -4);
+
+type Score = i64;
+type Pair = (Score, Score);
+
+fn total(p: Pair) -> Score {
+    p.0 + p.1
+}
+
+fn main() {
+    println(LIMIT);
+    println(DOUBLE_LIMIT);
+    println(GREETING);
+    println(PRIMES[2]);
+    println(ORIGIN.0 + ORIGIN.1);
+    let s: Score = 40;
+    println(total((s, 2)));
+
+    fn helper(x: i32) -> i32 {
+        x * LIMIT
+    }
+    println(helper(4));
+    let sized: [i32; LIMIT] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    println(sized[9]);
+}

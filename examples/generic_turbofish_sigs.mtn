@@ -1,0 +1,16 @@
+struct Wrapper<T> { value: T }
+impl<T> Wrapper<T> {
+    fn empty_like(v: T) -> Wrapper<T> { return Wrapper { value: v }; }
+    fn id(borrow self) -> i32 { return 1; }
+}
+struct Pair<A, B> { first: A, second: B }
+fn firstOf(p: Pair<i32, f64>) -> i32 { return p.first; }
+fn mk() -> Pair<i32, f64> { return Pair { first: 8, second: 1.0 }; }
+fn gen<T>(w: Wrapper<T>) -> i32 { return w.id(); }
+fn main() {
+    let a = Wrapper::<i64>::empty_like(5);
+    println(a.value);
+    println(firstOf(mk()));
+    println(gen(Wrapper { value: 3 }));
+    println(gen(Wrapper { value: 2.5 }));
+}

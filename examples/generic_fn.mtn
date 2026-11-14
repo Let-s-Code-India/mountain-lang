@@ -1,0 +1,17 @@
+trait Comparable {
+    fn compareTo(borrow self, other: i32) -> i32;
+}
+fn pick<T>(a: T, b: T, first: bool) -> T {
+    if first { return a; }
+    return b;
+}
+fn twice<T>(x: T, y: T) -> T {
+    return pick(x, y, true);
+}
+fn main() {
+    let a = pick(3, 4, false);
+    let b = pick(1.5, 2.5, true);
+    let c = pick::<i64>(7, 8, false);
+    let d = twice(9, 10);
+    println(a); println(b); println(c); println(d);
+}

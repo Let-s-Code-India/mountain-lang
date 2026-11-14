@@ -1,0 +1,40 @@
+// Generic traits (Doc 7 §4, Doc 8 §5 contrast): several impls of one trait on one type are
+// told apart by argument types and by the expected result type.
+trait Convert<T> { fn convert(borrow self) -> T; }
+impl Convert<f64> for i32 { fn convert(borrow self) -> f64 { return 1.5; } }
+impl Convert<bool> for i32 { fn convert(borrow self) -> bool { return true; } }
+
+trait Mapper<A, B> {
+    fn apply(borrow self, x: A) -> B;
+    fn twice(borrow self, x: A, y: A) -> i32 { return 2; }
+}
+struct Doubler { k: i32 }
+impl Mapper<i32, i32> for Doubler { fn apply(borrow self, x: i32) -> i32 { return x * self.k; } }
+impl Mapper<f64, f64> for Doubler { fn apply(borrow self, x: f64) -> f64 { return x * 2.0; } }
+
+trait Source<T> { fn get(borrow self) -> T; fn describe(borrow self) -> i32 { return 1; } }
+struct Holder<T> { v: T }
+impl<T> Source<T> for Holder<T> { fn get(borrow self) -> T { return self.v; } }
+struct Box1 { v: i32 }
+impl Source<i32> for Box1 { fn get(borrow self) -> i32 { return self.v; } }
+fn pull<S: Source<i32>>(s: borrow S) -> i32 { return s.get(); }
+
+fn main() {
+    let x: i32 = 3;
+    let f: f64 = x.convert();
+    let b: bool = x.convert();
+    println(f);
+    println(b);
+    let d = Doubler { k: 3 };
+    let a: i32 = d.apply(7);
+    let c: f64 = d.apply(1.25);
+    println(a);
+    println(c);
+    println(d.twice(1, 2));
+    let h = Holder { v: 9 };
+    let g: i32 = h.get();
+    println(g);
+    println(h.describe());
+    let bx = Box1 { v: 8 };
+    println(pull(borrow bx));
+}

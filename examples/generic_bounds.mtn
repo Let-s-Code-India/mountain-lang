@@ -1,0 +1,13 @@
+trait Ranked { fn rank(borrow self) -> i32; }
+impl Ranked for i32 { fn rank(borrow self) -> i32 { return self; } }
+impl Ranked for f64 { fn rank(borrow self) -> i32 { return self as i32; } }
+fn larger<T>(a: T, b: T) -> T where T: Ranked {
+    if a.rank() > b.rank() { return a; }
+    return b;
+}
+fn larger2<T: Ranked>(a: T, b: T) -> T {
+    if a.rank() > b.rank() { return a; }
+    return b;
+}
+fn via<T: Ranked>(a: T, b: T) -> T { return larger(a, b); }
+fn main() { println(larger(3, 9)); println(larger(2.5, 1.5)); println(larger2(8, 1)); println(via(4, 2)); }

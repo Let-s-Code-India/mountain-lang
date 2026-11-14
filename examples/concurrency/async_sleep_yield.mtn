@@ -1,0 +1,26 @@
+// sleepMs and yieldNow (Doc 12 §3): a sleeping task does not block a worker.
+async fn nap(name: String, ms: u64) -> u64 {
+    await sleepMs(ms);
+    println(name);
+    return ms;
+}
+
+async fn spin(times: i32) -> i32 {
+    let mut k = 0;
+    while k < times {
+        await yieldNow();
+        k = k + 1;
+    }
+    return k;
+}
+
+async fn main() {
+    let (a, b, c) = await join(nap(String::from("slow"), 40), nap(String::from("fast"), 5), spin(50));
+    println(a + b);
+    println(c);
+    // many sleepers and many yielders at once
+    let s1 = spawn nap(String::from("one"), 1);
+    let s2 = spawn spin(10);
+    println(await s1);
+    println(await s2);
+}

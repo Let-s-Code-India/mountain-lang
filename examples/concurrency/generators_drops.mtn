@@ -1,0 +1,98 @@
+// Generators: heap frame, owned locals alive across `yield`, early stop, nested generators.
+fn words(n: i32) -> Generator<String> {
+    let owned = Box::new(n);
+    let mut i = 0;
+    while i < *owned {
+        let keep = String::from("kept");
+        yield keep;
+        let s = String::from("item");
+        if i == 1 {
+            i += 1;
+            continue;
+        }
+        yield s;
+        i += 1;
+    }
+    println("finished");
+}
+
+fn counter(rc: Rc<i32>) -> Generator<i32> {
+    let mine = rc;
+    let mut i = 0;
+    loop {
+        yield i + *mine;
+        i += 1;
+    }
+}
+
+fn evens(limit: i32) -> Generator<i32> {
+    let mut i = 0;
+    while i < limit {
+        if i % 2 == 0 {
+            yield i;
+        }
+        i += 1;
+    }
+}
+
+fn outer() -> Generator<i32> {
+    yield -1;
+    for x in evens(7) {
+        yield x * 10;
+    }
+    yield -2;
+}
+
+fn early(stop: bool) -> Generator<i32> {
+    yield 1;
+    if stop {
+        return;
+    }
+    yield 2;
+}
+
+fn main() {
+    // stopped midway while the frame holds a Box and Strings
+    let mut g = words(3);
+    match g.next() {
+        Some(s) => println(s),
+        None => println("none"),
+    }
+
+    // a partially consumed Rc: the frame owns one count; dropping the generator releases it
+    let shared = Rc::new(100);
+    let c = counter(shared.clone());
+    println(Rc::strongCount(borrow shared));
+    let mut k = 0;
+    for v in c {
+        println(v);
+        k += 1;
+        if k == 3 {
+            break;
+        }
+    }
+    println(Rc::strongCount(borrow shared));
+
+    // never started, then dropped
+    let never = words(2);
+    let c2 = counter(shared.clone());
+    println(Rc::strongCount(borrow shared));
+    drop(c2);
+    println(Rc::strongCount(borrow shared));
+
+    // run to the end
+    for s in words(2) {
+        println(s);
+    }
+
+    // finished generators keep returning None
+    let mut done = early(true);
+    match done.next() { Some(_) => println("some"), None => println("none") }
+    match done.next() { Some(_) => println("some"), None => println("none") }
+    match done.next() { Some(_) => println("some"), None => println("none") }
+
+    // nested generators
+    for x in outer() {
+        println(x);
+    }
+}

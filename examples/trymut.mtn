@@ -1,0 +1,55 @@
+// `try` blocks that assign or mutably borrow outer locals (Document 11 §8.9):
+// those locals are handed to the synthesized wrapper as `borrow mut` parameters.
+enum Failure {
+    Odd(i32),
+}
+
+struct Stats {
+    ok: i32,
+    failed: i32,
+}
+
+fn check(n: i32) -> Result<i32, Failure> {
+    if n % 2 == 1 {
+        return Err(Failure::Odd(n));
+    }
+    Ok(n / 2)
+}
+
+fn bump(borrow mut s: Stats) {
+    s.ok += 1;
+}
+
+fn main() {
+    let mut total = 0;
+    let mut stats = Stats { ok: 0, failed: 0 };
+    let mut i = 0;
+    while i < 6 {
+        try {
+            let half = check(i)?;
+            total += half;
+            bump(borrow mut stats);
+        } catch (e) {
+            match e {
+                Failure::Odd(n) => {
+                    stats.failed += 1;
+                    total -= n;
+                }
+            }
+        }
+        i += 1;
+    }
+    println(total);
+    println(stats.ok);
+    println(stats.failed);
+    let limit = 4;
+    let mut last = -1;
+    let r = try {
+        last = check(limit)?;
+        last * 10
+    } catch (e) {
+        0
+    };
+    println(r);
+    println(last);
+}

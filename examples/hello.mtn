@@ -1,0 +1,4 @@
+// Phase 10 milestone: a real Mountain program compiled to a native binary.
+fn main() {
+    println("Hello, Mountain!");
+}

@@ -1,0 +1,33 @@
+// `From<T>` as an ordinary generic trait (Doc 11 §2) and the built-in `Into<U>`: `x.into()`
+// is `U::from(x)` with `U` taken from the expected type.
+struct Meters { v: i32 }
+struct Feet { v: i32 }
+struct Wrap { w: i32 }
+impl From<Feet> for Meters { fn from(f: Feet) -> Meters { return Meters { v: f.v / 3 }; } }
+impl From<i32> for Meters { fn from(n: i32) -> Meters { return Meters { v: n }; } }
+impl From<i32> for Wrap { fn from(n: i32) -> Wrap { return Wrap { w: n }; } }
+impl From<bool> for Wrap { fn from(b: bool) -> Wrap { if b { return Wrap { w: 1 }; } return Wrap { w: 0 }; } }
+
+fn toMeters<T: Into<Meters>>(x: T) -> Meters { return x.into(); }
+fn make<T>(x: T) -> i32 where T: Into<Wrap> { let w: Wrap = x.into(); return w.w; }
+
+fn main() {
+    let a = Meters::from(Feet { v: 9 });
+    let b = Meters::from(4);
+    println(a.v);
+    println(b.v);
+    let c: Meters = Feet { v: 30 }.into();
+    println(c.v);
+    let d: Meters = 7.into();
+    println(d.v);
+    println(toMeters(Feet { v: 12 }).v);
+    println(make(5));
+    println(make(true));
+    let same: Wrap = Wrap { w: 4 }.into();
+    println(same.w);
+    let nested: Option<Option<i32>> = Some(Some(2));
+    match nested {
+        Some(Some(n)) => println(n),
+        _ => println(0),
+    }
+}

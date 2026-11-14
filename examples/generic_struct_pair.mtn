@@ -1,0 +1,17 @@
+struct Pair<A, B> { first: A, second: B }
+impl<A, B> Pair<A, B> {
+    fn new(a: A, b: B) -> Pair<A, B> { return Pair { first: a, second: b }; }
+    fn getFirst(borrow self) -> A { return self.first; }
+}
+struct Wrapper<T> { value: T }
+impl<T> Wrapper<T> {
+    fn wrap(v: T) -> Wrapper<T> { return Wrapper { value: v }; }
+}
+fn main() {
+    let p = Pair { first: 1, second: 2.5 };
+    let r = Pair::new(3, 4.5);
+    let t: Pair<i32, f64> = Pair::new(7, 2.0);
+    let w = Wrapper { value: 42 };
+    println(p.first); println(r.second); println(t.first); println(w.value);
+    println(r.getFirst());
+}
