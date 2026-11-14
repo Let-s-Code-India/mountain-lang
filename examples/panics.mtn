@@ -1,5 +1,0 @@
-// `panic` prints to stderr and exits with code 101 (Document 11 §4).
-fn main() {
-    println("before");
-    panic("something impossible happened");
-}
