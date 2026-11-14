@@ -1269,9 +1269,10 @@ impl<'a> FnChecker<'a> {
             Expr::Ident(name) => self.use_ident_expr(expr, name),
             Expr::Literal(_) => {}
             Expr::Path(_) | Expr::TurbofishPath { .. } => {}
-            Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
+            Expr::Paren(e) | Expr::Propagate(e) | Expr::Throw(e)
             | Expr::Unary { expr: e, .. } | Expr::Deref(e) => self.check_expr(e, block, idx),
-            Expr::Yield(e) => self.check_moving_operand(e, block, idx),
+            // `await e` consumes the future / join handle: awaiting it twice is a use after move
+            Expr::Yield(e) | Expr::Await(e) => self.check_moving_operand(e, block, idx),
             Expr::Tuple(items) | Expr::Array(items) => {
                 for it in items {
                     self.check_moving_operand(it, block, idx);
@@ -1468,7 +1469,12 @@ impl<'a> FnChecker<'a> {
             // safe to leave unchecked here since Phase 6's exit
             // criteria (Document 6 §8) never exercises them.
             Expr::Spawn(inner) => {
-                self.check_expr(inner, block, idx);
+                // `spawn f` of a future held in a variable consumes it
+                if matches!(inner.as_ref(), Expr::Closure(_)) {
+                    self.check_expr(inner, block, idx);
+                } else {
+                    self.check_moving_operand(inner, block, idx);
+                }
                 self.check_task_closure(inner, "spawn");
             }
             Expr::Select(_) | Expr::Query(_) => {}

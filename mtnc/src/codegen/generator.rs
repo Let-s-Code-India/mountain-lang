@@ -241,3 +241,289 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(())
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// `async fn` (Phase 12 M4; Document 12 §3, §11.4)
+//
+// An `async fn` is compiled exactly like a generator (same coroutine ramp, heap frame that never
+// moves, lazy start, drop-on-destroy edge for every live local), with two differences: its promise
+// holds the function's *result*, and `await` — instead of `yield` — is how the body suspends.
+//
+//   await <future>   : loop { if sub is done break; resume sub; if sub is done break; suspend }
+//   await <handle>   : loop { if the task is done take its result; else register as waiter; suspend }
+//
+// "suspend" returns to whoever resumed this frame: the parent's await loop, or the executor
+// (`run_task` in the C runtime), which marks the task idle until the runtime wakes it. The frame
+// of the sub-future / the join handle is held in a hidden slot that is part of the drop frames, so a
+// frame destroyed while suspended drops it too.
+// ------------------------------------------------------------------------------------------
+impl<'ctx, 'a> Codegen<'ctx, 'a> {
+    /// `return v` / the body's tail in an `async fn`: the value is the future's result.
+    pub(super) fn async_return(&mut self, v: Option<BasicValueEnum<'ctx>>) -> R<()> {
+        if let Some(v) = v {
+            let promise = self.gen_ctx.as_ref().ok_or_else(|| CgErr("internal: async return without a frame".into()))?.promise;
+            self.builder.build_store(promise, v)?;
+        }
+        self.gen_finish_body()
+    }
+
+    /// Returns `v` from the function being generated (a plain return, or the result of an `async fn`).
+    pub(super) fn return_value(&mut self, v: BasicValueEnum<'ctx>) -> R<()> {
+        if self.async_item.is_some() {
+            // the caller goes on emitting into a reachable block (`?`'s success path): the block
+            // `gen_finish_body` left behind is unreachable
+            self.async_return(Some(v))?;
+            self.builder.build_unreachable()?;
+            return Ok(());
+        }
+        self.emit_frames_from(0)?;
+        self.builder.build_return(Some(&v))?;
+        Ok(())
+    }
+
+    fn require_async(&self, what: &str) -> R<()> {
+        if self.gen_ctx.is_none() || self.async_item.is_none() {
+            return Err(CgErr(format!("{} outside an `async fn`", what)));
+        }
+        Ok(())
+    }
+
+    /// Runs `body` in a fresh helper function `void/i32 name(ptr, ...)` without disturbing the
+    /// function being generated.
+    fn with_helper<F>(&mut self, name: &str, fty: inkwell::types::FunctionType<'ctx>, body: F) -> R<FunctionValue<'ctx>>
+    where
+        F: FnOnce(&mut Self, FunctionValue<'ctx>) -> R<()>,
+    {
+        if let Some(f) = self.module.get_function(name) {
+            return Ok(f);
+        }
+        let fd = self.module.add_function(name, fty, None);
+        let saved = self.builder.get_insert_block();
+        let saved_dead = self.dead;
+        let entry = self.context.append_basic_block(fd, "entry");
+        self.builder.position_at_end(entry);
+        let r = body(self, fd);
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        self.dead = saved_dead;
+        r?;
+        Ok(fd)
+    }
+
+    /// `i32 __mtn_fut_poll(ptr frame)`: resumes the frame unless it is done; returns 1 when it is done.
+    pub(super) fn fut_poll_fn(&mut self) -> R<FunctionValue<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let i32t = self.context.i32_type();
+        self.with_helper("__mtn_fut_poll", i32t.fn_type(&[ptrt.into()], false), |cg, fd| {
+            let h = fd.get_nth_param(0).unwrap().into_pointer_value();
+            let (res_bb, ret1, ret_end) = (cg.context.append_basic_block(fd, "resume"), cg.context.append_basic_block(fd, "done"), cg.context.append_basic_block(fd, "end"));
+            let d0 = cg.coro_call("llvm.coro.done", &[], &[h.as_value_ref()])?;
+            cg.builder.build_conditional_branch(cg.raw_int(d0), ret1, res_bb)?;
+            cg.builder.position_at_end(res_bb);
+            cg.coro_call("llvm.coro.resume", &[], &[h.as_value_ref()])?;
+            let d1 = cg.coro_call("llvm.coro.done", &[], &[h.as_value_ref()])?;
+            let d1 = cg.builder.build_int_z_extend(cg.raw_int(d1), i32t, "d1")?;
+            let res_last = cg.builder.get_insert_block().unwrap();
+            cg.builder.build_unconditional_branch(ret_end)?;
+            cg.builder.position_at_end(ret1);
+            cg.builder.build_unconditional_branch(ret_end)?;
+            cg.builder.position_at_end(ret_end);
+            let phi = cg.builder.build_phi(i32t, "r")?;
+            phi.add_incoming(&[(&d1, res_last), (&i32t.const_int(1, false), ret1)]);
+            cg.builder.build_return(Some(&phi.as_basic_value()))?;
+            Ok(())
+        })
+    }
+
+    /// `void __mtn_fut_destroy(ptr frame)`: frees a finished frame.
+    pub(super) fn fut_destroy_fn(&mut self) -> R<FunctionValue<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        self.with_helper("__mtn_fut_destroy", self.context.void_type().fn_type(&[ptrt.into()], false), |cg, fd| {
+            let h = fd.get_nth_param(0).unwrap().into_pointer_value();
+            cg.coro_call("llvm.coro.destroy", &[], &[h.as_value_ref()])?;
+            cg.builder.build_return(None)?;
+            Ok(())
+        })
+    }
+
+    /// `void __mtn_fut_take_<T>(ptr frame, ptr out)`: moves the finished frame's result out of its promise.
+    pub(super) fn fut_take_fn(&mut self, item: &Ty) -> R<FunctionValue<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let name = format!("__mtn_fut_take_{}", item.to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>());
+        let item = item.clone();
+        self.with_helper(&name, self.context.void_type().fn_type(&[ptrt.into(), ptrt.into()], false), move |cg, fd| {
+            let h = fd.get_nth_param(0).unwrap().into_pointer_value();
+            let out = fd.get_nth_param(1).unwrap().into_pointer_value();
+            if !is_unit_like(&item) && item != Ty::Never {
+                let lt = cg.llty(&item)?;
+                let align = cg.td.get_abi_alignment(&lt) as u64;
+                let bt = cg.context.bool_type();
+                let pp = cg.coro_call("llvm.coro.promise", &[], &[h.as_value_ref(), cg.int_ty(32).const_int(align, false).as_value_ref(), bt.const_int(0, false).as_value_ref()])?;
+                let pp = cg.raw_ptr(pp);
+                let v = cg.builder.build_load(lt, pp, "result")?;
+                cg.builder.build_store(out, v)?;
+            }
+            cg.builder.build_return(None)?;
+            Ok(())
+        })
+    }
+
+    /// `spawn <future>` -> `JoinHandle<T>`: the frame becomes a task on the pool.
+    pub(super) fn gen_spawn_future(&mut self, e: &Expr, item: &Ty) -> R<V<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let hdl = self.expr(e)?;
+        let (poll, take, destroy) = (self.fut_poll_fn()?, self.fut_take_fn(item)?, self.fut_destroy_fn()?);
+        let (size, rdrop) = self.task_result_info(item)?;
+        let ut = self.usize_ty();
+        let f = self.rt_decl("__mtn_rt_spawn_future", Some(ptrt.into()), &[ptrt.into(), ptrt.into(), ptrt.into(), ptrt.into(), ut.into(), ptrt.into()]);
+        let r = self.builder.build_call(
+            f,
+            &[
+                hdl.into(),
+                poll.as_global_value().as_pointer_value().into(),
+                take.as_global_value().as_pointer_value().into(),
+                destroy.as_global_value().as_pointer_value().into(),
+                ut.const_int(size, false).into(),
+                rdrop.into(),
+            ],
+            "task",
+        )?;
+        let ValueKind::Basic(h) = r.try_as_basic_value() else { return Err(CgErr("internal: spawn result".into())) };
+        Ok(h)
+    }
+
+    /// (size of the result slot, drop glue for an untaken result or null)
+    pub(super) fn task_result_info(&mut self, item: &Ty) -> R<(u64, PointerValue<'ctx>)> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let unit = is_unit_like(item) || *item == Ty::Never;
+        let size = if unit {
+            0
+        } else {
+            let lt = self.llty(item)?;
+            self.td.get_abi_size(&lt)
+        };
+        let rdrop = if !unit && self.needs_drop(item) { self.drop_glue(item)?.as_global_value().as_pointer_value() } else { ptrt.const_null() };
+        Ok((size, rdrop))
+    }
+
+    /// `await e` (Doc 12 §3, §11.4).
+    pub(super) fn gen_await(&mut self, inner: &Expr) -> R<V<'ctx>> {
+        self.require_async("`await`")?;
+        let ity = self.ty_of(inner)?;
+        if let Some(u) = crate::types::future_item(&ity) {
+            self.await_future(inner, &ity, &u)
+        } else if let Some(u) = crate::types::join_handle_item(&ity) {
+            self.await_handle(inner, &ity, &u)
+        } else {
+            Err(CgErr(format!("internal: `await` of a value of type `{}`", ity)))
+        }
+    }
+
+    fn await_future(&mut self, inner: &Expr, ity: &Ty, item: &Ty) -> R<V<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        self.push_scope();
+        let v = self.expr(inner)?;
+        let slot = self.declare_local("$await", ity)?;
+        self.builder.build_store(slot, v)?;
+        let (head, resume, pend, ready) = (self.new_block("await_head"), self.new_block("await_resume"), self.new_block("await_pending"), self.new_block("await_ready"));
+        self.builder.build_unconditional_branch(head)?;
+        self.position(head);
+        let hdl = self.builder.build_load(ptrt, slot, "sub")?.into_pointer_value();
+        let d0 = self.coro_call("llvm.coro.done", &[], &[hdl.as_value_ref()])?;
+        self.builder.build_conditional_branch(self.raw_int(d0), ready, resume)?;
+        self.position(resume);
+        self.coro_call("llvm.coro.resume", &[], &[hdl.as_value_ref()])?;
+        let d1 = self.coro_call("llvm.coro.done", &[], &[hdl.as_value_ref()])?;
+        self.builder.build_conditional_branch(self.raw_int(d1), ready, pend)?;
+        // the sub-future is not done: this frame suspends too; when resumed it polls the sub-future again
+        self.position(pend);
+        self.gen_suspend(false, true)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.position(ready);
+        let out = if is_unit_like(item) || *item == Ty::Never {
+            self.unit()
+        } else {
+            let lt = self.llty(item)?;
+            let align = self.td.get_abi_alignment(&lt) as u64;
+            let bt = self.context.bool_type();
+            let pp = self.coro_call("llvm.coro.promise", &[], &[hdl.as_value_ref(), self.int_ty(32).const_int(align, false).as_value_ref(), bt.const_int(0, false).as_value_ref()])?;
+            let pp = self.raw_ptr(pp);
+            self.builder.build_load(lt, pp, "awaited")?
+        };
+        // the finished frame only has to be freed; the hidden slot is cleared so scope exit drops nothing
+        self.coro_call("llvm.coro.destroy", &[], &[hdl.as_value_ref()])?;
+        self.builder.build_store(slot, ptrt.const_null())?;
+        self.pop_scope(true)?;
+        Ok(out)
+    }
+
+    fn await_handle(&mut self, inner: &Expr, ity: &Ty, item: &Ty) -> R<V<'ctx>> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let i32t = self.context.i32_type();
+        self.push_scope();
+        let v = self.expr(inner)?;
+        let slot = self.declare_local("$await", ity)?;
+        self.builder.build_store(slot, v)?;
+        let unit = is_unit_like(item) || *item == Ty::Never;
+        let out = if unit { ptrt.const_null() } else { self.alloca_ty(item, "awaited")? };
+        let (head, pend, ready) = (self.new_block("awaitj_head"), self.new_block("awaitj_pending"), self.new_block("awaitj_ready"));
+        self.builder.build_unconditional_branch(head)?;
+        self.position(head);
+        let h = self.builder.build_load(ptrt, slot, "task")?;
+        let f = self.rt_decl("__mtn_rt_await_join", Some(i32t.into()), &[ptrt.into(), ptrt.into()]);
+        let r = self.builder.build_call(f, &[h.into(), out.into()], "r")?;
+        let ValueKind::Basic(r) = r.try_as_basic_value() else { return Err(CgErr("internal: await_join".into())) };
+        let done = self.builder.build_int_compare(inkwell::IntPredicate::NE, r.into_int_value(), i32t.const_zero(), "done")?;
+        self.builder.build_conditional_branch(done, ready, pend)?;
+        self.position(pend);
+        self.gen_suspend(false, true)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.position(ready);
+        // the runtime released the task: nothing is left for the hidden slot to drop
+        self.builder.build_store(slot, ptrt.const_null())?;
+        let res = if unit { self.unit() } else { self.load(out, item)? };
+        self.pop_scope(true)?;
+        Ok(res)
+    }
+
+    /// `__await_yield()` (the body of the prelude `yieldNow`): requeue this task behind the others.
+    pub(super) fn gen_await_yield(&mut self) -> R<V<'ctx>> {
+        self.require_async("`yieldNow`")?;
+        let f = self.rt_decl("__mtn_rt_yield", None, &[]);
+        self.builder.build_call(f, &[], "")?;
+        self.gen_suspend(false, true)?;
+        Ok(self.unit())
+    }
+
+    /// `__await_sleep(ms)` (the body of the prelude `sleepMs`): the task is woken by the runtime's timer.
+    pub(super) fn gen_await_sleep(&mut self, arg: &Expr) -> R<V<'ctx>> {
+        self.require_async("`sleepMs`")?;
+        let i64t = self.context.i64_type();
+        let i32t = self.context.i32_type();
+        let i8t = self.context.i8_type();
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let ms = self.expr_as(arg, &Ty::U64)?;
+        let dl = self.alloca(i64t.into(), "deadline")?;
+        let reg = self.alloca(i8t.into(), "registered")?;
+        let fd = self.rt_decl("__mtn_rt_deadline_ns", Some(i64t.into()), &[i64t.into()]);
+        let d = self.builder.build_call(fd, &[ms.into()], "dl")?;
+        let ValueKind::Basic(d) = d.try_as_basic_value() else { return Err(CgErr("internal: deadline".into())) };
+        self.builder.build_store(dl, d)?;
+        self.builder.build_store(reg, i8t.const_zero())?;
+        let (head, pend, done) = (self.new_block("sleep_head"), self.new_block("sleep_pending"), self.new_block("sleep_done"));
+        self.builder.build_unconditional_branch(head)?;
+        self.position(head);
+        let dv = self.builder.build_load(i64t, dl, "d")?;
+        let f = self.rt_decl("__mtn_rt_sleep_wait", Some(i32t.into()), &[i64t.into(), ptrt.into()]);
+        let r = self.builder.build_call(f, &[dv.into(), reg.into()], "r")?;
+        let ValueKind::Basic(r) = r.try_as_basic_value() else { return Err(CgErr("internal: sleep_wait".into())) };
+        let elapsed = self.builder.build_int_compare(inkwell::IntPredicate::NE, r.into_int_value(), i32t.const_zero(), "elapsed")?;
+        self.builder.build_conditional_branch(elapsed, done, pend)?;
+        self.position(pend);
+        self.gen_suspend(false, true)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.position(done);
+        Ok(self.unit())
+    }
+}

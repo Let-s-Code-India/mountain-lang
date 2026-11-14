@@ -33,6 +33,23 @@ pub struct Checked {
 /// unless the program declares its own trait of that name.
 const PRELUDE: &str = "trait Allocator {\n    fn alloc(borrow mut self, size: usize, align: usize) -> *mut u8;\n    fn dealloc(borrow mut self, ptr: *mut u8, size: usize);\n}\n";
 
+/// The temporary runtime leaf futures (Document 12 §11.4), written as ordinary `async fn`s over two
+/// compiler-known suspension primitives; added only to programs that mention them.
+const ASYNC_PRELUDE: &str = "async fn yieldNow() {\n    __await_yield();\n}\nasync fn sleepMs(ms: u64) {\n    __await_sleep(ms);\n}\n";
+
+fn inject_async_prelude(program: &mut crate::ast::Program) {
+    use crate::ast::ItemKind;
+    if program.items.iter().any(|i| matches!(&i.kind, ItemKind::Fn(f) if f.name == "yieldNow" || f.name == "sleepMs")) {
+        return;
+    }
+    let (tokens, _) = lexer::tokenize(ASYNC_PRELUDE);
+    let (prelude, errs) = parse_program(tokens);
+    assert!(errs.is_empty(), "internal: the async prelude does not parse");
+    let mut items = prelude.items;
+    items.append(&mut program.items);
+    program.items = items;
+}
+
 fn inject_prelude(program: &mut crate::ast::Program) {
     use crate::ast::ItemKind;
     if program.items.iter().any(|i| matches!(&i.kind, ItemKind::Trait(t) if t.name == "Allocator")) {
@@ -46,16 +63,52 @@ fn inject_prelude(program: &mut crate::ast::Program) {
     program.items = items;
 }
 
+/// Document 12 §11.8: `Mutex`, `RwLock`, `Spinlock`, `Atomic`, `channel` and `volatile` arrive in
+/// Phase 13. Wherever they are used (path call, type position, `channel::<T>()`, `volatile ..`) the
+/// program is rejected with one clear message per use, instead of an "unknown function/type"
+/// error. A program that declares its own item of that name (`struct Mutex`, `fn channel`, ...)
+/// is left alone. `select` has its own message (raised where the expression is checked).
+fn phase13_names(tokens: &[crate::token::Token]) -> Vec<String> {
+    use crate::token::{Keyword, TokenKind};
+    const NAMES: [&str; 4] = ["Mutex", "RwLock", "Spinlock", "Atomic"];
+    let declares = |name: &str| {
+        tokens.windows(2).any(|w| {
+            matches!(&w[0].kind, TokenKind::Keyword(Keyword::Struct | Keyword::Enum | Keyword::Trait | Keyword::Fn | Keyword::Type))
+                && matches!(&w[1].kind, TokenKind::Ident(n) if n == name)
+        })
+    };
+    let mut out = Vec::new();
+    for t in tokens {
+        let name = match &t.kind {
+            TokenKind::Ident(n) if NAMES.contains(&n.as_str()) && !declares(n) => n.clone(),
+            TokenKind::Keyword(Keyword::Channel) => "channel".to_string(),
+            TokenKind::Keyword(Keyword::Volatile) => "volatile".to_string(),
+            _ => continue,
+        };
+        out.push(format!("error: `{}` is not yet supported by codegen — Phase 13 (Document 12 §11.8) --> {}", name, t.span));
+    }
+    out
+}
+
 pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let (tokens, lex_errs) = lexer::tokenize(src);
     if !lex_errs.is_empty() {
         return Err(lex_errs.iter().map(|d| d.to_string()).collect());
+    }
+    let wants_async_leaves = tokens.iter().any(|t| matches!(&t.kind, crate::token::TokenKind::Ident(n) if n == "yieldNow" || n == "sleepMs"));
+    let phase13 = phase13_names(&tokens);
+    if !phase13.is_empty() {
+        return Err(phase13);
     }
     let (mut program, parse_errs) = parse_program(tokens);
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| format!("error: {} --> {}", e.message, e.span)).collect());
     }
     inject_prelude(&mut program);
+    if wants_async_leaves {
+        inject_async_prelude(&mut program);
+    }
+    desugar::desugar_join(&mut program);
     // Same-named nested items of different functions get distinct names first.
     crate::scope::scope_nested_items(&mut program);
     desugar::inline_generic_default_methods(&mut program);

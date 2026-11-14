@@ -190,6 +190,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.tail_params = Vec::new();
         self.tail_loop = None;
         self.ret_ty = pc.ret.clone();
+        self.async_item = None;
         self.locals = vec![HashMap::new()];
         self.drop_frames = vec![drops::DropFrame { scope: true, entries: Vec::new() }];
         self.loops.clear();

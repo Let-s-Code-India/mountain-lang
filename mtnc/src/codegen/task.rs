@@ -11,7 +11,7 @@
 use super::*;
 
 impl<'ctx, 'a> Codegen<'ctx, 'a> {
-    fn rt_decl(&mut self, name: &str, ret: Option<BasicTypeEnum<'ctx>>, params: &[BasicMetadataTypeEnum<'ctx>]) -> FunctionValue<'ctx> {
+    pub(super) fn rt_decl(&mut self, name: &str, ret: Option<BasicTypeEnum<'ctx>>, params: &[BasicMetadataTypeEnum<'ctx>]) -> FunctionValue<'ctx> {
         self.get_extern(name, ret, params, false)
     }
 
@@ -73,6 +73,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// `spawn <closure>` (`os == false`) and `thread::spawnOS(<closure>)` (`os == true`) -> `JoinHandle<T>`.
     pub(super) fn gen_spawn(&mut self, closure: &Expr, os: bool) -> R<V<'ctx>> {
         let cty = self.ty_of(closure)?;
+        if let Some(item) = crate::types::future_item(&cty) {
+            return self.gen_spawn_future(closure, &item);
+        }
         let Ty::Fn(_, ret) = &cty else {
             return Err(CgErr(format!("internal: a task closure is typed `{}`", cty)));
         };

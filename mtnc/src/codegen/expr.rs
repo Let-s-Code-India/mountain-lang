@@ -191,7 +191,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     fn gen_return(&mut self, v: Option<&Expr>) -> R<()> {
-        if self.gen_ctx.is_some() {
+        if self.gen_ctx.is_some() && self.async_item.is_none() {
             // `return;` in a generator ends it (the checker rejected `return value;`)
             return self.gen_finish_body();
         }
@@ -200,6 +200,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Some(e) => Some(self.expr_as(e, &ret)?),
             None => None,
         };
+        if self.async_item.is_some() {
+            // `return v;` in an `async fn`: the value is the future's result
+            if self.dead {
+                return Ok(());
+            }
+            let v = if is_unit_like(&ret) { None } else { Some(val.ok_or_else(|| CgErr(format!("`return;` in an async function returning `{}`", ret)))?) };
+            return self.async_return(v);
+        }
         if is_unit_like(&ret) {
             self.emit_frames_from(0)?;
             self.builder.build_return(None)?;
@@ -576,7 +584,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Expr::Range { .. } => unsupported("range values outside a `for` loop", 16),
             Expr::Closure(c) => self.gen_closure(e, c),
-            Expr::Await(_) => unsupported("`await` (async)", 12),
+            Expr::Await(inner) => self.gen_await(inner),
             Expr::Spawn(inner) => self.gen_spawn(inner, false),
             Expr::Select(_) => unsupported("`select` (channels)", 13),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
@@ -2793,15 +2801,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ev = v;
             }
             let out = self.make_enum(&ret, 1, vec![ev])?;
-            self.emit_frames_from(0)?;
-            self.builder.build_return(Some(&out))?;
+            self.return_value(out)?;
         } else {
             if !matches!(ret, Ty::OptionTy(_)) {
                 return Err(CgErr(format!("`?` on an `Option` needs the function to return `Option<_>`, it returns `{}`", ret)));
             }
             let out = self.make_enum(&ret, 1, Vec::new())?;
-            self.emit_frames_from(0)?;
-            self.builder.build_return(Some(&out))?;
+            self.return_value(out)?;
         }
         self.position(ok_bb);
         if is_unit_like(&ok_ty) {
@@ -2827,6 +2833,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
                         "drop" => return self.gen_drop_call(args),
                         "pinToCore" => return self.gen_pin_to_core(&args[0].value),
+                        "__await_yield" if self.async_item.is_some() => return self.gen_await_yield(),
+                        "__await_sleep" if self.async_item.is_some() => return self.gen_await_sleep(&args[0].value),
                         "assert" => return self.gen_assert(args),
                         "ensure" => return self.gen_ensure(whole, args),
                         "print" | "println" | "eprint" | "eprintln" => return self.gen_print(name, args),

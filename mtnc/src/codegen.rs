@@ -201,6 +201,8 @@ pub struct Codegen<'ctx, 'a> {
     ref_captured: std::collections::HashSet<usize>,
     /// State of the generator function being generated (Phase 12 M2).
     gen_ctx: Option<generator::GenCtx<'ctx>>,
+    /// the result type `T` of the `async fn` being generated (its frame's promise), if any
+    async_item: Option<Ty>,
 }
 
 fn is_signed(t: &Ty) -> bool {
@@ -328,6 +330,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             closure_owner: String::new(),
             ref_captured: std::collections::HashSet::new(),
             gen_ctx: None,
+            async_item: None,
         }
     }
 
@@ -1045,9 +1048,6 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     fn declare_fn(&mut self, w: &FnWork<'a>) -> R<()> {
         let f = w.decl;
-        if f.is_async {
-            return unsupported("`async fn`", 12);
-        }
         if !f.generics.0.is_empty() {
             return Err(CgErr(format!("internal error: generic function `{}` reached code generation without being monomorphized", f.name)));
         }
@@ -1117,6 +1117,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return Err(CgErr("a variadic parameter must be the last parameter".into()));
         }
         let ret = f.return_type.as_ref().map(|t| self.rty(t)).unwrap_or(Ty::Unit);
+        // `async fn f() -> T` is called as a function returning the future frame (`Future<T>`, a pointer)
+        let ret = if f.is_async { Ty::Generic("Future".into(), vec![crate::types::GenericArg::Type(ret)]) } else { ret };
         let ft = if is_unit_like(&ret) {
             self.context.void_type().fn_type(&lls, false)
         } else {
@@ -1137,7 +1139,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.cur_fn = Some(val);
         self.cur_self = w.self_ty.clone();
         self.cur_key = w.key.clone();
-        let gen_item = crate::types::generator_item(&ret).filter(|_| crate::generator::block_has_yield(body));
+        // an `async fn` is compiled like a generator whose single "item" is its result (M4)
+        let async_item = if f.is_async { crate::types::future_item(&ret) } else { None };
+        let gen_item = match &async_item {
+            Some(t) => Some(t.clone()),
+            None => crate::types::generator_item(&ret).filter(|_| crate::generator::block_has_yield(body)),
+        };
+        let ret = async_item.clone().unwrap_or(ret);
+        self.async_item = async_item.clone();
         self.tail_calls = if gen_item.is_some() { Default::default() } else { crate::codegen::tail::tail_calls_of(body, is_unit_like(&ret)) };
         self.tail_params = Vec::new();
         self.ret_ty = ret.clone();
@@ -1224,6 +1233,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
                 if self.dead || bty == Ty::Never {
                     self.builder.build_unreachable()?;
+                } else if async_item.is_some() {
+                    // the body's value is the future's result: it goes to the promise
+                    self.async_return(if is_unit_like(&ret) { None } else { Some(v) })?;
+                    self.builder.build_unreachable()?;
                 } else {
                     self.gen_finish_body()?;
                     self.builder.build_unreachable()?;
@@ -1247,6 +1260,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.cur_self = None;
         self.tail_loop = None;
         self.tail_calls.clear();
+        self.async_item = None;
         Ok(())
     }
 
@@ -1265,13 +1279,55 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let bb = self.context.append_basic_block(w, "entry");
         self.cur_fn = Some(w);
         self.builder.position_at_end(bb);
+        // `async fn main()`: the executor runs the frame; the result is then treated like a sync `main`'s
+        let async_main = crate::types::future_item(&ret);
+        let ret = async_main.clone().unwrap_or(ret);
         // a program that uses tasks/threads starts the runtime first and waits for every task after `main`
-        let uses_rt = self.module.get_function("__mtn_rt_spawn").is_some() || self.module.get_function("__mtn_rt_spawn_os").is_some() || self.module.get_function("__mtn_rt_pin_to_core").is_some();
+        let uses_rt = async_main.is_some()
+            || self.module.get_function("__mtn_rt_spawn").is_some()
+            || self.module.get_function("__mtn_rt_spawn_future").is_some()
+            || self.module.get_function("__mtn_rt_spawn_os").is_some()
+            || self.module.get_function("__mtn_rt_pin_to_core").is_some();
         if uses_rt {
             let init = self.get_extern("__mtn_rt_init", None, &[], false);
             self.builder.build_call(init, &[], "")?;
         }
-        let call = self.builder.build_call(mainf, &[], "")?;
+        let call_val: Option<BasicValueEnum<'ctx>> = if async_main.is_some() {
+            let ptrt = self.context.ptr_type(AddressSpace::default());
+            let hdl = self.builder.build_call(mainf, &[], "main_future")?;
+            let ValueKind::Basic(hdl) = hdl.try_as_basic_value() else { return Err(CgErr("internal: async main handle".into())) };
+            let (poll, take, destroy) = (self.fut_poll_fn()?, self.fut_take_fn(&ret)?, self.fut_destroy_fn()?);
+            let (size, rdrop) = self.task_result_info(&ret)?;
+            let unit = is_unit_like(&ret) || ret == Ty::Never;
+            let out = if unit {
+                ptrt.const_null()
+            } else {
+                let lt = self.llty(&ret)?;
+                self.builder.build_alloca(lt, "main_result")?
+            };
+            let ut = self.usize_ty();
+            let f = self.get_extern("__mtn_rt_block_on", None, &[ptrt.into(), ptrt.into(), ptrt.into(), ptrt.into(), ut.into(), ptrt.into(), ptrt.into()], false);
+            self.builder.build_call(
+                f,
+                &[
+                    hdl.into(),
+                    poll.as_global_value().as_pointer_value().into(),
+                    take.as_global_value().as_pointer_value().into(),
+                    destroy.as_global_value().as_pointer_value().into(),
+                    ut.const_int(size, false).into(),
+                    rdrop.into(),
+                    out.into(),
+                ],
+                "",
+            )?;
+            if unit { None } else { Some(self.load(out, &ret)?) }
+        } else {
+            let call = self.builder.build_call(mainf, &[], "")?;
+            match call.try_as_basic_value() {
+                ValueKind::Basic(v) => Some(v),
+                _ => None,
+            }
+        };
         if uses_rt {
             let sd = self.get_extern("__mtn_rt_shutdown", None, &[], false);
             self.builder.build_call(sd, &[], "")?;
@@ -1282,7 +1338,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.build_return(Some(&i32t.const_zero()))?;
             }
             Ty::ResultTy(ok, _) if **ok == Ty::Unit => {
-                let ValueKind::Basic(v) = call.try_as_basic_value() else { return Err(CgErr("internal: main result".into())) };
+                let v = call_val.ok_or_else(|| CgErr("internal: main result".into()))?;
+                // the error value (e.g. a `String`) is dropped before the process exits
+                if self.needs_drop(&ret) {
+                    let lt = self.llty(&ret)?;
+                    let tmp = self.builder.build_alloca(lt, "main_result_drop")?;
+                    self.builder.build_store(tmp, v)?;
+                    let g = self.drop_glue(&ret)?;
+                    self.builder.build_call(g, &[tmp.into()], "")?;
+                }
                 let tag = self.builder.build_extract_value(v.into_struct_value(), 0, "tag")?.into_int_value();
                 let is_err = self.builder.build_int_compare(IntPredicate::NE, tag, i32t.const_zero(), "is_err")?;
                 let code = self.builder.build_select(is_err, i32t.const_int(1, false), i32t.const_zero(), "code")?;

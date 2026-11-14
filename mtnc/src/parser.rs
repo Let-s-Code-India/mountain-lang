@@ -1373,7 +1373,18 @@ impl Parser {
         if self.check_kw(Keyword::Await) {
             self.advance();
             let e = self.parse_prefix()?;
-            return Ok(Expr::Await(Box::new(e)));
+            // Document 12 §3.1 writes `await fetchUser(42)?`: the `?` applies to the awaited
+            // *result*, so trailing `?`s are moved outside the `await` (`(await f())?`).
+            let (mut inner, mut tries) = (e, 0usize);
+            while let Expr::Propagate(x) = inner {
+                inner = *x;
+                tries += 1;
+            }
+            let mut out = Expr::Await(Box::new(inner));
+            for _ in 0..tries {
+                out = Expr::Propagate(Box::new(out));
+            }
+            return Ok(out);
         }
         if self.check_kw(Keyword::Borrow) {
             self.advance();
@@ -1597,6 +1608,9 @@ impl Parser {
                 self.parse_postfix()?
             };
             return Ok(Expr::Spawn(Box::new(operand)));
+        }
+        if self.check_kw(Keyword::Async) {
+            return self.error("`async` closures and `async` blocks are not part of Mountain 1.0 (Document 12 §11.4); declare an `async fn` and call it instead");
         }
         if self.check_kw(Keyword::Select) {
             return self.parse_select_expr();

@@ -1065,3 +1065,90 @@ fn inline_defaults(program: &mut Program, only_generic: bool) -> bool {
     });
     changed
 }
+
+/// `await join(f1, .., fn)` (Document 12 §3.3, §11.4), run before type checking.
+///
+/// The futures run concurrently on the pool: each one is `spawn`ed and then awaited in order,
+///
+/// ```text
+/// await join(a(), b())   ==>   { let __joinN_0 = spawn a(); let __joinN_1 = spawn b();
+///                                (await __joinN_0, await __joinN_1) }
+/// await join([a(), b()]) ==>   the same with an array `[await .., await ..]` as the result
+/// ```
+///
+/// `join` with 2 to 8 arguments builds a tuple; a single array-literal argument builds an array
+/// (the growable `[Future<T>]` form needs Phase 16's collections). A program that declares its
+/// own function named `join` is left alone.
+pub fn desugar_join(program: &mut Program) {
+    let user_join = std::cell::Cell::new(false);
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
+        if matches!(&it.kind, ItemKind::Fn(f) if f.name == "join") {
+            user_join.set(true);
+        }
+    });
+    if user_join.get() {
+        return;
+    }
+    let mut counter = 0usize;
+    fn rewrite_block(b: &mut Block, counter: &mut usize) {
+        for c in block_children_mut(b) {
+            match c {
+                ChildMut::E(x) => rewrite_expr(x, counter),
+                ChildMut::B(x) => rewrite_block(x, counter),
+            }
+        }
+    }
+    fn rewrite_expr(e: &mut Expr, counter: &mut usize) {
+        for c in expr_children_mut(e) {
+            match c {
+                ChildMut::E(x) => rewrite_expr(x, counter),
+                ChildMut::B(x) => rewrite_block(x, counter),
+            }
+        }
+        let futures: Option<(Vec<Expr>, bool)> = match e {
+            Expr::Await(inner) => match &mut **inner {
+                Expr::Call { callee, args } if matches!(&**callee, Expr::Ident(n) if n == "join") => {
+                    if args.len() == 1 && matches!(args[0].value, Expr::Array(_)) {
+                        let Expr::Array(items) = std::mem::replace(&mut args[0].value, Expr::Tuple(Vec::new())) else { unreachable!() };
+                        if items.is_empty() || items.len() > 64 { None } else { Some((items, true)) }
+                    } else if (2..=8).contains(&args.len()) && args.iter().all(|a| a.name.is_none()) {
+                        Some((args.drain(..).map(|a| a.value).collect(), false))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((futs, as_array)) = futures else { return };
+        *counter += 1;
+        let id = *counter;
+        let names: Vec<String> = (0..futs.len()).map(|i| format!("__join{}_{}", id, i)).collect();
+        let stmts: Vec<Stmt> = futs
+            .into_iter()
+            .zip(names.iter())
+            .map(|(f, n)| Stmt::Let { mutable: false, pattern: Pattern::Ident(n.clone()), ty: None, value: Some(Expr::Spawn(Box::new(f))) })
+            .collect();
+        let awaited: Vec<Expr> = names.iter().map(|n| Expr::Await(Box::new(Expr::Ident(n.clone())))).collect();
+        let tail = if as_array { Expr::Array(awaited) } else { Expr::Tuple(awaited) };
+        *e = Expr::Block(Box::new(Block { stmts, tail: Some(Box::new(tail)) }));
+    }
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| match &mut it.kind {
+        ItemKind::Fn(f) => {
+            if let Some(b) = &mut f.body {
+                rewrite_block(b, &mut counter);
+            }
+        }
+        ItemKind::Impl(im) => {
+            for ii in im.items.iter_mut() {
+                if let ImplItem::Fn(f) = ii {
+                    if let Some(b) = &mut f.body {
+                        rewrite_block(b, &mut counter);
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+}

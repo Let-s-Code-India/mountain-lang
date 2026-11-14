@@ -648,7 +648,30 @@ pub fn register_item_context(items: &[&Item]) {
 
 /// `Box`/`Rc`/`Arc`/`Weak` are compiler-known generic heap types (Doc 6/13); they need no declaration.
 pub fn is_heap_generic(n: &str) -> bool {
-    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator" | "JoinHandle")
+    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator" | "JoinHandle" | "Future")
+}
+
+/// `Future<T>` (Doc 12 §3, §11.4): the owning handle of a heap-allocated `async fn` frame.
+pub fn future_item(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Generic(n, a) if n == "Future" && a.len() == 1 => match &a[0] {
+            GenericArg::Type(x) => Some(x.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn future_of(t: Ty) -> Ty {
+    Ty::Generic("Future".into(), vec![GenericArg::Type(t)])
+}
+
+/// What the type checker knows about one `async fn` for the `Send` analysis of its future
+/// (Doc 12 §11.7: a future is `Send` iff everything alive across an `await` is).
+#[derive(Default, Clone)]
+struct FutInfo {
+    not_send: Option<String>,
+    deps: Vec<String>,
 }
 
 /// `Generator<T>` (Doc 9 §4): the owning handle of a heap-allocated generator frame.
@@ -1092,6 +1115,18 @@ pub struct TypeChecker {
     closure_ret_seen: Vec<Option<Ty>>,
     /// The item type of the generator function being checked (Phase 12 M2).
     cur_gen: Option<Ty>,
+    /// Phase 12 M4: may `await` appear here (the body of an `async fn`, not inside a closure)?
+    await_ok: bool,
+    /// the message for an `await` where it may not appear
+    await_why: String,
+    /// key of the `async fn` being checked (`name` or `Type::name`)
+    cur_async_fn: Option<String>,
+    /// per `async fn` key: what is held across its `await`s
+    future_info: HashMap<String, FutInfo>,
+    /// keys of every `async fn`
+    async_fns: std::collections::HashSet<String>,
+    /// `spawn <call of an async fn>` sites: (key, context), resolved after all bodies are checked
+    future_spawns: Vec<(String, String)>,
     /// Receivers of `JoinHandle::join` (it consumes the handle; Phase 12 M3).
     join_receivers: std::collections::HashSet<usize>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
@@ -1231,6 +1266,20 @@ impl Env {
     }
     fn mark_mut(&mut self, name: &str) {
         self.muts.last_mut().unwrap().insert(name.to_string());
+    }
+    /// every binding currently in scope (innermost wins)
+    fn all_bindings(&self) -> Vec<(String, Ty)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for sc in self.scopes.iter().rev() {
+            for (n, t) in sc {
+                if seen.insert(n.clone()) {
+                    out.push((n.clone(), t.clone()));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
     fn mark_deferred(&mut self, name: &str) {
         let d = self.loop_depth;
@@ -1383,6 +1432,12 @@ impl TypeChecker {
             enums: HashMap::new(),
             closure_ret_seen: Vec::new(),
             cur_gen: None,
+            await_ok: false,
+            await_why: String::new(),
+            cur_async_fn: None,
+            future_info: HashMap::new(),
+            async_fns: std::collections::HashSet::new(),
+            future_spawns: Vec::new(),
             join_receivers: std::collections::HashSet::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
@@ -1554,11 +1609,23 @@ impl TypeChecker {
         for item in &items {
             self.register_impls(item);
         }
+        for item in &items {
+            if let ItemKind::Impl(im) = &item.kind {
+                for ii in &im.items {
+                    if let ImplItem::Fn(f) = ii {
+                        if f.is_async {
+                            self.async_fns.insert(format!("{}::{}", im.target.name, f.name));
+                        }
+                    }
+                }
+            }
+        }
         // Pass 3: type-check every function body (can now resolve
         // method calls via `impls_by_type`/`traits`).
         for item in &items {
             self.check_item(item);
         }
+        self.resolve_future_spawns();
         // Pass 4 (Phase 11b-2): resolve inference variables (Doc 5 §4) and report the
         // ones nothing ever fixed.
         self.finalize_inference();
@@ -1612,6 +1679,11 @@ impl TypeChecker {
                 let ret = f.return_type.as_ref()
                     .map(|t| mark_type_params(resolve_type(t), &type_param_names))
                     .unwrap_or(Ty::Unit);
+                // `async fn f() -> T` is called as a function returning `Future<T>` (Doc 12 §3.1)
+                let ret = if f.is_async { future_of(ret) } else { ret };
+                if f.is_async {
+                    self.async_fns.insert(f.name.clone());
+                }
                 let bounds = fn_bounds(f);
                 let bound_args = fn_bound_args(f, &type_param_names);
                 self.functions.insert(f.name.clone(), FunctionShape { params, ret, generics, bounds, bound_args });
@@ -1721,6 +1793,7 @@ impl TypeChecker {
                         .map(|p| arg_ty(p, mark_type_params(resolve_with_self(&p.ty), &own)))
                         .collect();
                     let ret = f.return_type.as_ref().map(|t| mark_type_params(resolve_with_self(t), &own)).unwrap_or(Ty::Unit);
+                    let ret = if f.is_async { future_of(ret) } else { ret };
                     let own_bounds = if own.is_empty() { Vec::new() } else { fn_bounds(f) };
                     Some((f.name.clone(), FnSig { params, ret, has_default_body: true, own, own_bounds }))
                 }
@@ -1923,6 +1996,18 @@ impl TypeChecker {
     }
 
     fn check_item(&mut self, item: &Item) {
+        if let ItemKind::Trait(t) = &item.kind {
+            for ti in &t.items {
+                if let TraitItem::Fn(f) = ti {
+                    if f.is_async {
+                        self.errors.push(TypeError {
+                            message: format!("`async fn {}` in a trait: async trait methods are not part of Mountain 1.0 (Document 12 §11.4); return a `Future<T>` from an ordinary method or use an `async fn` in an `impl` block", f.name),
+                            context: t.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
         match &item.kind {
             ItemKind::Fn(f) => self.check_fn(f, None),
             ItemKind::Impl(impl_decl) if self.is_template_impl(impl_decl) => {
@@ -2094,6 +2179,40 @@ impl TypeChecker {
                 }
             }
         }
+        // Phase 12 M4 (Doc 12 §11.4): an `async fn`'s frame outlives the call (generator rules for
+        // parameters); `?`, `throw` and `return value;` are allowed and use the declared type.
+        if f.is_async {
+            for p in &f.params {
+                let what = if p.name == "self" { "`self`".to_string() } else { format!("parameter `{}`", p.name) };
+                if p.is_variadic {
+                    self.errors.push(TypeError {
+                        message: format!("`async fn {}`: variadic {} is not allowed; the future owns all of its parameters (pass a `[T]` by value instead)", f.name, what),
+                        context: f.name.clone(),
+                    });
+                } else if matches!(p.ownership, OwnershipMod::Borrow | OwnershipMod::BorrowMut) {
+                    let hint = if p.name == "self" { "an `async fn` method takes `self` by value or no `self` (a `borrow self` async method is not supported in 1.0)" } else { "pass it by value" };
+                    self.errors.push(TypeError {
+                        message: format!("`async fn {}`: {} is passed by `borrow`; the future outlives the call and owns all of its parameters, so {}", f.name, what, hint),
+                        context: f.name.clone(),
+                    });
+                }
+            }
+        }
+        let async_key = if f.is_async {
+            Some(match self_ty {
+                Some(Ty::Named(n)) => format!("{}::{}", n, f.name),
+                _ => f.name.clone(),
+            })
+        } else {
+            None
+        };
+        let saved_await = (self.await_ok, std::mem::take(&mut self.await_why), self.cur_async_fn.take());
+        self.await_ok = f.is_async;
+        self.await_why = format!("`await` can only be used inside an `async fn` (Document 12 §11.4), and `{}` is not `async`", f.name);
+        self.cur_async_fn = async_key.clone();
+        if let Some(k) = &async_key {
+            self.future_info.entry(k.clone()).or_default();
+        }
         // Phase 9: `?`/`return` inside this body propagate to this
         // function's declared return type (Document 11 §2/§4).
         self.prop_targets.push(PropTarget::FnRet(expected_ret.clone().unwrap_or(Ty::Unit)));
@@ -2114,6 +2233,9 @@ impl TypeChecker {
         }
         self.cur_gen = saved_gen;
         self.prop_targets.pop();
+        self.await_ok = saved_await.0;
+        self.await_why = saved_await.1;
+        self.cur_async_fn = saved_await.2;
         self.self_type = saved_self_type;
     }
 
@@ -2836,6 +2958,24 @@ impl TypeChecker {
                 }
                 if let Expr::Ident(name) = callee.as_ref() {
                     match name.as_str() {
+                        "__await_yield" | "__await_sleep" if self.cur_async_fn.is_some() && !self.functions.contains_key(name.as_str()) => {
+                            if name == "__await_sleep" {
+                                for a in args {
+                                    self.check_expr(&a.value, Some(&Ty::U64), env, ctx);
+                                }
+                            }
+                            return Ty::Unit;
+                        }
+                        "join" if !self.functions.contains_key("join") => {
+                            for a in args {
+                                self.check_expr(&a.value, None, env, ctx);
+                            }
+                            self.errors.push(TypeError {
+                                message: "`join(..)` must be awaited directly and takes 2 to 8 futures (`let (a, b) = await join(fa(), fb());`) or one array literal of futures (`await join([f(), g()])`) (Document 12 §3.3, §11.4)".into(),
+                                context: ctx.into(),
+                            });
+                            return Ty::Unit;
+                        }
                         "pinToCore" if !self.functions.contains_key(name.as_str()) => {
                             if args.len() != 1 {
                                 self.errors.push(TypeError { message: format!("`pinToCore` takes exactly one argument (the core number, `usize`), found {}", args.len()), context: ctx.into() });
@@ -3391,10 +3531,53 @@ impl TypeChecker {
             }
 
             Expr::Await(inner) => {
-                self.check_expr(inner, None, env, ctx);
-                // `await`'s result type isn't modeled until Phase 12.
-                self.saw_unresolved = true;
-                expected.cloned().unwrap_or(Ty::Unit)
+                // Phase 12 M4 (Doc 12 §3, §11.4): `await` of a `Future<T>` or a `JoinHandle<T>` is a `T`
+                let it = self.check_expr(inner, None, env, ctx);
+                let it = self.zonk(&it);
+                if !self.await_ok {
+                    let why = self.await_why.clone();
+                    self.errors.push(TypeError { message: why, context: ctx.into() });
+                    return Ty::Unit;
+                }
+                if matches!(self.top_target(), Some(TargetView::Try)) {
+                    self.errors.push(TypeError {
+                        message: "`await` inside a `try` block is not supported: the block is lowered to a separate (non-async) function (Document 11 §3); `await` before the `try`, or put the `try` inside a helper".into(),
+                        context: ctx.into(),
+                    });
+                    return Ty::Unit;
+                }
+                let result = match (future_item(&it), join_handle_item(&it)) {
+                    (Some(u), _) | (_, Some(u)) => u,
+                    _ => {
+                        if !ty_has_infer(&it) && it != Ty::Never {
+                            self.errors.push(TypeError {
+                                message: format!("cannot `await` a value of type `{}`: only a `Future<T>` (from an `async fn`) or a `JoinHandle<T>` (from `spawn`) can be awaited", it),
+                                context: ctx.into(),
+                            });
+                        }
+                        return Ty::Unit;
+                    }
+                };
+                // what is alive across this suspension point decides whether the future is `Send`
+                if let Some(key) = self.cur_async_fn.clone() {
+                    let mut why: Option<String> = None;
+                    for (n, t) in env.all_bindings() {
+                        let t = self.zonk(&t);
+                        if let Some(w) = self.not_send_reason(&t) {
+                            why = Some(format!("{} (alive in `{}` across an `await` in `async fn {}`; Document 12 §11.7)", w, n, key));
+                            break;
+                        }
+                    }
+                    let dep = self.async_callee_key(inner);
+                    let info = self.future_info.entry(key).or_default();
+                    if info.not_send.is_none() {
+                        info.not_send = why;
+                    }
+                    if let Some(d) = dep {
+                        info.deps.push(d);
+                    }
+                }
+                result
             }
 
             Expr::Throw(inner) => {
@@ -3508,6 +3691,9 @@ impl TypeChecker {
             }
         }
         let saved_gen = self.cur_gen.take();
+        let saved_await = (self.await_ok, std::mem::take(&mut self.await_why), self.cur_async_fn.take());
+        self.await_ok = false;
+        self.await_why = "`await` cannot be used inside a closure or a `spawn` block: only the body of an `async fn` can suspend (Document 12 §11.4); `await` before calling `spawn`, or `spawn` the future itself (`spawn f()`)".into();
         match &known_ret {
             Some(r) => self.prop_targets.push(PropTarget::FnRet(r.clone())),
             None => {
@@ -3521,6 +3707,9 @@ impl TypeChecker {
         };
         self.prop_targets.pop();
         self.cur_gen = saved_gen;
+        self.await_ok = saved_await.0;
+        self.await_why = saved_await.1;
+        self.cur_async_fn = saved_await.2;
         let seen = if known_ret.is_none() { self.closure_ret_seen.pop().flatten() } else { None };
         let ret = match known_ret {
             Some(r) => {
@@ -4971,6 +5160,13 @@ impl TypeChecker {
                     context: ctx.into(),
                 });
             }
+            None if self.cur_async_fn.is_some() => {
+                self.check_expr(value, None, env, ctx);
+                self.errors.push(TypeError {
+                    message: "`yield` inside an `async fn`: an async function produces one value (its result); only a generator function (`-> Generator<T>`) can `yield` (Document 9 §4, Document 12 §11.4)".into(),
+                    context: ctx.into(),
+                });
+            }
             None => {
                 self.check_expr(value, None, env, ctx);
                 self.errors.push(TypeError {
@@ -5820,7 +6016,7 @@ impl TypeChecker {
                             }
                         })
                     }
-                    "Box" | "Generator" | "JoinHandle" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
+                    "Box" | "Generator" | "JoinHandle" | "Future" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
                     _ => {
                         let key = format!("{}#{}", ty, kind);
                         if !seen.insert(key) {
@@ -5854,6 +6050,67 @@ impl TypeChecker {
         }
     }
 
+    /// The `async fn` a call expression invokes (`f(..)`, `Type::f(..)`, `x.method(..)`), if known.
+    fn async_callee_key(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Paren(i) => self.async_callee_key(i),
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Ident(n) if self.async_fns.contains(n) => Some(n.clone()),
+                Expr::Path(p) if p.len() == 2 => {
+                    let k = format!("{}::{}", p[0], p[1]);
+                    self.async_fns.contains(&k).then_some(k)
+                }
+                _ => None,
+            },
+            Expr::MethodCall { receiver, name, .. } => {
+                let rt = self.expr_types.get(&(receiver.as_ref() as *const Expr as usize))?;
+                let mut t = rt;
+                while let Ty::Ref(_, i) = t {
+                    t = i;
+                }
+                match t {
+                    Ty::Named(n) | Ty::Generic(n, _) => {
+                        let k = format!("{}::{}", n, name);
+                        self.async_fns.contains(&k).then_some(k)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Why the future of `async fn key` is not `Send`, following the futures it awaits.
+    fn future_not_send(&self, key: &str, seen: &mut Vec<String>) -> Option<String> {
+        if seen.iter().any(|s| s == key) {
+            return None;
+        }
+        seen.push(key.to_string());
+        let info = self.future_info.get(key)?;
+        if let Some(w) = &info.not_send {
+            return Some(w.clone());
+        }
+        for d in &info.deps {
+            if let Some(w) = self.future_not_send(d, seen) {
+                return Some(format!("{} (through the future of `{}`)", w, d));
+            }
+        }
+        None
+    }
+
+    /// After every body was checked: a spawned future must be `Send`.
+    fn resolve_future_spawns(&mut self) {
+        let sites = std::mem::take(&mut self.future_spawns);
+        for (key, ctx) in sites {
+            if let Some(w) = self.future_not_send(&key, &mut Vec::new()) {
+                self.errors.push(TypeError {
+                    message: format!("the future of `async fn {}` cannot be spawned: it is not `Send`: {}", key, w),
+                    context: ctx,
+                });
+            }
+        }
+    }
+
     /// `spawn <closure>` and `thread::spawnOS(<closure>)` (Doc 12 §11.2, §11.3): the operand must be
     /// a zero-parameter closure literal (a block is wrapped by the parser); the task's captured
     /// variables and its result must be `Send` and may not borrow. Yields `JoinHandle<T>`.
@@ -5862,11 +6119,31 @@ impl TypeChecker {
         let Expr::Closure(c) = operand else {
             // a function item or a `Future<T>` call
             let t = self.check_expr(operand, None, env, ctx);
+            let t = self.zonk(&t);
+            if let Some(u) = future_item(&t) {
+                if what != "spawn" {
+                    self.errors.push(TypeError { message: format!("`{}` takes a closure, not a `Future<T>`; use `spawn f()` to run a future on the task pool", what), context: ctx.into() });
+                    return handle(u);
+                }
+                if ty_borrows(&u) {
+                    self.errors.push(TypeError { message: format!("the future given to `spawn` produces `{}`, a borrowed reference that may outlive the data it borrows", u), context: ctx.into() });
+                }
+                if let Some(why) = self.not_send_reason(&u) {
+                    self.errors.push(TypeError { message: format!("{} (it is the result of the future given to `spawn`; Document 12 §11.7)", why), context: ctx.into() });
+                }
+                match self.async_callee_key(operand) {
+                    Some(k) => self.future_spawns.push((k, ctx.to_string())),
+                    None => {
+                        // a future held in a variable: `Send` iff its output is (approximation)
+                    }
+                }
+                return handle(u);
+            }
             let msg = match &t {
                 Ty::Fn(ps, r) if ps.is_empty() && (matches!(operand, Expr::Path(_)) || matches!(operand, Expr::Ident(n) if env.get(n).is_none())) => {
                     return handle((**r).clone());
                 }
-                _ => format!("`{}` takes a block, a closure literal (`|| {{ .. }}`) or the name of a function, found a value of type `{}`; spawning a `Future<T>` call arrives with `async` (Phase 12, milestone M4)", what, t),
+                _ => format!("`{}` takes a block, a closure literal (`|| {{ .. }}`), the name of a function or a call of an `async fn`, found a value of type `{}`", what, t),
             };
             self.errors.push(TypeError { message: msg, context: ctx.into() });
             return handle(Ty::Unit);

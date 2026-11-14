@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Phase 11c C7: build every program in examples/concurrency/ and run it under valgrind.
+# Phase 12: build every program in examples/concurrency/ and run it under valgrind.
 # Fails (exit 1) if any program leaks definitely-lost memory, touches invalid memory,
-# double-frees, or exits with a non-zero code.  Usage: scripts/valgrind_memory_examples.sh [path/to/mtnc]
+# double-frees, or exits with a non-zero code.  Usage: scripts/valgrind_concurrency_examples.sh [path/to/mtnc]
 set -u
 MTNC="${1:-target/debug/mtnc}"
 OUT="$(mktemp -d)"
