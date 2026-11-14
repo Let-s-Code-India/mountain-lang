@@ -1,0 +1,52 @@
+// async/await basics (Doc 12 §3, §11.4): lazy futures, nested await, join, spawn of a future.
+async fn add(a: i32, b: i32) -> i32 {
+    await yieldNow();
+    return a + b;
+}
+
+async fn greeting(name: String) -> String {
+    let extra = String::from("!");
+    await yieldNow();
+    println(extra);
+    return name;
+}
+
+async fn twice(x: i32) -> i32 {
+    let a = await add(x, x);
+    return await add(a, 0);
+}
+
+struct Counter { base: i32 }
+impl Counter {
+    async fn total(self, extra: i32) -> i32 {
+        await yieldNow();
+        return self.base + extra;
+    }
+}
+
+async fn main() {
+    println(await twice(21));
+
+    // a future that is never awaited never runs; it is dropped with its parameters
+    let unused = greeting(String::from("never"));
+
+    // join: all futures run concurrently on the pool; the result is a tuple
+    let (x, y, z) = await join(add(1, 2), twice(5), add(10, 20));
+    println(x + y + z);
+
+    // join over an array literal gives an array
+    let r = await join([add(1, 1), add(2, 2), add(3, 3)]);
+    println(r[0] + r[1] + r[2]);
+
+    // heap values owned by a suspended future
+    let (g, h) = await join(greeting(String::from("hello")), greeting(String::from("world")));
+    println(g);
+    println(h);
+
+    // spawn a future: it becomes a task; its JoinHandle can be awaited
+    let handle = spawn add(40, 2);
+    println(await handle);
+
+    let c = Counter { base: 100 };
+    println(await c.total(5));
+}

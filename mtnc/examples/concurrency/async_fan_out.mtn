@@ -1,0 +1,22 @@
+// Fan-out of 100 spawned futures, awaited in spawn order (Doc 12 §3). A chain of handles is
+// used because a growable array of handles needs Vec (Phase 16).
+async fn job(i: i32) -> i32 {
+    await yieldNow();
+    return i * 2;
+}
+
+async fn chain(i: i32, n: i32, h: JoinHandle<i32>) -> i32 {
+    let here = await h;
+    println(here);
+    if i == n {
+        return here;
+    }
+    let next = spawn job(i);
+    return here + await chain(i + 1, n, next);
+}
+
+async fn main() {
+    let first = spawn job(0);
+    let total = await chain(1, 100, first);
+    println(total);
+}
