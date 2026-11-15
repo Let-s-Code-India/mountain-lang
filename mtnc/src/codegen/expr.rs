@@ -1425,6 +1425,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
             }
             if let Ty::Generic(gn, ga) = &b0 {
+                if gn == "ActorRef" && name == "send" && args.len() == 1 {
+                    if let Some(crate::types::GenericArg::Type(mt)) = ga.first() {
+                        let mt = mt.clone();
+                        return self.gen_actor_send(receiver, &args[0].value, &mt);
+                    }
+                }
+            }
+            if let Ty::Generic(gn, ga) = &b0 {
                 if matches!(gn.as_str(), "Rc" | "Arc" | "Weak") && matches!(name, "clone" | "downgrade" | "upgrade") {
                     let whole_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: the type checker recorded no type for a method call".into()))?;
                     return self.rc_method(receiver, gn, ga, name, &whole_ty);
@@ -2833,6 +2841,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
                         "drop" => return self.gen_drop_call(args),
                         "pinToCore" => return self.gen_pin_to_core(&args[0].value),
+                        "__actor_new" => return self.gen_actor_new(args),
                         "__await_yield" if self.async_item.is_some() => return self.gen_await_yield(),
                         "__await_sleep" if self.async_item.is_some() => return self.gen_await_sleep(&args[0].value),
                         "assert" => return self.gen_assert(args),

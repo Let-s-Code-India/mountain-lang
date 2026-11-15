@@ -37,6 +37,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         match ty {
             Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
+            Ty::Generic(n, _) if n == "ActorRef" => false,
             Ty::Generic(n, _) => crate::types::is_heap_generic(n),
             Ty::Tuple(ts) => ts.iter().any(|t| self.needs_drop_d(t, depth + 1)),
             Ty::Fixed(t, _) => self.needs_drop_d(t, depth + 1),
