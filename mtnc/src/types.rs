@@ -648,7 +648,7 @@ pub fn register_item_context(items: &[&Item]) {
 
 /// `Box`/`Rc`/`Arc`/`Weak` are compiler-known generic heap types (Doc 6/13); they need no declaration.
 pub fn is_heap_generic(n: &str) -> bool {
-    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator" | "JoinHandle" | "Future")
+    matches!(n, "Box" | "Rc" | "Arc" | "Weak" | "Generator" | "JoinHandle" | "Future" | "ActorRef")
 }
 
 /// `Future<T>` (Doc 12 §3, §11.4): the owning handle of a heap-allocated `async fn` frame.
@@ -2176,6 +2176,12 @@ impl TypeChecker {
                         message: format!("generator function `{}`: {} is passed by `borrow`; a generator outlives the call and owns all of its parameters, so pass {} by value", f.name, what, if p.name == "self" { "`self`" } else { "it" }),
                         context: f.name.clone(),
                     });
+                } else if p.name != "self" && ty_borrows(&resolve_with_self(&p.ty)) {
+                    // the other spelling: `x: borrow T` / `x: borrow mut T` / any reference type (Doc 12 §11.11 item 4)
+                    self.errors.push(TypeError {
+                        message: format!("generator function `{}`: {} has the borrowed type `{}`; a generator outlives the call and owns all of its parameters, so pass it by value (Document 9 §8.6)", f.name, what, resolve_with_self(&p.ty)),
+                        context: f.name.clone(),
+                    });
                 }
             }
         }
@@ -2195,6 +2201,11 @@ impl TypeChecker {
                         message: format!("`async fn {}`: {} is passed by `borrow`; the future outlives the call and owns all of its parameters, so {}", f.name, what, hint),
                         context: f.name.clone(),
                     });
+                } else if p.name != "self" && ty_borrows(&resolve_with_self(&p.ty)) {
+                    self.errors.push(TypeError {
+                        message: format!("`async fn {}`: {} has the borrowed type `{}`; the future outlives the call and owns all of its parameters, so pass it by value (Document 12 §11.11)", f.name, what, resolve_with_self(&p.ty)),
+                        context: f.name.clone(),
+                    });
                 }
             }
         }
@@ -2208,7 +2219,11 @@ impl TypeChecker {
         };
         let saved_await = (self.await_ok, std::mem::take(&mut self.await_why), self.cur_async_fn.take());
         self.await_ok = f.is_async;
-        self.await_why = format!("`await` can only be used inside an `async fn` (Document 12 §11.4), and `{}` is not `async`", f.name);
+        self.await_why = if f.name.starts_with("__on_") {
+            "`await` is not allowed in an actor handler: a handler is an ordinary synchronous body (Document 12 §11.5); `spawn` an async task or send a message instead".to_string()
+        } else {
+            format!("`await` can only be used inside an `async fn` (Document 12 §11.4), and `{}` is not `async`", f.name)
+        };
         self.cur_async_fn = async_key.clone();
         if let Some(k) = &async_key {
             self.future_info.entry(k.clone()).or_default();
@@ -2578,7 +2593,11 @@ impl TypeChecker {
                     }
                 } else {
                     self.errors.push(TypeError {
-                        message: format!("undefined variable `{}`", name),
+                        message: if name == "self" {
+                            "`self` is only available inside a method or an actor `on` handler (Document 12 §11.5)".to_string()
+                        } else {
+                            format!("undefined variable `{}`", name)
+                        },
                         context: ctx.into(),
                     });
                     // Already reported; don't let a downstream `?` pile a
@@ -2635,7 +2654,7 @@ impl TypeChecker {
                             }
                             None => {
                                 self.errors.push(TypeError {
-                                    message: format!("enum `{}` has no variant `{}`", enum_name, variant_name),
+                                    message: self.no_variant_message(enum_name, variant_name),
                                     context: ctx.into(),
                                 });
                                 return Ty::Named(enum_name.clone());
@@ -2965,6 +2984,36 @@ impl TypeChecker {
                                 }
                             }
                             return Ty::Unit;
+                        }
+                        "__actor_new" if !self.functions.contains_key("__actor_new") && args.len() == 2 => {
+                            let st_t = self.check_expr(&args[0].value, None, env, ctx);
+                            let st_t = self.zonk(&st_t);
+                            let actor = match &st_t {
+                                Ty::Named(n) if n.starts_with("__ActorState_") => n["__ActorState_".len()..].to_string(),
+                                _ => {
+                                    self.errors.push(TypeError { message: "internal: `__actor_new` needs an actor state".into(), context: ctx.into() });
+                                    return Ty::Unit;
+                                }
+                            };
+                            if let Some(why) = self.not_send_reason(&st_t) {
+                                self.errors.push(TypeError { message: format!("the state of actor `{}` must be `Send` (it moves between worker threads): {}", actor, why.replace("__ActorState_", "")), context: ctx.into() });
+                            }
+                            if let Some(why) = self.not_send_reason(&Ty::Named(actor.clone())) {
+                                self.errors.push(TypeError { message: format!("a message of actor `{}` must be `Send` (messages are handed to another thread): {}", actor, why), context: ctx.into() });
+                            }
+                            return Ty::Generic("ActorRef".into(), vec![GenericArg::Type(Ty::Named(actor))]);
+                        }
+                        n if env.get(n).is_none() && !self.functions.contains_key(n) && self.ambiguous_message(n).is_some() => {
+                            let actors = self.ambiguous_message(n).unwrap_or_default();
+                            for a in args {
+                                self.check_expr(&a.value, None, env, ctx);
+                            }
+                            let spelled: Vec<String> = actors.iter().map(|a| format!("`{}::{}(..)`", a, n)).collect();
+                            self.errors.push(TypeError {
+                                message: format!("the message name `{}` is defined by several actors ({}): the bare name is ambiguous; write {} (Document 12 §11.5)", n, actors.join(", "), spelled.join(" or ")),
+                                context: ctx.into(),
+                            });
+                            return Ty::Never;
                         }
                         "join" if !self.functions.contains_key("join") => {
                             for a in args {
@@ -3345,7 +3394,7 @@ impl TypeChecker {
                                 }
                                 None => {
                                     self.errors.push(TypeError {
-                                        message: format!("enum `{}` has no variant `{}`", enum_name, variant_name),
+                                        message: self.no_variant_message(enum_name, variant_name),
                                         context: ctx.into(),
                                     });
                                     return Ty::Named(enum_name.clone());
@@ -3370,6 +3419,25 @@ impl TypeChecker {
                         ("JoinHandle", "join", Some(t)) if args.is_empty() => {
                             self.join_receivers.insert(receiver.as_ref() as *const Expr as usize);
                             return t;
+                        }
+                        ("ActorRef", "send", Some(t)) => {
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`send` takes exactly one message, found {} arguments", args.len()), context: ctx.into() });
+                                return Ty::Unit;
+                            }
+                            let at = self.check_expr(&args[0].value, Some(&t), env, ctx);
+                            let at = self.zonk(&at);
+                            if at != t && at != Ty::Never && !ty_has_infer(&at) {
+                                self.errors.push(TypeError {
+                                    message: format!("`send` on `ActorRef<{0}>` needs a message of actor `{0}` (build one with `{0}::handlerName(..)` or the bare handler name), found `{1}`", t, at),
+                                    context: ctx.into(),
+                                });
+                            }
+                            return Ty::Unit;
+                        }
+                        ("ActorRef", other, Some(_)) => {
+                            self.errors.push(TypeError { message: format!("`ActorRef` has only `send(message)` (found `{}`); an actor's state is private (Document 12 §8, §11.5)", other), context: ctx.into() });
+                            return Ty::Unit;
                         }
                         ("JoinHandle", other, Some(_)) => {
                             self.errors.push(TypeError { message: format!("`JoinHandle` has only `join()` (found `{}`)", other), context: ctx.into() });
@@ -5449,6 +5517,8 @@ impl TypeChecker {
         }
         match t {
             Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
+            // `ActorRef<A>` is a plain, copyable pointer: actors live until the process exits (M5)
+            Ty::Generic(n, _) if n == "ActorRef" => false,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
             Ty::Tuple(ts) => ts.iter().any(|x| self.owns_heap(x, depth + 1)),
             Ty::Fixed(x, _) => self.owns_heap(x, depth + 1),
@@ -5586,7 +5656,7 @@ impl TypeChecker {
             }
         }
         let Some((_, data)) = shape.variants.iter().find(|(n, _)| n == vn).cloned() else {
-            self.errors.push(TypeError { message: format!("enum `{}` has no variant `{}`", en, vn), context: ctx.into() });
+            self.errors.push(TypeError { message: self.no_variant_message(&en, &vn), context: ctx.into() });
             for a in args { self.check_expr(&a.value, None, env, ctx); }
             return Ty::Named(en.to_string());
         };
@@ -5876,6 +5946,13 @@ impl TypeChecker {
             }
         }
         if let Ty::Generic(n, args) = base {
+            if n == "ActorRef" {
+                self.errors.push(TypeError {
+                    message: format!("`{}` has no field `{}`: the state of an actor is not accessible from outside; the only way to interact with an actor is `r.send(message)` (Document 12 §8, §11.5)", base, field),
+                    context: ctx.into(),
+                });
+                return Ty::Unit;
+            }
             if let Some(shape) = self.structs.get(n).cloned() {
                 let subst: HashMap<String, Ty> = generic_subst(&shape.generics, args);
                 for (fname, fty) in &shape.fields {
@@ -6017,6 +6094,8 @@ impl TypeChecker {
                         })
                     }
                     "Box" | "Generator" | "JoinHandle" | "Future" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
+                    // an actor reference is a handle on a mailbox: always `Send` and `Sync` (Document 12 §11.5)
+                    "ActorRef" => None,
                     _ => {
                         let key = format!("{}#{}", ty, kind);
                         if !seen.insert(key) {
@@ -6051,6 +6130,22 @@ impl TypeChecker {
     }
 
     /// The `async fn` a call expression invokes (`f(..)`, `Type::f(..)`, `x.method(..)`), if known.
+    /// Actors that define a handler called `name`, when two or more do (the compiler adds a marker
+    /// function `__ambiguous_msg$name$A$B` for each such name, Phase 12 M5).
+    /// `enum E has no variant v`, worded for an actor's message type when `E` is an actor.
+    fn no_variant_message(&self, en: &str, vn: &str) -> String {
+        if self.functions.contains_key(&format!("__actor_dispatch_{}", en)) {
+            format!("actor `{}` has no handler `{}` (its handlers are the `on` blocks of the actor; Document 12 §11.5)", en, vn)
+        } else {
+            format!("enum `{}` has no variant `{}`", en, vn)
+        }
+    }
+
+    fn ambiguous_message(&self, name: &str) -> Option<Vec<String>> {
+        let prefix = format!("__ambiguous_msg${}$", name);
+        self.functions.keys().find_map(|k| k.strip_prefix(&prefix).map(|r| r.split('$').map(|x| x.to_string()).collect()))
+    }
+
     fn async_callee_key(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Paren(i) => self.async_callee_key(i),
@@ -6131,10 +6226,20 @@ impl TypeChecker {
                 if let Some(why) = self.not_send_reason(&u) {
                     self.errors.push(TypeError { message: format!("{} (it is the result of the future given to `spawn`; Document 12 §11.7)", why), context: ctx.into() });
                 }
-                match self.async_callee_key(operand) {
+                // Document 12 §11.11 item 5: only a direct `async fn` call is judged exactly; a future
+                // that is a variable, parameter, field, element or function-value result is not `Send`
+                let mut callee = operand;
+                while let Expr::Paren(i) = callee {
+                    callee = i;
+                }
+                let shadowed = matches!(callee, Expr::Call { callee: c, .. } if matches!(c.as_ref(), Expr::Ident(n) if env.get(n).is_some()));
+                match self.async_callee_key(operand).filter(|_| !shadowed) {
                     Some(k) => self.future_spawns.push((k, ctx.to_string())),
                     None => {
-                        // a future held in a variable: `Send` iff its output is (approximation)
+                        self.errors.push(TypeError {
+                            message: format!("the future given to `spawn` is not `Send`: it is not a direct `async fn` call, so the compiler cannot see what it holds across its suspension points (it could hold an `Rc`); pass the async call itself to `spawn`, e.g. `spawn work(x)` (Document 12 §11.11)"),
+                            context: ctx.into(),
+                        });
                     }
                 }
                 return handle(u);
@@ -6163,6 +6268,13 @@ impl TypeChecker {
             if ty_borrows(&vt) {
                 self.errors.push(TypeError {
                     message: format!("`{}` has type `{}`, a borrowed reference: the task given to `{}` may outlive the data it borrows; give the task an owned value or an `Arc`", name, vt, what),
+                    context: ctx.into(),
+                });
+                continue;
+            }
+            if future_item(&vt).is_some() || generator_item(&vt).is_some() {
+                self.errors.push(TypeError {
+                    message: format!("`{}` has type `{}` and is captured by the task given to `{}`: it is not `Send` because the compiler cannot see what a future or generator held in a variable keeps alive across its suspension points; pass the async call itself to `spawn` (Document 12 §11.11)", name, vt, what),
                     context: ctx.into(),
                 });
                 continue;

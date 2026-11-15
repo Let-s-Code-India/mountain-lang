@@ -870,6 +870,12 @@ impl Parser {
     fn parse_actor_decl(&mut self) -> ParseResult<ActorDecl> {
         self.expect_kw(Keyword::Actor)?;
         let name = self.expect_word()?;
+        if self.check_op(Op::Lt) {
+            return self.error("actor generics are not part of Mountain 1.0 (Document 12 §11.5): declare a concrete `actor`");
+        }
+        if self.check_delim(Delim::Colon) || self.check_kw(Keyword::Impl) || self.check_kw(Keyword::Where) {
+            return self.error("actor inheritance and trait bounds on actors are not part of Mountain 1.0 (Document 12 §11.5)");
+        }
         self.expect_delim(Delim::LBrace)?;
         let mut items = Vec::new();
         while !self.check_delim(Delim::RBrace) {
@@ -893,6 +899,9 @@ impl Parser {
                     }
                 }
                 self.expect_delim(Delim::RParen)?;
+                if self.check_op(Op::Arrow) {
+                    return self.error("request/reply is not part of Mountain 1.0 (Document 12 §11.5): an `on` handler returns `()`; send a message back with an `ActorRef` passed in the message");
+                }
                 let body = self.parse_block()?;
                 items.push(ActorItem::On(OnHandler { name, params, body }));
             } else {

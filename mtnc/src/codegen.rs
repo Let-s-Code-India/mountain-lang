@@ -1287,7 +1287,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             || self.module.get_function("__mtn_rt_spawn").is_some()
             || self.module.get_function("__mtn_rt_spawn_future").is_some()
             || self.module.get_function("__mtn_rt_spawn_os").is_some()
-            || self.module.get_function("__mtn_rt_pin_to_core").is_some();
+            || self.module.get_function("__mtn_rt_pin_to_core").is_some()
+            || self.module.get_function("__mtn_rt_actor_new").is_some()
+            || self.module.get_function("__mtn_rt_actor_send").is_some();
         if uses_rt {
             let init = self.get_extern("__mtn_rt_init", None, &[], false);
             self.builder.build_call(init, &[], "")?;
@@ -1371,5 +1373,6 @@ mod dynamic;
 mod expr;
 mod generator;
 mod task;
+mod actor;
 mod print;
 pub(crate) mod tail;

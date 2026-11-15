@@ -109,6 +109,10 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
         inject_async_prelude(&mut program);
     }
     desugar::desugar_join(&mut program);
+    let actor_errors = desugar::desugar_actors(&mut program);
+    if !actor_errors.is_empty() {
+        return Err(actor_errors);
+    }
     // Same-named nested items of different functions get distinct names first.
     crate::scope::scope_nested_items(&mut program);
     desugar::inline_generic_default_methods(&mut program);

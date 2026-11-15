@@ -1152,3 +1152,210 @@ pub fn desugar_join(program: &mut Program) {
         _ => {}
     });
 }
+
+// ---------------------------------------------------------------- actors (Phase 12 M5)
+
+/// Document 12 §8, §11.5: lowers every top-level `actor A { state f: T = init; on h(p: P) { .. } }`
+/// to ordinary items, so the type checker, borrow checker and code generator need no actor-specific
+/// passes beyond `ActorRef<A>`, `send` and the internal `__actor_new`:
+///
+/// ```text
+/// struct __ActorState_A { f: T }                      // the private state
+/// impl __ActorState_A { fn __on_h(borrow mut self, p: P) { .. } }   // one method per handler
+/// enum A { h(P), .. }                                 // the message type: one variant per handler
+/// fn __actor_dispatch_A(st: borrow mut __ActorState_A, msg: A) { match msg { A::h(p) => st.__on_h(p), .. } }
+/// impl A { fn spawn() -> ActorRef<A> { __actor_new(__ActorState_A { f: init }, __actor_dispatch_A) } }
+/// fn h(p: P) -> A { A::h(p) }                         // the bare message name, when it is unique
+/// ```
+/// Returns the compile errors found while lowering (duplicate handlers, `borrow` message fields...).
+pub fn desugar_actors(program: &mut Program) -> Vec<String> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut errors = Vec::new();
+    let actors: Vec<ActorDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| if let ItemKind::Actor(a) = &i.kind { Some(a.clone()) } else { None })
+        .collect();
+    if actors.is_empty() {
+        return errors;
+    }
+    program.items.retain(|i| !matches!(i.kind, ItemKind::Actor(_)));
+    let declared: HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Fn(f) => Some(f.name.clone()),
+            ItemKind::Struct(s) => Some(s.name.clone()),
+            ItemKind::Enum(e) => Some(e.name.clone()),
+            _ => None,
+        })
+        .collect();
+    // handler name -> actors defining it (declaration order)
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for a in &actors {
+        let mut seen = HashSet::new();
+        for it in &a.items {
+            if let ActorItem::On(h) = it {
+                if seen.insert(h.name.clone()) {
+                    owners.entry(h.name.clone()).or_default().push(a.name.clone());
+                }
+            }
+        }
+    }
+    let parse = |text: &str| -> Vec<Item> {
+        let (tokens, lex) = crate::lexer::tokenize(text);
+        assert!(lex.is_empty(), "internal: the actor skeleton does not lex: {}\n{}", lex[0], text);
+        let (prog, errs) = crate::parser::parse_program(tokens);
+        assert!(errs.is_empty(), "internal: the actor skeleton does not parse: {}\n{}", errs[0].message, text);
+        prog.items
+    };
+    for a in &actors {
+        let name = &a.name;
+        let states: Vec<&StateDecl> = a.items.iter().filter_map(|i| if let ActorItem::State(s) = i { Some(s) } else { None }).collect();
+        let mut handlers: Vec<&OnHandler> = Vec::new();
+        let mut ok = true;
+        let mut seen_h = HashSet::new();
+        for it in &a.items {
+            if let ActorItem::On(h) = it {
+                if h.name == "spawn" {
+                    errors.push(format!("error: actor `{}`: `spawn` is reserved (`{}::spawn()` creates the actor); choose another handler name", name, name));
+                    ok = false;
+                }
+                if !seen_h.insert(h.name.clone()) {
+                    errors.push(format!("error: actor `{}` defines the handler `{}` twice", name, h.name));
+                    ok = false;
+                }
+                for p in &h.params {
+                    if p.is_variadic || p.ownership != OwnershipMod::None || p.default.is_some() {
+                        errors.push(format!(
+                            "error: actor `{}`, handler `{}`, parameter `{}`: the fields of a message are passed by value (no `borrow`, variadic or default parameters; Document 12 §11.5)",
+                            name, h.name, p.name
+                        ));
+                        ok = false;
+                    }
+                }
+                handlers.push(h);
+            }
+        }
+        let mut seen_s = HashSet::new();
+        for s in &states {
+            if !seen_s.insert(s.name.clone()) {
+                errors.push(format!("error: actor `{}` declares the state `{}` twice", name, s.name));
+                ok = false;
+            }
+        }
+        if handlers.is_empty() {
+            errors.push(format!("error: actor `{}` has no `on` handler: nothing could ever be sent to it", name));
+            ok = false;
+        }
+        if !ok {
+            continue;
+        }
+        // ---- skeleton text
+        let mut text = String::new();
+        // an actor without state still gets a one-field struct (an empty struct is not a value here)
+        let pad = states.is_empty();
+        text.push_str(&format!(
+            "struct __ActorState_{} {{ {} }}\n",
+            name,
+            if pad { "__pad: i32".to_string() } else { states.iter().map(|s| format!("{}: i32", s.name)).collect::<Vec<_>>().join(", ") }
+        ));
+        text.push_str(&format!(
+            "enum {} {{ {} }}\n",
+            name,
+            handlers.iter().map(|h| format!("{}({})", h.name, vec!["i32"; h.params.len()].join(", "))).collect::<Vec<_>>().join(", ")
+        ));
+        text.push_str(&format!(
+            "impl {0} {{ fn spawn() -> ActorRef<{0}> {{ let st = __ActorState_{0} {{ {1} }}; __actor_new(st, __actor_dispatch_{0}) }} }}\n",
+            name,
+            if pad { "__pad: 0".to_string() } else { states.iter().map(|s| format!("{}: 0", s.name)).collect::<Vec<_>>().join(", ") }
+        ));
+        let arms: Vec<String> = handlers
+            .iter()
+            .map(|h| {
+                let vars: Vec<String> = (0..h.params.len()).map(|i| format!("a{}", i)).collect();
+                format!("{n}::{h}({v}) => {{ st.__on_{h}({v}); }}", n = name, h = h.name, v = vars.join(", "))
+            })
+            .collect();
+        text.push_str(&format!("fn __actor_dispatch_{0}(st: borrow mut __ActorState_{0}, msg: {0}) {{ match msg {{ {1} }} }}\n", name, arms.join(" ")));
+        text.push_str(&format!("impl __ActorState_{} {{ {} }}\n", name, handlers.iter().map(|h| format!("fn __on_{}(borrow mut self) {{ }}", h.name)).collect::<Vec<_>>().join(" ")));
+        for h in &handlers {
+            if owners.get(&h.name).map_or(false, |o| o.len() == 1) && !declared.contains(&h.name) {
+                let vars: Vec<String> = (0..h.params.len()).map(|i| format!("q{}", i)).collect();
+                let ps: Vec<String> = vars.iter().map(|v| format!("{}: i32", v)).collect();
+                text.push_str(&format!("fn {h}({ps}) -> {n} {{ {n}::{h}({vs}) }}\n", h = h.name, ps = ps.join(", "), n = name, vs = vars.join(", ")));
+            }
+        }
+        let mut items = parse(&text);
+        // ---- patch the real types, initial values, parameters and bodies in
+        for it in items.iter_mut() {
+            match &mut it.kind {
+                ItemKind::Struct(sd) if sd.name.starts_with("__ActorState_") => {
+                    if let StructBody::Named(fields) = &mut sd.body {
+                        for (f, s) in fields.iter_mut().zip(states.iter()) {
+                            f.ty = s.ty.clone();
+                        }
+                    }
+                }
+                ItemKind::Enum(ed) if &ed.name == name => {
+                    for (v, h) in ed.variants.iter_mut().zip(handlers.iter()) {
+                        v.data = h.params.iter().map(|p| p.ty.clone()).collect();
+                    }
+                }
+                ItemKind::Impl(im) if im.target.name == *name => {
+                    // `spawn`: the state literal takes the declared initial values
+                    for ii in im.items.iter_mut() {
+                        if let ImplItem::Fn(f) = ii {
+                            if let Some(body) = &mut f.body {
+                                if let Some(Stmt::Let { value: Some(Expr::StructLit { fields, .. }), .. }) = body.stmts.first_mut() {
+                                    for ((_, v), s) in fields.iter_mut().zip(states.iter()) {
+                                        *v = s.value.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ItemKind::Impl(im) if im.target.name.starts_with("__ActorState_") => {
+                    for (ii, h) in im.items.iter_mut().zip(handlers.iter()) {
+                        if let ImplItem::Fn(f) = ii {
+                            f.params.extend(h.params.iter().cloned());
+                            f.body = Some(h.body.clone());
+                        }
+                    }
+                }
+                ItemKind::Fn(f) if !f.name.starts_with("__actor_dispatch_") => {
+                    // bare message constructor: the real parameter list
+                    if let Some(h) = handlers.iter().find(|h| h.name == f.name) {
+                        f.params = h
+                            .params
+                            .iter()
+                            .map(|p| Param { ownership: OwnershipMod::None, name: p.name.clone(), is_variadic: false, ty: p.ty.clone(), default: None, is_mut: false })
+                            .collect();
+                        // the call `A::h(q0, ..)` uses the real parameter names
+                        if let Some(b) = &mut f.body {
+                            if let Some(Expr::Call { args, .. }) = b.tail.as_deref_mut() {
+                                for (arg, p) in args.iter_mut().zip(h.params.iter()) {
+                                    arg.value = Expr::Ident(p.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        program.items.extend(items);
+    }
+    // markers for the ambiguous bare names (the type checker turns a call of the bare name into an error)
+    for (h, os) in &owners {
+        if os.len() > 1 {
+            let mut items = parse("fn __ambiguous_msg() { }\n");
+            if let Some(Item { kind: ItemKind::Fn(f), .. }) = items.first_mut() {
+                f.name = format!("__ambiguous_msg${}${}", h, os.join("$"));
+            }
+            program.items.extend(items);
+        }
+    }
+    errors
+}

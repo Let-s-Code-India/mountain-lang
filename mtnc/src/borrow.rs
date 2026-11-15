@@ -365,6 +365,8 @@ impl BorrowChecker {
             // never copies the underlying owned data it points to.
             Type::Ref { .. } | Type::RawPtr { .. } => true,
             Type::Tuple(ts) => ts.iter().all(|t| self.is_type_copy(t)),
+            // `ActorRef<A>` is a plain pointer to the actor (Phase 12 M5): copyable
+            Type::Named(name, _) if name == "ActorRef" && !self.struct_copy.contains_key("ActorRef") => true,
             Type::Named(name, _) => *self.struct_copy.get(name).unwrap_or(&false),
             Type::Unit => true,
             // Array/[T], Dyn, Fn, Option, Result, Never, ConstArg:
@@ -423,6 +425,7 @@ impl BorrowChecker {
                 ctx: f.name.clone(),
                 errors: Vec::new(),
                 block_stack: Vec::new(),
+                break_acc: Vec::new(),
                 next_serial: 0,
                 closure_info: HashMap::new(),
                 by_ref_closures: std::collections::HashSet::new(),
@@ -578,6 +581,8 @@ struct FnChecker<'a> {
     /// One entry per block currently being checked: (unique serial of that block instance,
     /// index of the statement being checked right now). Phase 12 M0.
     block_stack: Vec<(usize, usize)>,
+    /// One entry per enclosing loop: the moved state at every `break` seen so far (F1).
+    break_acc: Vec<Option<Vec<HashMap<String, bool>>>>,
     next_serial: usize,
     /// Closure literals of this function by AST address (Phase 12 M1).
     closure_info: HashMap<usize, ClosureInfo>,
@@ -880,8 +885,12 @@ impl<'a> FnChecker<'a> {
                 self.check_return_value(e, block, idx);
             }
             Stmt::Yield(e) => self.check_moving_operand(e, block, idx),
-            Stmt::Break { value: Some(e), .. } => self.check_expr(e, block, idx),
-            Stmt::Return(None) | Stmt::Break { value: None, .. } | Stmt::Continue { .. } | Stmt::Item(_) => {}
+            Stmt::Break { value: Some(e), .. } => {
+                self.check_expr(e, block, idx);
+                self.record_break();
+            }
+            Stmt::Break { value: None, .. } => self.record_break(),
+            Stmt::Return(None) | Stmt::Continue { .. } | Stmt::Item(_) => {}
             Stmt::TargetBlock(_, b) => self.check_block(b),
         }
     }
@@ -1256,12 +1265,128 @@ impl<'a> FnChecker<'a> {
 
     fn check_if(&mut self, if_expr: &IfExpr, block: &Block, idx: usize) {
         self.check_expr(&if_expr.cond, block, idx);
-        self.check_branch(&if_expr.then_block);
-        match &if_expr.else_branch {
-            Some(ElseBranch::Block(b)) => self.check_branch(b),
-            Some(ElseBranch::If(inner)) => self.check_if(inner, block, idx),
-            None => {}
+        // Document 6 §9.11 (Phase 12 M5 / F1): the `then` block and the `else` part are
+        // alternative paths; a move in one does not affect the other.
+        let count = if if_expr.else_branch.is_some() { 2 } else { 1 };
+        self.branch_join(count, |this, i| {
+            if i == 0 {
+                this.check_branch(&if_expr.then_block);
+                block_diverges(&if_expr.then_block, !this.break_acc.is_empty())
+            } else {
+                match &if_expr.else_branch {
+                    Some(ElseBranch::Block(b)) => {
+                        this.check_branch(b);
+                        block_diverges(b, !this.break_acc.is_empty())
+                    }
+                    Some(ElseBranch::If(inner)) => {
+                        this.check_if(inner, block, idx);
+                        if_diverges(inner, !this.break_acc.is_empty())
+                    }
+                    None => false,
+                }
+            }
+        });
+    }
+
+    fn record_break(&mut self) {
+        let st = self.moved_state();
+        for slot in self.break_acc.iter_mut() {
+            match slot {
+                None => *slot = Some(st.clone()),
+                Some(acc) => or_state(acc, &st),
+            }
         }
+    }
+
+    /// A loop body runs more than once, so a variable moved in it (and not given a new value
+    /// before the iteration ends) is moved again by the next iteration (Document 6 §9.11).
+    /// The body is checked once, then once more from the state at the end of the iteration;
+    /// paths that leave through `break`/`return` do not loop back. `cond` is the `while` /
+    /// `do-while` condition (`cond_after` puts it after the body).
+    fn check_loop(&mut self, cond: Option<&Expr>, body: &Block, cond_after: bool, block: &Block, idx: usize) {
+        let base = self.moved_state();
+        self.break_acc.push(None);
+        let errs_before = self.errors.len();
+        self.loop_iteration(cond, body, cond_after, block, idx);
+        let raw_end = self.moved_state();
+        let carried = if block_diverges_in_loop(body) { base.clone() } else { raw_end.clone() };
+        let new_moves = carried.iter().zip(base.iter()).any(|(c, b)| c.iter().any(|(k, m)| *m && !b.get(k).copied().unwrap_or(true)));
+        if new_moves {
+            self.set_moved_state(&carried);
+            let n = self.errors.len();
+            self.loop_iteration(cond, body, cond_after, block, idx);
+            // the second pass only adds what the first could not see: drop exact repeats
+            let known: Vec<String> = self.errors[..n].iter().map(|e| e.message.clone()).collect();
+            let mut keep = Vec::new();
+            for (i, e) in self.errors.drain(n..).enumerate() {
+                let _ = i;
+                if !known.contains(&e.message) {
+                    keep.push(e);
+                }
+            }
+            self.errors.extend(keep);
+        }
+        let _ = errs_before;
+        let mut after = raw_end;
+        if let Some(Some(b)) = self.break_acc.pop() {
+            or_state(&mut after, &b);
+        }
+        let end = self.moved_state();
+        or_state(&mut after, &end);
+        or_state(&mut after, &base);
+        self.set_moved_state(&after);
+    }
+
+    fn loop_iteration(&mut self, cond: Option<&Expr>, body: &Block, cond_after: bool, block: &Block, idx: usize) {
+        if let (Some(c), false) = (cond, cond_after) {
+            self.check_expr(c, block, idx);
+        }
+        self.check_branch(body);
+        if let (Some(c), true) = (cond, cond_after) {
+            self.check_expr(c, block, idx);
+        }
+    }
+
+    /// The "moved" flag of every binding currently in scope, scope by scope.
+    fn moved_state(&self) -> Vec<HashMap<String, bool>> {
+        self.scopes.iter().map(|s| s.bindings.iter().map(|(k, b)| (k.clone(), b.moved)).collect()).collect()
+    }
+
+    fn set_moved_state(&mut self, st: &[HashMap<String, bool>]) {
+        for (scope, saved) in self.scopes.iter_mut().zip(st.iter()) {
+            for (k, b) in scope.bindings.iter_mut() {
+                if let Some(m) = saved.get(k) {
+                    b.moved = *m;
+                }
+            }
+        }
+    }
+
+    /// Document 6 §9.11: `count` alternative paths (`if`/`else` branches, `match` arms). Each
+    /// runs from the move state before the construct; afterwards a binding is moved if it was
+    /// moved before or in ANY alternative that does not end in `return` (`run` returns true when
+    /// its path diverges). Conservative: it may reject valid code, never accepts a use after a
+    /// move on some path.
+    fn branch_join<F: FnMut(&mut Self, usize) -> bool>(&mut self, count: usize, mut run: F) {
+        let base = self.moved_state();
+        let mut joined = base.clone();
+        for i in 0..count {
+            self.set_moved_state(&base);
+            let diverges = run(self, i);
+            if !diverges {
+                let after = self.moved_state();
+                for (j, scope) in after.iter().enumerate() {
+                    for (k, m) in scope {
+                        if *m {
+                            if let Some(slot) = joined.get_mut(j).and_then(|h| h.get_mut(k)) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.set_moved_state(&joined);
     }
 
     fn check_expr(&mut self, expr: &Expr, block: &Block, idx: usize) {
@@ -1398,31 +1523,32 @@ impl<'a> FnChecker<'a> {
             Expr::If(if_expr) => self.check_if(if_expr, block, idx),
             Expr::Match(m) => {
                 self.check_expr(&m.scrutinee, block, idx);
-                for arm in &m.arms {
+                self.branch_join(m.arms.len(), |this, i| {
+                    let arm = &m.arms[i];
                     if let Some(g) = &arm.guard {
-                        self.check_expr(g, block, idx);
+                        this.check_expr(g, block, idx);
                     }
                     match &arm.body {
-                        MatchArmBody::Expr(e) => self.check_branch_expr(e),
-                        MatchArmBody::Block(b) => self.check_branch(b),
+                        MatchArmBody::Expr(e) => {
+                            this.check_branch_expr(e);
+                            expr_diverges(e, !this.break_acc.is_empty())
+                        }
+                        MatchArmBody::Block(b) => {
+                            this.check_branch(b);
+                            block_diverges(b, !this.break_acc.is_empty())
+                        }
                     }
-                }
+                });
             }
             Expr::Loop(l) => match l.as_ref() {
-                LoopExpr::Loop { body, .. } => self.check_branch(body),
-                LoopExpr::While { cond, body, .. } => {
-                    self.check_expr(cond, block, idx);
-                    self.check_branch(body);
-                }
+                LoopExpr::Loop { body, .. } => self.check_loop(None, body, false, block, idx),
+                LoopExpr::While { cond, body, .. } => self.check_loop(Some(cond), body, false, block, idx),
                 LoopExpr::For { iter, body, .. } => {
                     // `for x in g` consumes a generator variable (it is moved into the loop)
                     self.check_moving_operand(iter, block, idx);
-                    self.check_branch(body);
+                    self.check_loop(None, body, false, block, idx);
                 }
-                LoopExpr::DoWhile { body, cond } => {
-                    self.check_branch(body);
-                    self.check_expr(cond, block, idx);
-                }
+                LoopExpr::DoWhile { body, cond } => self.check_loop(Some(cond), body, true, block, idx),
             },
             Expr::Block(b) => self.check_branch(b),
             Expr::Unsafe(b) => self.check_branch(b),
@@ -1777,4 +1903,55 @@ fn binding_name(pattern: &Pattern) -> Option<String> {
         // rather than a new one introduced by this pass).
         _ => None,
     }
+}
+
+/// True when every path through the block ends in `return` — or, with `brk`, also in `break`
+/// (inside a loop the moves at a `break` are recorded separately and do not loop back).
+fn block_diverges(b: &Block, brk: bool) -> bool {
+    let ends = |s: &Stmt| matches!(s, Stmt::Return(_)) || (brk && matches!(s, Stmt::Break { .. }));
+    if b.stmts.iter().any(|s| ends(s)) {
+        return true;
+    }
+    if let Some(Stmt::Expr(e)) = b.stmts.last() {
+        if expr_diverges(e, brk) {
+            return true;
+        }
+    }
+    b.tail.as_ref().map_or(false, |t| expr_diverges(t, brk))
+}
+
+fn expr_diverges(e: &Expr, brk: bool) -> bool {
+    match e {
+        Expr::Return(_) => true,
+        Expr::Paren(i) => expr_diverges(i, brk),
+        Expr::Block(b) => block_diverges(b, brk),
+        Expr::If(i) => if_diverges(i, brk),
+        _ => false,
+    }
+}
+
+fn if_diverges(i: &IfExpr, brk: bool) -> bool {
+    block_diverges(&i.then_block, brk)
+        && match &i.else_branch {
+            Some(ElseBranch::Block(b)) => block_diverges(b, brk),
+            Some(ElseBranch::If(inner)) => if_diverges(inner, brk),
+            None => false,
+        }
+}
+
+fn or_state(acc: &mut Vec<HashMap<String, bool>>, other: &[HashMap<String, bool>]) {
+    for (j, scope) in other.iter().enumerate() {
+        for (k, m) in scope {
+            if *m {
+                if let Some(slot) = acc.get_mut(j).and_then(|h| h.get_mut(k)) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+}
+
+/// Like `block_diverges` but a `break` also ends the path (it never reaches the next iteration).
+fn block_diverges_in_loop(b: &Block) -> bool {
+    block_diverges(b, true)
 }
