@@ -1,0 +1,10 @@
+// Document 23 §17.2: a generic function with explicit type arguments is a function VALUE.
+fn identity<T>(x: T) -> T { return x; }
+fn apply(f: fn(i32) -> i32, v: i32) -> i32 { return f(v); }
+fn main() {
+    let f = identity::<i32>;
+    println(f(5));
+    println(apply(identity::<i32>, 7));
+    let s = identity::<String>;
+    println(s(String::from("hi")));
+}
