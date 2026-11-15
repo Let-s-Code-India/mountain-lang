@@ -27,6 +27,19 @@
  *    is remembered (NOTIFIED) and the task is requeued when the poll returns, so wakes are never lost.
  *    No worker ever blocks on an `await`; an idle worker sleeps on the condition variable.
  *  - One timer thread (started on the first timer) keeps a min-heap of (deadline, task).
+ *
+ * Actors (Phase 12 M5; Document 12 §8, §11.5)
+ *  - An actor is a state block plus a FIFO mailbox (messages are copies of the compiler's message
+ *    value, a malloc'd node each). `send` appends under `g_mu` (it never blocks on a handler) and, if the
+ *    actor is not already scheduled, makes the actor's own embedded task runnable. A worker running
+ *    that task takes messages one at a time from the front and calls the compiler-generated
+ *    `dispatch(state, msg)` (which owns the message and runs the handler): an actor therefore never runs two
+ *    handlers at once, and messages from one sender are handled in the order they were sent.
+ *  - After ACTOR_BATCH messages an actor requeues itself behind the other ready tasks (fairness).
+ *  - A scheduled actor counts in `g_pending`, so `__mtn_rt_shutdown` (called after `main` returns) waits
+ *    until every mailbox is empty and no handler is running; only then are the actors freed: the state's
+ *    drop glue runs once, then the state block and the actor are released.
+ *  - Stats line: every message is counted as one `spawned`/`completed` task (the line is unchanged).
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -46,7 +59,8 @@ typedef int (*poll_fn)(void *hdl);                  /* resumes the frame; return
 typedef void (*take_fn)(void *hdl, void *out);      /* moves the frame's result out */
 typedef void (*destroy_fn)(void *hdl);              /* frees the (finished) frame */
 
-enum { K_SYNC = 0, K_FUTURE = 1, K_OS = 2 };
+enum { K_SYNC = 0, K_FUTURE = 1, K_OS = 2, K_ACTOR = 3 };
+#define ACTOR_BATCH 64
 enum { S_QUEUED = 0, S_RUNNING = 1, S_NOTIFIED = 2, S_IDLE = 3 };
 
 typedef struct Task {
@@ -102,6 +116,26 @@ static pthread_t g_timer_thread;
 static int g_timer_started, g_timer_stop;
 static TimerEnt *g_heap;
 static size_t g_nheap, g_capheap;
+
+typedef void (*dispatch_fn)(void *state, void *msg);
+
+typedef struct Msg {
+    struct Msg *next;
+    /* the payload (msg_size bytes) starts 16 bytes after the node */
+} Msg;
+
+typedef struct Actor {
+    Task task; /* first member: the actor is scheduled through its own task */
+    void *state;
+    dispatch_fn dispatch;
+    drop_fn drop_state;
+    size_t msg_size;
+    Msg *head, *tail;
+    int scheduled;
+    struct Actor *all_next;
+} Actor;
+
+static Actor *g_actors;
 
 static __thread int t_worker = -1;
 static __thread Task *t_cur; /* the future task being polled on this thread */
@@ -200,8 +234,48 @@ static int finish_locked(Task *t) {
 }
 
 /* Runs / polls `t` once (not holding g_mu). */
+static void run_actor(Task *t) {
+    Actor *a = (Actor *)t;
+    for (int n = 0; n < ACTOR_BATCH; n++) {
+        pthread_mutex_lock(&g_mu);
+        Msg *m = a->head;
+        if (!m) { /* mailbox empty and no handler running: the actor goes idle */
+            a->scheduled = 0;
+            g_pending--;
+            pthread_cond_broadcast(&g_cv);
+            pthread_mutex_unlock(&g_mu);
+            return;
+        }
+        a->head = m->next;
+        if (!a->head) a->tail = NULL;
+        pthread_mutex_unlock(&g_mu);
+        Task *saved = t_cur;
+        t_cur = NULL;
+        a->dispatch(a->state, (char *)m + 16); /* the handler owns the message */
+        t_cur = saved;
+        free(m);
+        pthread_mutex_lock(&g_mu);
+        g_completed++;
+        g_live--;
+        pthread_mutex_unlock(&g_mu);
+    }
+    pthread_mutex_lock(&g_mu);
+    if (a->head) {
+        enqueue(t, 0); /* more messages: behind the other ready tasks */
+    } else {
+        a->scheduled = 0;
+        g_pending--;
+        pthread_cond_broadcast(&g_cv);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
 static void run_task(Task *t) {
     Task *saved = t_cur;
+    if (t->kind == K_ACTOR) {
+        run_actor(t);
+        return;
+    }
     if (t->kind == K_SYNC) {
         t_cur = NULL;
         t->thunk(t->code, t->env, t->res);
@@ -353,6 +427,48 @@ void *__mtn_rt_spawn_os(thunk_fn thunk, void *code, void *env, size_t res_size, 
     spawn_thread(&t->thread, os_main, t);
     pthread_mutex_unlock(&g_mu);
     return t;
+}
+
+/* `A::spawn()`: a new actor with a zeroed state block of `state_size` bytes (the caller stores the
+   initial state into `__mtn_rt_actor_state(a)`). The returned pointer is the `ActorRef`. */
+void *__mtn_rt_actor_new(dispatch_fn dispatch, drop_fn drop_state, size_t state_size, size_t msg_size) {
+    Actor *a = calloc(1, sizeof(Actor));
+    if (!a) rt_die("runtime: out of memory\n");
+    a->state = calloc(1, state_size ? state_size : 1);
+    if (!a->state) rt_die("runtime: out of memory\n");
+    a->dispatch = dispatch;
+    a->drop_state = drop_state;
+    a->msg_size = msg_size;
+    a->task.kind = K_ACTOR;
+    pthread_mutex_lock(&g_mu);
+    a->all_next = g_actors;
+    g_actors = a;
+    pthread_mutex_unlock(&g_mu);
+    return a;
+}
+
+void *__mtn_rt_actor_state(void *actor) {
+    return ((Actor *)actor)->state;
+}
+
+/* `r.send(msg)`: copies the message into the mailbox and schedules the actor; never blocks. */
+void __mtn_rt_actor_send(void *actor, void *msg) {
+    Actor *a = actor;
+    Msg *m = malloc(16 + a->msg_size);
+    if (!m) rt_die("runtime: out of memory\n");
+    m->next = NULL;
+    memcpy((char *)m + 16, msg, a->msg_size);
+    pthread_mutex_lock(&g_mu);
+    if (a->tail) a->tail->next = m; else a->head = m;
+    a->tail = m;
+    g_spawned++;
+    if (++g_live > g_peak) g_peak = g_live;
+    if (!a->scheduled) {
+        a->scheduled = 1;
+        g_pending++;
+        enqueue(&a->task, 0);
+    }
+    pthread_mutex_unlock(&g_mu);
 }
 
 /* `h.join()`: waits for the task, moves its result into `out`, releases the handle. */
@@ -544,6 +660,14 @@ void __mtn_rt_shutdown(void) {
         pthread_join(os->thread, NULL);
         task_free(os);
         os = n;
+    }
+    /* every mailbox is empty and no handler runs: drop each actor's state once, then free it */
+    while (g_actors) {
+        Actor *a = g_actors;
+        g_actors = a->all_next;
+        if (a->drop_state) a->drop_state(a->state);
+        free(a->state);
+        free(a);
     }
     const char *st = getenv("MTN_RT_STATS");
     if (st && st[0] == '1' && st[1] == 0)
