@@ -943,7 +943,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ItemKind::Table(_) | ItemKind::Index(_) | ItemKind::Schema(_) => errors.push("`table`/`index`/`schema` are not yet supported by codegen — Phase 18".into()),
                 ItemKind::Ui(_) | ItemKind::Component(_) => errors.push("`ui`/`component` are not yet supported by codegen — Phase 19".into()),
                 ItemKind::Server(_) => errors.push("`server` is not yet supported by codegen — Phase 17".into()),
-                ItemKind::Actor(_) => errors.push("`actor` is not yet supported by codegen — Phase 12".into()),
+                // Unreachable: `desugar_actors` (Phase 12 M5) lowers every `actor` before codegen.
+                ItemKind::Actor(_) => errors.push("internal error: an `actor` reached code generation (it should have been lowered earlier)".into()),
             }
         }
     }

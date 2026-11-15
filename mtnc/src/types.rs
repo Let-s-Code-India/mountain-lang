@@ -2554,14 +2554,57 @@ impl TypeChecker {
         match expr {
             Expr::Literal(lit) => self.check_literal(lit, expected, ctx),
 
-            Expr::TurbofishPath { path, .. } => {
-                // Only a direct call `f::<T>(..)` is handled (in the Call
-                // arm); any other use of a turbofish path is not supported yet.
-                self.errors.push(TypeError {
-                    message: format!("a generic path `{}::<..>` is only supported as the callee of a call (using it as a function value is not yet supported by codegen — Phase 12)", path.join("::")),
-                    context: ctx.into(),
-                });
-                Ty::Unit
+            Expr::TurbofishPath { path, gens } => {
+                // `f::<T>` as a function VALUE (Doc 23 §17.2): a generic function instance is a
+                // named function value after monomorphization. Every type parameter must be given.
+                let shape = if path.len() == 1 && gens.len() == 1 { self.functions.get(&path[0]).cloned() } else { None };
+                let Some(shape) = shape.filter(|s| !s.generics.is_empty()) else {
+                    self.errors.push(TypeError {
+                        message: format!("a generic path `{}::<..>` can only name a generic function (as a call or as a function value)", path.join("::")),
+                        context: ctx.into(),
+                    });
+                    return Ty::Unit;
+                };
+                let name = &path[0];
+                let tparam_names: Vec<String> = shape.generics.iter()
+                    .map(|g| match g { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() })
+                    .collect();
+                let targs = &gens[0].1;
+                if targs.len() != tparam_names.len() {
+                    self.errors.push(TypeError {
+                        message: format!("`{}::<..>` used as a function value needs all {} type argument(s) written out, found {}", name, tparam_names.len(), targs.len()),
+                        context: ctx.into(),
+                    });
+                    return Ty::Unit;
+                }
+                let mut subst: HashMap<String, Ty> = HashMap::new();
+                for (pn, ta) in tparam_names.iter().zip(targs.iter()) {
+                    subst.insert(pn.clone(), resolve_targ(ta));
+                }
+                for (param_name, trait_names) in &shape.bounds {
+                    if let Some(concrete) = subst.get(param_name).cloned() {
+                        for tn in trait_names.iter().filter(|n| !(n.as_str() == "Into" && !self.traits.contains_key("Into"))) {
+                            let ok = match &concrete {
+                                Ty::Named(n) if self.cur_tparams.contains(n) => self.cur_bounds.iter().any(|(p, bs)| p == n && bs.contains(tn)),
+                                _ => self.satisfies_bound(&concrete, tn),
+                            };
+                            if !ok {
+                                self.errors.push(TypeError {
+                                    message: format!("type `{}` does not satisfy bound `{}` required for generic parameter `{}` of `{}` (Document 8 §2/§3)", concrete, tn, param_name, name),
+                                    context: ctx.into(),
+                                });
+                            }
+                        }
+                    }
+                }
+                let tys: Vec<Ty> = tparam_names.iter().filter_map(|n| subst.get(n).cloned()).collect();
+                if tys.iter().all(|t| !self.mentions_tparam(t)) {
+                    self.instances.insert(expr as *const Expr as usize, (name.clone(), tys));
+                }
+                Ty::Fn(
+                    shape.params.iter().map(|p| substitute_type_params(p, &subst)).collect(),
+                    Box::new(substitute_type_params(&shape.ret, &subst)),
+                )
             }
 
             Expr::Ident(name) => {
@@ -2999,7 +3042,17 @@ impl TypeChecker {
                                 self.errors.push(TypeError { message: format!("the state of actor `{}` must be `Send` (it moves between worker threads): {}", actor, why.replace("__ActorState_", "")), context: ctx.into() });
                             }
                             if let Some(why) = self.not_send_reason(&Ty::Named(actor.clone())) {
-                                self.errors.push(TypeError { message: format!("a message of actor `{}` must be `Send` (messages are handed to another thread): {}", actor, why), context: ctx.into() });
+                                // Name the offending handler: "the message `go(..)` of actor `A` ...".
+                                let variants = self.enums.get(&actor).map(|e| e.variants.clone()).unwrap_or_default();
+                                let bad = variants.iter().find(|(_, tys)| tys.iter().any(|t| self.not_send_reason(t).is_some())).map(|(n, _)| n.clone());
+                                let msg = match bad {
+                                    Some(h) => {
+                                        let inner = variants.iter().find(|(n, _)| *n == h).and_then(|(_, tys)| tys.iter().find_map(|t| self.not_send_reason(t))).unwrap_or(why.clone());
+                                        format!("the message `{}(..)` of actor `{}` must be `Send` (messages are handed to another thread): {}", h, actor, inner)
+                                    }
+                                    None => format!("a message of actor `{}` must be `Send` (messages are handed to another thread): {}", actor, why),
+                                };
+                                self.errors.push(TypeError { message: msg, context: ctx.into() });
                             }
                             return Ty::Generic("ActorRef".into(), vec![GenericArg::Type(Ty::Named(actor))]);
                         }

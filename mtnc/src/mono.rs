@@ -213,6 +213,12 @@ fn rewrite_expr(e: &mut Expr, calls: &Rw) {
             *name = n.clone();
         }
     }
+    if let Expr::TurbofishPath { .. } = e {
+        if let Some(n) = calls.calls.get(&self_key) {
+            *e = Expr::Ident(n.clone());
+            return;
+        }
+    }
     if let Expr::Call { callee, .. } = e {
         let key = callee.as_ref() as *const Expr as usize;
         if let Some(n) = calls.calls.get(&key) {
