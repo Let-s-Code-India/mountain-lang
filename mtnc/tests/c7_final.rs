@@ -346,7 +346,7 @@ fn no_user_visible_message_blames_phase_11() {
     for src in [
         "fn main() { let x = null; }",
         "fn main() { let a = [1, 2]; match a { [x, y] => println(x), _ => println(0) } }",
-        "fn f<T>(x: T) -> i32 { return 1; }\nfn main() { let g = f::<i32>; }",
+        "fn f<A, B>(a: A, b: B) -> i32 { return 1; }\nfn main() { let g = f::<i32>; }",
     ] {
         let m = rejected_build(src);
         assert!(!m.contains("Phase 11"), "{}\n{}", src, m);

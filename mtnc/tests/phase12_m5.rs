@@ -553,12 +553,12 @@ fn the_stats_line_counts_every_message_as_a_task() {
 
 #[test]
 fn rejects_a_message_holding_an_rc() {
-    rejects("actor A { on bad(r: Rc<i32>) { } }\nfn main() { let a = A::spawn(); }", "a message of actor `A` must be `Send`");
+    rejects("actor A { on bad(r: Rc<i32>) { } }\nfn main() { let a = A::spawn(); }", "the message `bad(..)` of actor `A` must be `Send`");
 }
 
 #[test]
 fn the_rc_message_reason_names_the_type() {
-    rejects("actor A { on bad(r: Rc<i32>) { } }\nfn main() { let a = A::spawn(); }", "it contains `Rc<i32>`");
+    rejects("actor A { on bad(r: Rc<i32>) { } }\nfn main() { let a = A::spawn(); }", "`Rc<i32>` cannot be sent between threads");
 }
 
 #[test]
