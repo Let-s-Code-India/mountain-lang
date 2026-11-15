@@ -1,0 +1,33 @@
+// Two actors playing ping-pong: each message carries the `ActorRef`s the receiver needs to answer.
+// An `ActorRef<A>` is a plain handle: copy it freely, send it in messages, keep it in a struct.
+actor Ping {
+    state rounds: i32 = 0;
+
+    on start(peer: ActorRef<Pong>, me: ActorRef<Ping>, n: i32) {
+        peer.send(ping(me, peer, n));
+    }
+
+    on pong(peer: ActorRef<Pong>, me: ActorRef<Ping>, n: i32) {
+        self.rounds = self.rounds + 1;
+        if n > 1 {
+            peer.send(ping(me, peer, n - 1));
+        } else {
+            println(self.rounds);
+        }
+    }
+}
+
+actor Pong {
+    state seen: i32 = 0;
+
+    on ping(back: ActorRef<Ping>, me: ActorRef<Pong>, n: i32) {
+        self.seen = self.seen + 1;
+        back.send(pong(me, back, n));
+    }
+}
+
+fn main() {
+    let a = Ping::spawn();
+    let b = Pong::spawn();
+    a.send(start(b, a, 1000));
+}

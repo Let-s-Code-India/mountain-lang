@@ -1,0 +1,29 @@
+// A counter actor (Doc 12 §8, §11.5): its state is private and has no lock; the only way to reach
+// it is `send`. Messages are handled one at a time, in the order they were sent.
+actor Counter {
+    state total: i64 = 0;
+    state label: String = String::from("counter");
+
+    on add(n: i64) {
+        self.total = self.total + n;
+    }
+
+    on show() {
+        println(self.label);
+        println(self.total);
+    }
+}
+
+fn main() {
+    let c = Counter::spawn();
+    let mut i = 0;
+    while i < 1000 {
+        c.send(add(1));
+        i = i + 1;
+    }
+    // both spellings build a message: `add(5)` and `Counter::add(5)`
+    c.send(Counter::add(5));
+    // handled after the 1,001 messages before it, so this prints 1005
+    c.send(show());
+    // `main` returns here; the runtime waits until the mailbox is empty
+}

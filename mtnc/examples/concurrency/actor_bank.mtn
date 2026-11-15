@@ -1,0 +1,65 @@
+// A small bank: two `Account` actors and a `Ledger` actor. Money moves only by messages, so no
+// account's balance is ever touched by two threads and no lock exists anywhere.
+// Everything printed below comes from `ann` and the ledger, and `ann` sends the ledger its records
+// and then the request for the summary, so the order of the output is fixed by the mailboxes.
+actor Ledger {
+    state entries: i32 = 0;
+    state volume: i64 = 0;
+
+    on record(amount: i64) {
+        self.entries = self.entries + 1;
+        self.volume = self.volume + amount;
+    }
+
+    on summary() {
+        println(self.entries);
+        println(self.volume);
+    }
+}
+
+actor Account {
+    state owner: String = String::from("nobody");
+    state balance: i64 = 0;
+
+    on open(who: String, initial: i64) {
+        self.owner = who;
+        self.balance = initial;
+    }
+
+    on deposit(amount: i64, ledger: ActorRef<Ledger>) {
+        self.balance = self.balance + amount;
+        ledger.send(record(amount));
+    }
+
+    on receive(amount: i64) {
+        self.balance = self.balance + amount;
+    }
+
+    on transfer(amount: i64, to: ActorRef<Account>, ledger: ActorRef<Ledger>) {
+        if self.balance >= amount {
+            self.balance = self.balance - amount;
+            ledger.send(record(amount));
+            to.send(receive(amount));
+        } else {
+            println(String::from("insufficient funds"));
+        }
+    }
+
+    on report(ledger: ActorRef<Ledger>) {
+        println(self.owner);
+        println(self.balance);
+        ledger.send(summary());
+    }
+}
+
+fn main() {
+    let ledger = Ledger::spawn();
+    let ann = Account::spawn();
+    let bob = Account::spawn();
+    ann.send(open(String::from("ann"), 100));
+    bob.send(open(String::from("bob"), 50));
+    ann.send(deposit(25, ledger));
+    ann.send(transfer(60, bob, ledger));
+    ann.send(transfer(500, bob, ledger));
+    ann.send(report(ledger));
+}
