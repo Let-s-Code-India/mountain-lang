@@ -198,7 +198,7 @@ impl Renamer<'_> {
             }
             Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => self.ty(inner),
             Type::Assoc(b, _) => self.ty(b),
-            Type::Dyn(n, args) => {
+            Type::Dyn(n, args, _) => {
                 if let Some(new) = self.rn(n) {
                     *n = new;
                 }

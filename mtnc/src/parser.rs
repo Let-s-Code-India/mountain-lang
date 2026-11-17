@@ -1055,10 +1055,22 @@ impl Parser {
         if self.eat_kw(Keyword::Dyn) {
             let name = self.expect_word()?;
             let args = self.parse_generic_args_opt()?;
-            if !args.is_empty() {
-                return self.error(format!("not yet supported: `dyn {}<..>` (a generic trait object); the spec shows only non-generic traits behind `dyn`", name));
+            // `dyn T + Send + Sync`: the auto-trait bounds of a trait object (Document 12 §3 / Phase 13 M0).
+            // bit 1 = Send, bit 2 = Sync; each at most once.
+            let mut bits = 0u8;
+            while self.eat_op(Op::Plus) {
+                let w = self.expect_word()?;
+                let bit = match w.as_str() {
+                    "Send" => 1u8,
+                    "Sync" => 2u8,
+                    other => return self.error(format!("a trait object can only add the auto traits `Send` and `Sync` after `+`, found `{}`", other)),
+                };
+                if bits & bit != 0 {
+                    return self.error(format!("`{}` is listed twice in this trait-object type", w));
+                }
+                bits |= bit;
             }
-            return Ok(Type::Dyn(name, args));
+            return Ok(Type::Dyn(name, args, bits));
         }
         if self.eat_kw(Keyword::Fn) {
             self.expect_delim(Delim::LParen)?;

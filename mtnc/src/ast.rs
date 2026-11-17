@@ -377,7 +377,7 @@ pub enum Type {
     Ref { lifetime: Option<String>, mutable: bool, inner: Box<Type> },
     /// Phase 11b M6 (Doc 23 §17.9): the raw pointer type `*const T` / `*mut T`.
     RawPtr { mutable: bool, inner: Box<Type> },
-    Dyn(String, Vec<Type>),
+    Dyn(String, Vec<Type>, u8),
     Fn(Vec<Type>, Box<Type>),
     Option(Box<Type>),
     Result(Box<Type>, Box<Type>),

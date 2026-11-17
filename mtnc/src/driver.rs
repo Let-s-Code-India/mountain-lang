@@ -50,12 +50,15 @@ fn inject_async_prelude(program: &mut crate::ast::Program) {
     program.items = items;
 }
 
+/// The compiler-known `Drop` trait (Document 6 §9.9). Always added; a user trait of that name is
+/// rejected by `dropcheck` before this runs.
+const DROP_PRELUDE: &str = "trait Drop {\n    fn drop(borrow mut self);\n}\n";
+
 fn inject_prelude(program: &mut crate::ast::Program) {
     use crate::ast::ItemKind;
-    if program.items.iter().any(|i| matches!(&i.kind, ItemKind::Trait(t) if t.name == "Allocator")) {
-        return;
-    }
-    let (tokens, _) = lexer::tokenize(PRELUDE);
+    let has_allocator = program.items.iter().any(|i| matches!(&i.kind, ItemKind::Trait(t) if t.name == "Allocator"));
+    let src = if has_allocator { DROP_PRELUDE.to_string() } else { format!("{}{}", PRELUDE, DROP_PRELUDE) };
+    let (tokens, _) = lexer::tokenize(&src);
     let (prelude, errs) = parse_program(tokens);
     assert!(errs.is_empty(), "internal: the prelude does not parse");
     let mut items = prelude.items;
@@ -103,6 +106,10 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let (mut program, parse_errs) = parse_program(tokens);
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| format!("error: {} --> {}", e.message, e.span)).collect());
+    }
+    let drop_errors = crate::dropcheck::check(&program);
+    if !drop_errors.is_empty() {
+        return Err(drop_errors);
     }
     inject_prelude(&mut program);
     if wants_async_leaves {

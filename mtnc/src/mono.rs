@@ -51,7 +51,7 @@ pub(crate) fn subst_type(t: &mut Type, m: &HashMap<String, Type>) {
         Type::Assoc(b, _) => subst_type(b, m),
         Type::Tuple(v) => v.iter_mut().for_each(|x| subst_type(x, m)),
         Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => subst_type(inner, m),
-        Type::Dyn(_, v) => v.iter_mut().for_each(|x| subst_type(x, m)),
+        Type::Dyn(_, v, _) => v.iter_mut().for_each(|x| subst_type(x, m)),
         Type::Fn(ps, r) => {
             ps.iter_mut().for_each(|x| subst_type(x, m));
             subst_type(r, m);
@@ -276,7 +276,7 @@ fn walk_type(t: &mut Type, f: TyFn) {
         return;
     }
     match t {
-        Type::Named(_, a) | Type::Tuple(a) | Type::Dyn(_, a) => a.iter_mut().for_each(|x| walk_type(x, f)),
+        Type::Named(_, a) | Type::Tuple(a) | Type::Dyn(_, a, _) => a.iter_mut().for_each(|x| walk_type(x, f)),
         Type::Array(i, _) | Type::Option(i) => walk_type(i, f),
         Type::Assoc(b, _) => walk_type(b, f),
         Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => walk_type(inner, f),

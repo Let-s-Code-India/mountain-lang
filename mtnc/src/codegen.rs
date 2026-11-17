@@ -178,6 +178,8 @@ pub struct Codegen<'ctx, 'a> {
     dyn_coercions: HashMap<usize, (Ty, Ty)>,
     /// Trait name -> its methods in declaration order (the vtable slots).
     trait_defs: HashMap<String, Vec<dynamic::TraitMethod>>,
+    /// Type-parameter names of generic traits (`trait Source<T>` -> `["T"]`), for `dyn Source<i32>`.
+    trait_generics: HashMap<String, Vec<String>>,
     /// (implementing type, trait, method) -> function key.
     trait_impl_keys: HashMap<(String, String, String), String>,
     vtables: HashMap<String, PointerValue<'ctx>>,
@@ -312,6 +314,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             cur_match_by_ref: false,
             dyn_coercions: HashMap::new(),
             trait_defs: HashMap::new(),
+            trait_generics: HashMap::new(),
             trait_impl_keys: HashMap::new(),
             vtables: HashMap::new(),
             drop_frames: Vec::new(),
@@ -377,6 +380,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         None
     }
 
+    /// The user `drop` method (function key) when the struct/enum `n` implements `Drop` (Document 6 §9.9).
+    pub(super) fn drop_impl_key(&self, n: &str) -> Option<String> {
+        self.trait_impl_keys.get(&(n.to_string(), "Drop".to_string(), "drop".to_string())).cloned()
+    }
+
+    /// Index of the hidden "live" byte of a type that implements `Drop`: the LAST field of a struct,
+    /// field 2 of an enum. A value is built with live = 1; a moved-out slot is all-zero, so live = 0
+    /// and its glue does nothing. (Without it a `Drop` value whose fields are all zero could not be
+    /// told apart from a moved-out slot.) `None` for every other type.
+    pub(super) fn drop_flag_index(&self, ty: &Ty) -> Option<u32> {
+        let Ty::Named(n) = ty else { return None };
+        self.drop_impl_key(n)?;
+        if let Some((fields, _)) = self.structs.get(n) {
+            Some(fields.len() as u32)
+        } else if self.enums.contains_key(n) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
     fn llty(&mut self, ty: &Ty) -> R<BasicTypeEnum<'ctx>> {
         Ok(match ty {
             Ty::I8 | Ty::U8 => self.int_ty(8).into(),
@@ -404,6 +428,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     let mut fs = Vec::new();
                     for (_, t) in &fields {
                         fs.push(self.llty(t)?);
+                    }
+                    if self.drop_impl_key(n).is_some() {
+                        fs.push(self.context.i8_type().into()); // the hidden "live" byte (see `drop_flag_index`)
                     }
                     match self.struct_layout.get(n).copied() {
                         // `@pack`: no padding, alignment 1
@@ -435,7 +462,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 // `&str` has the same `{ptr, len}` shape as a string value.
                 Ty::Str => self.str_ty().into(),
                 // `&dyn Trait`: a fat pointer `{ data, vtable }`
-                Ty::DynTrait(_) => self.fat_ty().into(),
+                Ty::DynTrait(..) => self.fat_ty().into(),
                 _ => self.context.ptr_type(AddressSpace::default()).into(),
             },
             Ty::Str => return unsupported("the unsized `str` type (use `&str`)", 16),
@@ -449,18 +476,20 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             // The data pointer is always the FIRST field, so code that only needs the pointer can load field 0.
             Ty::Generic(n, a) if n == "Box" && a.len() == 2 => {
                 let p = self.context.ptr_type(AddressSpace::default());
-                if matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) {
+                if matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) {
                     self.context.struct_type(&[p.into(), p.into(), p.into()], false).into()
                 } else {
                     self.context.struct_type(&[p.into(), p.into()], false).into()
                 }
             }
-            Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => self.fat_ty().into(),
+            Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
+            // `Rc<dyn T>` / `Arc<dyn T>` / `Weak<dyn T>`: a fat handle `{ object pointer, vtable }` (Phase 13 M0)
+            Ty::Generic(n, a) if matches!(n.as_str(), "Rc" | "Arc" | "Weak") && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Generic(..) | Ty::TypeParam(_) | Ty::Assoc(..) | Ty::Infer(_) | Ty::SymFixed(..) | Ty::ConstVal(_) => {
                 return Err(CgErr(format!("internal error: the type `{}` reached code generation without being monomorphized", ty)))
             }
-            Ty::DynTrait(_) => return Err(CgErr("`dyn Trait` is unsized: use `Box<dyn Trait>` or `borrow dyn Trait` (Document 13 §1 point 4)".into())),
+            Ty::DynTrait(..) => return Err(CgErr("`dyn Trait` is unsized: use `Box<dyn Trait>` or `borrow dyn Trait` (Document 13 §1 point 4)".into())),
             Ty::Null => return Err(CgErr("`null` has no type here: it is only valid where a raw pointer type is expected (Document 23 §17.9)".into())),
         })
     }
@@ -487,7 +516,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let unit = max_align.max(8);
             let words = max_size.div_ceil(unit) as u32;
             let payload = self.int_ty((unit * 8) as u32).array_type(words);
-            let llty = self.context.struct_type(&[self.int_ty(32).into(), payload.into()], false);
+            let llty = if matches!(ty, Ty::Named(n) if self.drop_impl_key(n).is_some()) {
+                // a `Drop` enum carries the hidden "live" byte as field 2 (see `drop_flag_index`)
+                self.context.struct_type(&[self.int_ty(32).into(), payload.into(), self.context.i8_type().into()], false)
+            } else {
+                self.context.struct_type(&[self.int_ty(32).into(), payload.into()], false)
+            };
             self.enum_layouts.insert(key.clone(), EnumLayout { llty, variants: vsts });
         }
         let l = &self.enum_layouts[&key];
@@ -926,6 +960,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         ms.push(dynamic::TraitMethod { name: f.name.clone(), self_kind, params, ret, generic: !f.generics.0.is_empty() });
                     }
                     self.trait_defs.insert(t.name.clone(), ms);
+                    self.trait_generics.insert(
+                        t.name.clone(),
+                        t.generics.0.iter().map(|g| match g { GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name.clone() }).collect(),
+                    );
                 }
                 ItemKind::Const(c) => {
                     let ty = resolve_type(&c.ty);
@@ -1098,7 +1136,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             match mode {
                 PMode::Value => lls.push(self.llty(&t)?.into()),
-                PMode::Ref(_) if matches!(t, Ty::DynTrait(_)) => {
+                PMode::Ref(_) if matches!(t, Ty::DynTrait(..)) => {
                     // `borrow dyn Trait`: a fat pointer
                     lls.push(self.fat_ty().into());
                 }
@@ -1186,7 +1224,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             let pv = val.get_nth_param(llidx).unwrap();
             llidx += 1;
             match p.mode {
-                PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(_)) => {
+                PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(..)) => {
                     // `borrow dyn Trait`: the local holds the fat pointer (a `&dyn Trait` value)
                     let rt = Ty::Ref(false, Box::new(p.ty.clone()));
                     let slot = self.declare_local(&p.name, &rt)?;

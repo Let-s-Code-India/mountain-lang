@@ -88,7 +88,8 @@ pub enum Ty {
     /// implement `Trait`, resolved via vtable at runtime. Method
     /// resolution against this type looks up the *trait's* declared
     /// signature, not any concrete `impl`'s.
-    DynTrait(String),
+    /// Fields: trait name, the trait's generic arguments (`dyn Source<i32>`), auto-trait bits (1 = `+ Send`, 2 = `+ Sync`).
+    DynTrait(String, Vec<Ty>, u8),
     OptionTy(Box<Ty>),
     ResultTy(Box<Ty>, Box<Ty>),
     Fn(Vec<Ty>, Box<Ty>),
@@ -150,7 +151,19 @@ impl std::fmt::Display for Ty {
             Ty::Named(n) => write!(f, "{}", n),
             Ty::Generic(n, args) => write!(f, "{}<{}>", n, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::TypeParam(n) => write!(f, "{}", n),
-            Ty::DynTrait(n) => write!(f, "dyn {}", n),
+            Ty::DynTrait(n, a, bits) => {
+                write!(f, "dyn {}", n)?;
+                if !a.is_empty() {
+                    write!(f, "<{}>", a.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))?;
+                }
+                if bits & 1 != 0 {
+                    write!(f, " + Send")?;
+                }
+                if bits & 2 != 0 {
+                    write!(f, " + Sync")?;
+                }
+                Ok(())
+            }
             Ty::OptionTy(t) => write!(f, "Option<{}>", t),
             Ty::ResultTy(o, e) => write!(f, "Result<{}, {}>", o, e),
             Ty::Fn(ps, r) => write!(f, "fn({}) -> {}", ps.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "), r),
@@ -713,7 +726,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
                     for a in args {
                         match a {
                             // `Box<dyn T>` names the trait object itself (the box is the pointer around it)
-                            Type::Dyn(dn, _) if is_heap_generic(n) => out.push(GenericArg::Type(Ty::DynTrait(dn.clone()))),
+                            Type::Dyn(dn, da, bits) if is_heap_generic(n) => out.push(GenericArg::Type(Ty::DynTrait(dn.clone(), da.iter().map(|x| resolve_type_depth(x, depth)).collect(), *bits))),
                             Type::ConstArg(e) => match CONSTS.with(|c| eval_const_int(e, &c.borrow())) {
                                 Some(v) => out.push(GenericArg::Const(v as i64)),
                                 None => return Ty::Named(n.clone()),
@@ -746,13 +759,13 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         }
         Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|x| resolve_type_depth(x, depth)).collect()),
         Type::Ref { mutable, inner, .. } => match &**inner {
-            Type::Dyn(dn, _) => Ty::Ref(*mutable, Box::new(Ty::DynTrait(dn.clone()))),
+            Type::Dyn(dn, da, bits) => Ty::Ref(*mutable, Box::new(Ty::DynTrait(dn.clone(), da.iter().map(|x| resolve_type_depth(x, depth)).collect(), *bits))),
             _ => Ty::Ref(*mutable, Box::new(resolve_type_depth(inner, depth))),
         },
         Type::RawPtr { mutable, inner } => Ty::RawPtr(*mutable, Box::new(resolve_type_depth(inner, depth))),
         // Doc 7 §4.5 / Doc 3 F / Doc 8 §6 (manager decision, Phase 11c): a `dyn Trait` used as a VALUE
         // type (array element, by-value parameter, field, local) is an OWNED trait object = `Box<dyn Trait>`.
-        Type::Dyn(n, _) => Ty::Generic("Box".into(), vec![GenericArg::Type(Ty::DynTrait(n.clone()))]),
+        Type::Dyn(n, da, bits) => Ty::Generic("Box".into(), vec![GenericArg::Type(Ty::DynTrait(n.clone(), da.iter().map(|x| resolve_type_depth(x, depth)).collect(), *bits))]),
         Type::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| resolve_type_depth(x, depth)).collect(), Box::new(resolve_type_depth(r, depth))),
         Type::Option(inner) => Ty::OptionTy(Box::new(resolve_type_depth(inner, depth))),
         Type::Result(o, e) => Ty::ResultTy(Box::new(resolve_type_depth(o, depth)), Box::new(resolve_type_depth(e, depth))),
@@ -820,7 +833,7 @@ pub fn lookup_assoc(base: &Ty, name: &str) -> Option<Ty> {
 /// against a known concrete instantiation, e.g. `Pair<i32, String>`'s
 /// `first` field should be checked as `i32`, not the abstract
 /// `TypeParam("A")` stored in the struct's registered shape).
-fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
+pub(crate) fn substitute_type_params(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Assoc(b, n) => {
@@ -973,7 +986,7 @@ pub struct StructShape {
 /// a concrete struct that happens to be named A". Applied once, right
 /// after a generic struct/enum's fields are resolved via the ordinary
 /// (context-free) `resolve_type`.
-fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
+pub(crate) fn mark_type_params(ty: Ty, param_names: &[String]) -> Ty {
     match ty {
         Ty::Named(n) if param_names.contains(&n) => Ty::TypeParam(n),
         Ty::Assoc(b, n) => Ty::Assoc(Box::new(mark_type_params(*b, param_names)), n),
@@ -3010,6 +3023,17 @@ impl TypeChecker {
                 // function of the same name (they are ordinary prelude
                 // names, not reserved by the grammar).
                 if let Expr::Path(segs) = callee.as_ref() {
+                    // Document 6 §9.9 rule 4: `Drop::drop(..)` and `Type::drop(..)` are explicit destructor calls
+                    if segs.len() == 2 && segs[1] == "drop" && (segs[0] == "Drop" || self.has_drop_impl_named(&segs[0])) {
+                        self.errors.push(TypeError {
+                            message: format!("explicit destructor calls are not allowed (`{}::drop(..)`); use `drop(x)` (Document 6 §9.9, rule 4)", segs[0]),
+                            context: ctx.into(),
+                        });
+                        for a in args {
+                            self.check_expr(&a.value, None, env, ctx);
+                        }
+                        return Ty::Unit;
+                    }
                     if segs.len() == 2 && segs[0] == "thread" && segs[1] == "spawnOS" {
                         if args.len() != 1 {
                             self.errors.push(TypeError { message: format!("`thread::spawnOS` takes exactly one argument (a closure), found {}", args.len()), context: ctx.into() });
@@ -3099,6 +3123,9 @@ impl TypeChecker {
                         "alloc" | "dealloc" if !self.functions.contains_key(name.as_str()) => {
                             return self.check_alloc_intrinsic(name, args, env, ctx);
                         }
+                        "copyNonOverlapping" | "copy" | "dropInPlace" if !self.functions.contains_key(name.as_str()) => {
+                            return self.check_ptr_intrinsic(name, args, env, ctx);
+                        }
                         _ => {}
                     }
                 }
@@ -3142,6 +3169,27 @@ impl TypeChecker {
                             }
                             return Ty::Unit;
                         }
+                    }
+                }
+                // `sizeOf::<T>()` / `alignOf::<T>()` (Document 23 §17.13): compiler-known, safe
+                if let Expr::TurbofishPath { path, gens } = callee.as_ref() {
+                    if path.len() == 1 && (path[0] == "sizeOf" || path[0] == "alignOf") && !self.functions.contains_key(path[0].as_str()) {
+                        if gens.len() != 1 || gens[0].1.len() != 1 || !args.is_empty() {
+                            self.errors.push(TypeError {
+                                message: format!("`{0}` is written `{0}::<T>()`: exactly one type argument and no arguments (Document 23 §17.13)", path[0]),
+                                context: ctx.into(),
+                            });
+                        }
+                        return Ty::Usize;
+                    }
+                }
+                if let Expr::Ident(n) = callee.as_ref() {
+                    if (n == "sizeOf" || n == "alignOf") && !self.functions.contains_key(n.as_str()) && env.get(n).is_none() {
+                        self.errors.push(TypeError {
+                            message: format!("`{0}` needs its type argument: write `{0}::<T>()` (Document 23 §17.13)", n),
+                            context: ctx.into(),
+                        });
+                        return Ty::Usize;
                     }
                 }
                 let (callee_name, explicit_targs): (Option<&String>, Vec<Type>) = match callee.as_ref() {
@@ -3308,7 +3356,7 @@ impl TypeChecker {
                             if args.len() != 1 {
                                 self.errors.push(TypeError { message: format!("`Box::new` takes exactly one argument, found {}", args.len()), context: ctx.into() });
                             }
-                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(_)));
+                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(..)));
                             let mut it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
                             if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
                             return Ty::Generic("Box".into(), vec![GenericArg::Type(it)]);
@@ -3322,7 +3370,7 @@ impl TypeChecker {
                             if args.len() != 2 {
                                 self.errors.push(TypeError { message: format!("`Box::newIn` takes two arguments (the value and `borrow <allocator>`), found {}", args.len()), context: ctx.into() });
                             }
-                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(_)));
+                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(..)));
                             let mut it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
                             if let Some(e) = inner_exp { if matches!(it, Ty::Ref(..)) && !matches!(e, Ty::Ref(..)) { it = e; } }
                             let mut alloc_ty = Ty::Unit;
@@ -3344,6 +3392,8 @@ impl TypeChecker {
                             if args.len() != 1 {
                                 self.errors.push(TypeError { message: format!("`{}::new` takes exactly one argument, found {}", tn, args.len()), context: ctx.into() });
                             }
+                            // `Rc::new(x)` where `Rc<dyn T>` is expected: `x` is a concrete value, unsized afterwards
+                            let inner_exp = inner_exp.filter(|t| !matches!(t, Ty::DynTrait(..)));
                             let it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
                             return Ty::Generic(tn.clone(), vec![GenericArg::Type(it)]);
                         }
@@ -3465,6 +3515,10 @@ impl TypeChecker {
 
             Expr::MethodCall { receiver, name, args, gens } => {
                 let raw_recv = strip_refs(self.check_expr(receiver, None, env, ctx));
+                if let Ty::RawPtr(m, pointee) = &raw_recv {
+                    // Document 23 §17.13: `add`, `sub`, `offset`, `offsetFrom`, `isNull`, `read`, `write`
+                    return self.check_ptr_method(&raw_recv, *m, (**pointee).clone(), name, args, env, ctx);
+                }
                 if let Ty::Generic(gn, ga) = &raw_recv {
                     let inner = match ga.first() { Some(GenericArg::Type(t)) => Some(t.clone()), _ => None };
                     let is_arc_weak = gn == "Weak" && matches!(ga.get(1), Some(GenericArg::Type(Ty::Named(k))) if k == "Arc");
@@ -3532,6 +3586,17 @@ impl TypeChecker {
                     }
                 }
                 let recv_ty = peel_box(raw_recv);
+                if name == "drop" && args.is_empty() {
+                    if let Some(key) = ty_lookup_name(&recv_ty) {
+                        if self.has_drop_impl_named(&key) {
+                            self.errors.push(TypeError {
+                                message: format!("explicit destructor calls are not allowed (`x.drop()` on `{}`); use `drop(x)` (Document 6 §9.9, rule 4)", recv_ty),
+                                context: ctx.into(),
+                            });
+                            return Ty::Unit;
+                        }
+                    }
+                }
                 let call_addr = expr as *const Expr as usize;
                 // Phase 11b M5: impls of a generic trait (`impl Convert<f64> for i32`) are
                 // told apart by the call's arguments and expected type.
@@ -3584,7 +3649,7 @@ impl TypeChecker {
                         let known_base = match &recv_ty {
                             Ty::Named(n) => self.structs.contains_key(n) || self.enums.contains_key(n) || self.cur_tparams.contains(n),
                             Ty::Generic(n, _) => self.structs.contains_key(n) || self.enums.contains_key(n),
-                            Ty::DynTrait(n) => self.traits.contains_key(n),
+                            Ty::DynTrait(n, ..) => self.traits.contains_key(n),
                             Ty::RawPtr(..) => {
                                 self.errors.push(TypeError {
                                     message: format!("method `{}` on a raw pointer: pointer methods are not yet supported -- decided with the library that needs them (Document 23 §17.9 specifies none)", name),
@@ -3610,7 +3675,7 @@ impl TypeChecker {
                 let inner_expected = match expected {
                     // a slice target `&[T]` is reached by unsizing a fixed array, so the
                     // operand itself is NOT expected to be an unsized `[T]`
-                    Some(Ty::Ref(_, t)) if !matches!(**t, Ty::Array(_) | Ty::DynTrait(_)) => Some((**t).clone()),
+                    Some(Ty::Ref(_, t)) if !matches!(**t, Ty::Array(_) | Ty::DynTrait(..)) => Some((**t).clone()),
                     _ => None,
                 };
                 let t = self.check_expr(inner, inner_expected.as_ref(), env, ctx);
@@ -4350,6 +4415,97 @@ impl TypeChecker {
         }
     }
 
+    /// Methods of `*const T` / `*mut T` (Document 23 §17.13). Everything except `isNull` needs `unsafe`.
+    fn check_ptr_method(&mut self, recv: &Ty, mutable: bool, pointee: Ty, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        let (want, ret, needs_unsafe): (Vec<Ty>, Ty, bool) = match name {
+            "isNull" => (vec![], Ty::Bool, false),
+            "add" | "sub" => (vec![Ty::Usize], recv.clone(), true),
+            "offset" => (vec![Ty::Isize], recv.clone(), true),
+            "offsetFrom" => (vec![Ty::RawPtr(false, Box::new(pointee.clone()))], Ty::Isize, true),
+            "read" => (vec![], pointee.clone(), true),
+            "write" => {
+                if !mutable {
+                    self.errors.push(TypeError {
+                        message: "`write` needs a `*mut T`: a `*const T` cannot be written through (Document 23 §17.13)".into(),
+                        context: ctx.into(),
+                    });
+                }
+                (vec![pointee.clone()], Ty::Unit, true)
+            }
+            other => {
+                self.errors.push(TypeError {
+                    message: format!("no method named `{}` on a raw pointer; the pointer methods are add, sub, offset, offsetFrom, isNull, read, write (Document 23 §17.13)", other),
+                    context: ctx.into(),
+                });
+                for a in args {
+                    self.check_expr(&a.value, None, env, ctx);
+                }
+                return Ty::Unit;
+            }
+        };
+        if needs_unsafe && self.unsafe_depth == 0 {
+            self.errors.push(TypeError {
+                message: format!("the pointer method `{}` is only allowed inside an `unsafe` block (Document 23 §17.13)", name),
+                context: ctx.into(),
+            });
+        }
+        if args.len() != want.len() {
+            self.errors.push(TypeError {
+                message: format!("pointer method `{}` expects {} argument(s), found {} (Document 23 §17.13)", name, want.len(), args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+        } else {
+            for (a, w) in args.iter().zip(want.iter()) {
+                self.check_expr(&a.value, Some(w), env, ctx);
+            }
+        }
+        ret
+    }
+
+    /// `copyNonOverlapping(src, dst, count)`, `copy(src, dst, count)`, `dropInPlace(p)` (Document 23 §17.13): `unsafe` only.
+    fn check_ptr_intrinsic(&mut self, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        if self.unsafe_depth == 0 {
+            self.errors.push(TypeError {
+                message: format!("`{}` is only allowed inside an `unsafe` block (Document 23 §17.13)", name),
+                context: ctx.into(),
+            });
+        }
+        let arity = if name == "dropInPlace" { 1 } else { 3 };
+        if args.len() != arity {
+            self.errors.push(TypeError {
+                message: format!("`{}` expects {} argument(s), found {} (Document 23 §17.13)", name, arity, args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+            return Ty::Unit;
+        }
+        if name == "dropInPlace" {
+            let t = self.check_expr(&args[0].value, None, env, ctx);
+            if !matches!(self.zonk(&t), Ty::RawPtr(true, _)) && t != Ty::Never {
+                self.errors.push(TypeError { message: format!("`dropInPlace` takes a `*mut T`, found `{}` (Document 23 §17.13)", t), context: ctx.into() });
+            }
+            return Ty::Unit;
+        }
+        let st = self.check_expr(&args[0].value, None, env, ctx);
+        let st = self.zonk(&st);
+        let pointee = match &st {
+            Ty::RawPtr(_, p) => (**p).clone(),
+            Ty::Never => return Ty::Unit,
+            other => {
+                self.errors.push(TypeError { message: format!("`{}` takes a pointer as its first argument (`*const T`), found `{}` (Document 23 §17.13)", name, other), context: ctx.into() });
+                return Ty::Unit;
+            }
+        };
+        self.check_expr(&args[1].value, Some(&Ty::RawPtr(true, Box::new(pointee))), env, ctx);
+        self.check_expr(&args[2].value, Some(&Ty::Usize), env, ctx);
+        Ty::Unit
+    }
+
     /// `alloc(size, align) -> *mut u8` / `dealloc(ptr, size, align)` (Document 23 §17.9):
     /// free functions, usable only inside `unsafe`.
     fn check_alloc_intrinsic(&mut self, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
@@ -4407,49 +4563,136 @@ impl TypeChecker {
         }
     }
 
+    /// Does `ty` implement the trait `tr` with exactly the trait arguments `targs` (`dyn Source<i32>`)?
+    fn satisfies_dyn(&self, ty: &Ty, tr: &str, targs: &[Ty]) -> bool {
+        if !self.traits.contains_key(tr) {
+            return false;
+        }
+        if targs.is_empty() {
+            return self.satisfies_bound(ty, tr);
+        }
+        let Some(key) = ty_lookup_name(ty) else { return false };
+        if let Ty::Generic(gn, gargs) = ty {
+            if let Some(imps) = self.generic_impls.get(gn) {
+                if imps.iter().any(|i| i.trait_name.as_deref() == Some(tr) && i.trait_args == targs && self.impl_subst(i, gargs).is_some()) {
+                    return true;
+                }
+            }
+        }
+        self.impls_by_type.get(&key).map(|impls| impls.iter().any(|r| r.trait_name.as_deref() == Some(tr) && r.trait_args == targs)).unwrap_or(false)
+    }
+
+    /// The auto-trait bits (`1` = Send, `2` = Sync) that `ty` can promise; used to check
+    /// `dyn T + Send` / `+ Sync` coercions (a type must satisfy every bound it is coerced to).
+    fn auto_bits_ok(&self, ty: &Ty, bits: u8) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        if bits & 1 != 0 && self.auto_trait_walk(ty, true, &mut seen).is_some() {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::new();
+        !(bits & 2 != 0 && self.auto_trait_walk(ty, false, &mut seen).is_some())
+    }
+
     /// May a value of type `actual` be used where the trait-object type `exp` is expected?
+    /// Allowed: a concrete type to `dyn T` (it must implement `T<args>` and satisfy each `+ Send`/`+ Sync`),
+    /// and dropping auto-trait bits (`dyn T + Send` -> `dyn T`); never adding them.
     fn dyn_coercible(&self, actual: &Ty, exp: &Ty) -> bool {
-        let boxed = |t: &Ty| -> Option<Ty> {
+        // the pointer kinds that can hold a trait object: (constructor name, pointee, whole type)
+        let ptr_inner = |t: &Ty| -> Option<(String, Ty)> {
             match t {
-                Ty::Generic(n, a) if n == "Box" && !a.is_empty() => match &a[0] { GenericArg::Type(i) => Some(i.clone()), _ => None },
+                Ty::Generic(n, a) if matches!(n.as_str(), "Box" | "Rc" | "Arc" | "Weak") && !a.is_empty() => match &a[0] {
+                    GenericArg::Type(i) => Some((n.clone(), i.clone())),
+                    _ => None,
+                },
                 _ => None,
             }
         };
-        // the allocator argument of `Box<T, A>` (None for the default global allocator)
-        let alloc_of = |t: &Ty| -> Option<Ty> {
+        // everything after the pointee (`Box`'s allocator, `Weak`'s `Rc`/`Arc` selector) must agree
+        let tail_of = |t: &Ty| -> Vec<GenericArg> {
             match t {
-                Ty::Generic(n, a) if n == "Box" && a.len() == 2 => match &a[1] { GenericArg::Type(i) => Some(i.clone()), _ => None },
-                _ => None,
+                Ty::Generic(_, a) => a.iter().skip(1).cloned().collect(),
+                _ => Vec::new(),
             }
         };
+        let dyn_to_dyn = |t2: &str, a2: &[Ty], b2: u8, tr: &str, targs: &[Ty], eb: u8| t2 == tr && a2 == targs && (b2 & eb) == eb;
         match (actual, exp) {
             (Ty::Ref(am, a), Ty::Ref(em, e)) => {
                 if *em && !*am {
                     return false;
                 }
-                let Ty::DynTrait(tr) = &**e else { return false };
+                let Ty::DynTrait(tr, targs, eb) = &**e else { return false };
                 match &**a {
-                    Ty::DynTrait(_) => false,
-                    other => match boxed(other) {
-                        Some(Ty::DynTrait(t2)) => t2 == *tr,
+                    Ty::DynTrait(t2, a2, b2) => dyn_to_dyn(t2, a2, *b2, tr, targs, *eb),
+                    other => match ptr_inner(other) {
+                        Some((n, Ty::DynTrait(t2, a2, b2))) if n == "Box" => dyn_to_dyn(&t2, &a2, b2, tr, targs, *eb),
                         Some(_) => false,
-                        None => self.traits.contains_key(tr) && self.satisfies_bound(other, tr),
+                        None => self.satisfies_dyn(other, tr, targs) && self.auto_bits_ok(other, *eb),
                     },
                 }
             }
-            _ => match (boxed(actual), boxed(exp)) {
-                (Some(c), Some(Ty::DynTrait(tr))) => alloc_of(actual) == alloc_of(exp) && !matches!(c, Ty::DynTrait(_)) && self.traits.contains_key(&tr) && self.satisfies_bound(&c, &tr),
+            _ => match (ptr_inner(actual), ptr_inner(exp)) {
+                (Some((an, c)), Some((en, Ty::DynTrait(tr, targs, eb)))) => {
+                    if an != en || tail_of(actual) != tail_of(exp) {
+                        return false;
+                    }
+                    match &c {
+                        Ty::DynTrait(t2, a2, b2) => dyn_to_dyn(t2, a2, *b2, &tr, &targs, eb),
+                        _ => self.satisfies_dyn(&c, &tr, &targs) && self.auto_bits_ok(&c, eb),
+                    }
+                }
                 // a concrete VALUE where an owned `dyn Trait` is expected: boxed implicitly (Doc 5 sub-typing via trait objects)
-                (None, Some(Ty::DynTrait(tr))) => {
-                    alloc_of(exp).is_none()
-                        && !matches!(actual, Ty::Ref(..) | Ty::Infer(_) | Ty::Never | Ty::Unit | Ty::DynTrait(_) | Ty::RawPtr(..))
-                        && !matches!(actual, Ty::Generic(n, _) if n == "Box")
-                        && self.traits.contains_key(&tr)
-                        && self.satisfies_bound(actual, &tr)
+                (None, Some((en, Ty::DynTrait(tr, targs, eb)))) if en == "Box" => {
+                    tail_of(exp).is_empty()
+                        && !matches!(actual, Ty::Ref(..) | Ty::Infer(_) | Ty::Never | Ty::Unit | Ty::DynTrait(..) | Ty::RawPtr(..))
+                        && !matches!(actual, Ty::Generic(n, _) if matches!(n.as_str(), "Box" | "Rc" | "Arc" | "Weak"))
+                        && self.satisfies_dyn(actual, &tr, &targs)
+                        && self.auto_bits_ok(actual, eb)
                 }
                 _ => false,
             },
         }
+    }
+
+    /// A precise reason why `actual` cannot coerce to the trait-object type `exp` (used in the error text).
+    fn dyn_mismatch_reason(&self, actual: &Ty, exp: &Ty) -> Option<String> {
+        let inner = |t: &Ty| -> Option<Ty> {
+            match t {
+                Ty::Generic(n, a) if matches!(n.as_str(), "Box" | "Rc" | "Arc" | "Weak") && !a.is_empty() => match &a[0] {
+                    GenericArg::Type(i) => Some(i.clone()),
+                    _ => None,
+                },
+                Ty::Ref(_, i) => Some((**i).clone()),
+                other => Some(other.clone()),
+            }
+        };
+        let Some(Ty::DynTrait(tr, targs, eb)) = inner(exp) else { return None };
+        let c = inner(actual)?;
+        if let Ty::DynTrait(t2, a2, b2) = &c {
+            if *t2 != tr || *a2 != targs {
+                return Some(format!("`{}` is a different trait object type", c));
+            }
+            if b2 & eb != eb {
+                let missing = if eb & 1 != 0 && b2 & 1 == 0 { "Send" } else { "Sync" };
+                return Some(format!("`{}` does not promise `{}`: a trait object can drop `+ Send`/`+ Sync` but never gain them", c, missing));
+            }
+            return None;
+        }
+        if !self.satisfies_dyn(&c, &tr, &targs) {
+            return Some(format!("`{}` does not implement `{}`", c, crate::types::trait_label(&tr, &targs)));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if eb & 1 != 0 {
+            if let Some((_, why)) = self.auto_trait_walk(&c, true, &mut seen) {
+                return Some(format!("`{}` is not `Send`, so it cannot become `{}`: {}", c, exp_dyn_name(&tr, &targs, eb), why));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        if eb & 2 != 0 {
+            if let Some((_, why)) = self.auto_trait_walk(&c, false, &mut seen) {
+                return Some(format!("`{}` is not `Sync`, so it cannot become `{}`: {}", c, exp_dyn_name(&tr, &targs, eb), why));
+            }
+        }
+        None
     }
 
     fn check_compatible(&mut self, actual: &Ty, expected: Option<&Ty>, ctx: &str) {
@@ -4479,8 +4722,9 @@ impl TypeChecker {
                 }
             }
             if actual != exp {
+                let extra = self.dyn_mismatch_reason(actual, exp).map(|r| format!(": {}", r)).unwrap_or_default();
                 self.errors.push(TypeError {
-                    message: format!("expected `{}`, found `{}` (Document 5 §6: no implicit coercion, use `as`)", exp, actual),
+                    message: format!("expected `{}`, found `{}`{} (Document 5 §6: no implicit coercion, use `as`)", exp, actual, extra),
                     context: ctx.into(),
                 });
             }
@@ -5563,6 +5807,13 @@ impl TypeChecker {
         self.expr_types.iter().filter(|(_, t)| matches!(t, Ty::Fn(..))).map(|(a, _)| *a).collect()
     }
 
+    /// Does `name` (a struct or enum, or the base name of a generic one) implement the compiler-known
+    /// `Drop` trait (Document 6 §9.9)?
+    pub fn has_drop_impl_named(&self, name: &str) -> bool {
+        self.impls_by_type.get(name).map_or(false, |v| v.iter().any(|r| r.trait_name.as_deref() == Some("Drop")))
+            || self.generic_impls.get(name).map_or(false, |v| v.iter().any(|g| g.trait_name.as_deref() == Some("Drop")))
+    }
+
     /// Does a value of `t` own heap memory (so that binding it by value would be a move)?
     pub fn owns_heap(&self, t: &Ty, depth: u32) -> bool {
         if depth > 32 {
@@ -5573,10 +5824,14 @@ impl TypeChecker {
             // `ActorRef<A>` is a plain, copyable pointer: actors live until the process exits (M5)
             Ty::Generic(n, _) if n == "ActorRef" => false,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
+            // a generic struct/enum with a `Drop` impl is move-tracked before monomorphization too
+            Ty::Generic(n, _) if self.has_drop_impl_named(n) => true,
             Ty::Tuple(ts) => ts.iter().any(|x| self.owns_heap(x, depth + 1)),
             Ty::Fixed(x, _) => self.owns_heap(x, depth + 1),
             Ty::OptionTy(x) => self.owns_heap(x, depth + 1),
             Ty::ResultTy(a, b) => self.owns_heap(a, depth + 1) || self.owns_heap(b, depth + 1),
+            // a type with a `Drop` impl owns a resource, so it is always move-tracked (Document 6 §9.9)
+            Ty::Named(n) if self.has_drop_impl_named(n) => true,
             Ty::Named(n) => {
                 if let Some(sh) = self.structs.get(n) {
                     sh.fields.iter().any(|(_, f)| self.owns_heap(f, depth + 1))
@@ -5906,8 +6161,18 @@ impl TypeChecker {
 
     fn resolve_method(&self, recv_ty: &Ty, name: &str) -> Option<FnSig> {
         match recv_ty {
-            Ty::DynTrait(trait_name) => {
-                self.traits.get(trait_name)?.methods.get(name).cloned()
+            Ty::DynTrait(trait_name, targs, _) => {
+                let shape = self.traits.get(trait_name)?;
+                let sig = shape.methods.get(name)?.clone();
+                if targs.is_empty() || shape.generics.is_empty() {
+                    return Some(sig);
+                }
+                // `dyn Source<i32>`: the trait's own parameters are fixed by the object type
+                let mut names: Vec<String> = shape.generics.clone();
+                names.push("Self".to_string());
+                let subst: HashMap<String, Ty> = shape.generics.iter().cloned().zip(targs.iter().cloned()).collect();
+                let fix = |t: &Ty| substitute_type_params(&mark_type_params(t.clone(), &names), &subst);
+                Some(FnSig { params: sig.params.iter().map(fix).collect(), ret: fix(&sig.ret), has_default_body: sig.has_default_body, own: sig.own.clone(), own_bounds: sig.own_bounds.clone() })
             }
             Ty::Generic(gn, gargs) if self.generic_impls.contains_key(gn) => self.generic_method_sig(gn, gargs, name),
             // Phase 11b-2 (Doc 8 §2): inside a generic body a value of type `T`
@@ -6072,6 +6337,10 @@ pub fn join_handle_item(t: &Ty) -> Option<Ty> {
     }
 }
 
+fn exp_dyn_name(tr: &str, targs: &[Ty], bits: u8) -> String {
+    Ty::DynTrait(tr.to_string(), targs.to_vec(), bits).to_string()
+}
+
 /// Does `ty` contain a reference that is not a `'static` string view?
 fn ty_borrows(ty: &Ty) -> bool {
     match ty {
@@ -6102,9 +6371,11 @@ impl TypeChecker {
         let kind = if want_send { "Send" } else { "Sync" };
         match ty {
             Ty::RawPtr(..) => Some((ty.clone(), format!("a raw pointer is not `{}`", kind))),
-            Ty::DynTrait(n) => {
-                if want_send {
-                    Some((ty.clone(), format!("`dyn {}` carries no `+ Send` guarantee (Document 7 §9.10)", n)))
+            Ty::DynTrait(n, _, bits) => {
+                if want_send && bits & 1 == 0 {
+                    Some((ty.clone(), format!("`dyn {}` carries no `+ Send` guarantee: write `dyn {} + Send` (Document 7 §9.10)", n, n)))
+                } else if !want_send && bits & 2 == 0 {
+                    Some((ty.clone(), format!("`dyn {}` carries no `+ Sync` guarantee: write `dyn {} + Sync` (Document 7 §9.10)", n, n)))
                 } else {
                     None
                 }
