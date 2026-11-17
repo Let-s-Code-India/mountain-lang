@@ -157,7 +157,7 @@ fn pointer_arithmetic_not_yet_supported() {
 
 #[test]
 fn pointer_methods_and_indexing_not_yet_supported() {
-    rejected("fn main() { let mut v: i32 = 1; let p = &mut v as *mut i32; let q = p.offset(1); println(1); }", "not yet supported -- decided with the library that needs");
+    // pointer methods (`offset`, `add`, ...) were implemented in Phase 13 M0 (tests/phase13_m0.rs); only indexing stays rejected
     rejected("fn main() { let mut v: i32 = 1; let p = &mut v as *mut i32; let x = unsafe { p[0] }; println(x); }", "indexing a raw pointer");
 }
 

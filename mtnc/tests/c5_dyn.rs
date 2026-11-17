@@ -266,10 +266,14 @@ fn borrowed_dyn_option_with_a_type_that_does_not_implement_the_trait_is_rejected
     rejected(src);
 }
 
+// Phase 13 M0 lifted the old "generic trait objects are not supported" error: `dyn G<i32>` now works
+// (the full coverage is in tests/phase13_m0.rs); this keeps the original program as a positive check.
 #[test]
-fn generic_trait_object_is_a_clear_error() {
-    let m = rejected("trait G<T> { fn get(borrow self) -> i32; }\nfn f(x: borrow dyn G<i32>) { }\nfn main() { }");
-    assert!(m.contains("dyn G<..>"), "{}", m);
+fn generic_trait_object_is_now_supported() {
+    ok(
+        "trait G<T> { fn get(borrow self) -> T; }\nstruct A { v: i32 }\nimpl G<i32> for A { fn get(borrow self) -> i32 { return self.v; } }\nfn f(x: borrow dyn G<i32>) -> i32 { return x.get(); }\nfn main() { let b: Box<dyn G<i32>> = Box::new(A { v: 5 }); println(f(borrow b)); }",
+        "5\n",
+    );
 }
 
 #[test]
