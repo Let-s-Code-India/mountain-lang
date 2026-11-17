@@ -418,6 +418,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         if self.root_is_borrowed(e) {
                             return Err(CgErr(format!("cannot move the `{}` field (type `{}`) out of a borrowed value", name, t)));
                         }
+                        if let Ty::Named(bn) = strip_ref_ty(&bty) {
+                            if self.drop_impl_key(bn).is_some() {
+                                return Err(CgErr(format!("cannot move the field `{}` (type `{}`) out of `{}`: a type that implements `Drop` cannot be taken apart (Document 6 §9.9, rule 5); borrow the field instead", name, t, bn)));
+                            }
+                        }
                         self.mark_moved(p, &t)?;
                     }
                     return Ok(v);
@@ -735,6 +740,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         for (i, v) in vals.into_iter().enumerate() {
             agg = self.builder.build_insert_value(agg, v, i as u32, "agg")?.into_struct_value();
         }
+        if let Some(fi) = self.drop_flag_index(ty) {
+            agg = self.builder.build_insert_value(agg, self.context.i8_type().const_int(1, false), fi, "live")?.into_struct_value();
+        }
         Ok(agg.into())
     }
 
@@ -769,6 +777,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let tmp = self.alloca(layout.llty.into(), "enum")?;
         let tag = self.builder.build_struct_gep(layout.llty, tmp, 0, "tag")?;
         self.builder.build_store(tag, self.int_ty(32).const_int(idx as u64, false))?;
+        if let Some(fi) = self.drop_flag_index(ty) {
+            let lp = self.builder.build_struct_gep(layout.llty, tmp, fi, "live")?;
+            self.builder.build_store(lp, self.context.i8_type().const_int(1, false))?;
+        }
         if !vals.is_empty() {
             let payload = self.builder.build_struct_gep(layout.llty, tmp, 1, "payload")?;
             for (i, v) in vals.into_iter().enumerate() {
@@ -817,6 +829,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 Ty::Generic(n, a) if (n == "Rc" || n == "Arc") && !a.is_empty() => {
                     let Some(crate::types::GenericArg::Type(inner)) = a.first() else { return Err(CgErr("internal: `Rc` without a type argument".into())) };
                     let inner = inner.clone();
+                    if matches!(inner, Ty::DynTrait(..)) {
+                        return Err(CgErr(format!("`{}` points at an unsized trait object: call its trait methods directly (`rc.method()`); it cannot be dereferenced into a value", ty)));
+                    }
                     let obj = self.builder.build_load(ptrt, p, "rcobj")?.into_pointer_value();
                     let objt = self.rc_obj_ty(&inner)?;
                     p = self.builder.build_struct_gep(objt, obj, 2, "rcval")?;
@@ -1192,7 +1207,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         match p.mode {
             PMode::Value | PMode::Variadic => self.expr_as(arg, &p.ty),
             // `borrow dyn Trait`: the argument is (or is coerced to) a `&dyn Trait` fat pointer
-            PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(_)) => self.expr(arg),
+            PMode::Ref(_) if matches!(p.ty, Ty::DynTrait(..)) => self.expr(arg),
             PMode::Ref(want_mut) => {
                 let mut a = arg;
                 while let Expr::Paren(i) = a {
@@ -1407,6 +1422,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Arg], call_addr: usize) -> R<V<'ctx>> {
         let rty = self.ty_of(receiver)?;
+        if let Ty::RawPtr(_, _) = strip_ref_ty(&rty) {
+            return self.ptr_method(receiver, &rty, name, args);
+        }
         {
             let mut b0 = rty.clone();
             while let Ty::Ref(_, i) = b0 {
@@ -1454,9 +1472,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 _ => break,
             }
         }
-        if let Ty::DynTrait(tr) = &base {
-            let tr = tr.clone();
-            return self.dyn_method_call(receiver, &rty, &tr, name, args);
+        if let Ty::DynTrait(tr, targs, _) = &base {
+            let (tr, targs) = (tr.clone(), targs.clone());
+            return self.dyn_method_call(receiver, &rty, &tr, &targs, name, args);
         }
         let tystr = base.to_string();
         let mut found = self.find_method(&tystr, name);
@@ -1853,6 +1871,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 (_, false) => IntPredicate::UGE,
             };
             return Ok(self.builder.build_int_compare(pred, l.into_int_value(), r.into_int_value(), "")?.into());
+        }
+        if let Ty::RawPtr(..) = ty {
+            // raw pointers compare by address (Document 23 §17.13); `Atomic<*mut T>` compares the same way
+            let it = self.int_ty(64);
+            let (a, b) = (self.builder.build_ptr_to_int(l.into_pointer_value(), it, "pa")?, self.builder.build_ptr_to_int(r.into_pointer_value(), it, "pb")?);
+            return self.compare(op, a.into(), b.into(), &Ty::Usize);
         }
         Err(CgErr(format!("comparing values of type `{}` is not yet supported by codegen — Phase 16", ty)))
     }
@@ -2557,6 +2581,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     }
                     let mut acc = if test { self.tag_is(ty, place, idx)? } else { t };
                     for (i, (p, ft)) in subs.iter().zip(ftys.iter()).enumerate() {
+                        self.forbid_move_out_of_drop_type(ty, p, ft)?;
                         let fp = self.payload_ptr(ty, place, idx, i)?;
                         let c = self.pat_test(p, fp, ft, binds, test)?;
                         if test {
@@ -2571,6 +2596,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                             let st = self.llty(ty)?;
                             let mut acc = t;
                             for (i, (p, (_, ft))) in subs.iter().zip(fields.iter()).enumerate() {
+                                self.forbid_move_out_of_drop_type(ty, p, ft)?;
                                 let fp = self.builder.build_struct_gep(st, place, i as u32, "sp")?;
                                 let c = self.pat_test(p, fp, ft, binds, test)?;
                                 if test {
@@ -2600,6 +2626,25 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             // FLAGGED: Document 25 §2.5 does not schedule array patterns; proposed with Phase 16 (slices / `Iterable`).
             Pattern::Array(..) => unsupported("array patterns (not scheduled in Document 25 §2.5; proposed with the slice work)", 16),
         }
+    }
+
+    /// Document 6 §9.9 rule 5: a pattern that moves an owning field out of an owned value of a type
+    /// that implements `Drop` is an error (matching through a reference, or binding Copy fields, is fine).
+    fn forbid_move_out_of_drop_type(&mut self, ty: &Ty, sub: &Pattern, ft: &Ty) -> R<()> {
+        let Ty::Named(n) = ty else { return Ok(()) };
+        if self.cur_match_by_ref || self.drop_impl_key(n).is_none() || !self.needs_drop(ft) {
+            return Ok(());
+        }
+        let binds = match sub {
+            Pattern::Ident(b) => !b.contains("::") && self.variant_index(b, ft).is_none(),
+            Pattern::Mut(_) => true,
+            Pattern::Wildcard | Pattern::Literal(_) => false,
+            _ => true,
+        };
+        if binds {
+            return Err(CgErr(format!("cannot move a field of type `{}` out of `{}` with a pattern: a type that implements `Drop` cannot be taken apart (Document 6 §9.9, rule 5); match on a reference instead", ft, n)));
+        }
+        Ok(())
     }
 
     fn tag_is(&mut self, ty: &Ty, place: PointerValue<'ctx>, idx: usize) -> R<IntValue<'ctx>> {
@@ -2828,6 +2873,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // ---- calls --------------------------------------------------------------------
 
     fn call(&mut self, whole: &Expr, callee: &Expr, args: &[Arg]) -> R<V<'ctx>> {
+        if let Expr::TurbofishPath { path, gens } = callee {
+            if path.len() == 1 && (path[0] == "sizeOf" || path[0] == "alignOf") && !self.fns.contains_key(path[0].as_str()) {
+                return self.gen_size_of(&path[0], &gens[0].1[0]);
+            }
+        }
         match callee {
             Expr::Ident(name) => {
                 if matches!(self.lookup_local(name), Some((_, Ty::Fn(..)))) {
@@ -2839,6 +2889,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         "Ok" | "Err" | "Some" => return self.ctor_call(whole, name, args),
                         "panic" => return self.gen_panic(args),
                         "alloc" | "dealloc" => return self.gen_alloc_call(name, args),
+                        "copyNonOverlapping" | "copy" | "dropInPlace" => return self.gen_ptr_intrinsic(name, args),
                         "drop" => return self.gen_drop_call(args),
                         "pinToCore" => return self.gen_pin_to_core(&args[0].value),
                         "__actor_new" => return self.gen_actor_new(args),
@@ -3004,6 +3055,90 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.emit_top_frame()
     }
 
+    /// The pointer value of a receiver/argument of type `*T` (through any references).
+    fn ptr_operand(&mut self, e: &Expr, ty: &Ty) -> R<PointerValue<'ctx>> {
+        let mut v = self.expr(e)?;
+        let mut t = ty.clone();
+        while let Ty::Ref(_, i) = t {
+            let ptrt = self.context.ptr_type(AddressSpace::default());
+            v = self.builder.build_load(ptrt, v.into_pointer_value(), "deref")?;
+            t = *i;
+        }
+        Ok(v.into_pointer_value())
+    }
+
+    /// Pointer methods (Document 23 §17.13): `add sub offset offsetFrom isNull read write`.
+    fn ptr_method(&mut self, receiver: &Expr, rty: &Ty, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+        let Ty::RawPtr(_, pointee) = strip_ref_ty(rty).clone() else { unreachable!() };
+        let pointee = *pointee;
+        let p = self.ptr_operand(receiver, rty)?;
+        let elt = self.llty(&pointee)?;
+        let i64t = self.int_ty(64);
+        match name {
+            "isNull" => Ok(self.builder.build_is_null(p, "isnull")?.into()),
+            "add" | "sub" | "offset" => {
+                let want = if name == "offset" { Ty::Isize } else { Ty::Usize };
+                let n = self.expr_as(&args[0].value, &want)?.into_int_value();
+                let n = if n.get_type().get_bit_width() < 64 { self.builder.build_int_s_extend(n, i64t, "n")? } else { n };
+                let idx = if name == "sub" { self.builder.build_int_neg(n, "neg")? } else { n };
+                // a plain (non-`inbounds`) GEP: the address arithmetic wraps and never traps
+                let r = unsafe { self.builder.build_gep(elt, p, &[idx], "padd")? };
+                Ok(r.into())
+            }
+            "offsetFrom" => {
+                let q = self.ptr_operand(&args[0].value, &self.ty_of(&args[0].value)?)?;
+                if self.td.get_abi_size(&elt) == 0 {
+                    return Ok(i64t.const_zero().into());
+                }
+                Ok(self.builder.build_ptr_diff(elt, p, q, "pdiff")?.into())
+            }
+            "read" => self.load(p, &pointee),
+            "write" => {
+                let v = self.expr_as(&args[0].value, &pointee)?;
+                self.builder.build_store(p, v)?;
+                Ok(self.unit())
+            }
+            other => Err(CgErr(format!("internal: pointer method `{}`", other))),
+        }
+    }
+
+    /// `copyNonOverlapping(src, dst, count)`, `copy(src, dst, count)`, `dropInPlace(p)`.
+    fn gen_ptr_intrinsic(&mut self, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+        let st = self.ty_of(&args[0].value)?;
+        let Ty::RawPtr(_, pointee) = strip_ref_ty(&st).clone() else { return Err(CgErr(format!("`{}` takes a pointer", name))) };
+        let pointee = *pointee;
+        if name == "dropInPlace" {
+            let p = self.ptr_operand(&args[0].value, &st)?;
+            if self.needs_drop(&pointee) {
+                let g = self.drop_glue(&pointee)?;
+                self.builder.build_call(g, &[p.into()], "")?;
+            }
+            return Ok(self.unit());
+        }
+        let src = self.ptr_operand(&args[0].value, &st)?;
+        let dt = self.ty_of(&args[1].value)?;
+        let dst = self.ptr_operand(&args[1].value, &dt)?;
+        let count = self.expr_as(&args[2].value, &Ty::Usize)?.into_int_value();
+        let elt = self.llty(&pointee)?;
+        let size = self.td.get_abi_size(&elt);
+        let align = self.td.get_abi_alignment(&elt).max(1);
+        let bytes = self.builder.build_int_mul(count, count.get_type().const_int(size, false), "bytes")?;
+        if name == "copyNonOverlapping" {
+            self.builder.build_memcpy(dst, align, src, align, bytes)?;
+        } else {
+            self.builder.build_memmove(dst, align, src, align, bytes)?;
+        }
+        Ok(self.unit())
+    }
+
+    /// `sizeOf::<T>()` / `alignOf::<T>()`.
+    fn gen_size_of(&mut self, name: &str, t: &Type) -> R<V<'ctx>> {
+        let ty = self.rty(t);
+        let lt = self.llty(&ty)?;
+        let n = if name == "sizeOf" { self.td.get_abi_size(&lt) } else { self.td.get_abi_alignment(&lt) as u64 };
+        Ok(self.int_ty(64).const_int(n, false).into())
+    }
+
     /// `alloc(size, align)` / `dealloc(ptr, size, align)` lower to the single internal allocation interface.
     fn gen_alloc_call(&mut self, name: &str, args: &[Arg]) -> R<V<'ctx>> {
         let (fa, fd) = self.alloc_fns();
@@ -3087,5 +3222,13 @@ fn ty_has_ref(t: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().any(ty_has_ref),
         Ty::Array(e) | Ty::Fixed(e, _) => ty_has_ref(e),
         _ => false,
+    }
+}
+
+/// `T` for `T`, `&T`, `&mut T`, `&&T`, ...
+pub(super) fn strip_ref_ty(t: &Ty) -> &Ty {
+    match t {
+        Ty::Ref(_, i) => strip_ref_ty(i),
+        other => other,
     }
 }

@@ -41,6 +41,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::Generic(n, _) => crate::types::is_heap_generic(n),
             Ty::Tuple(ts) => ts.iter().any(|t| self.needs_drop_d(t, depth + 1)),
             Ty::Fixed(t, _) => self.needs_drop_d(t, depth + 1),
+            // a type with a `Drop` impl always has something to do (Document 6 §9.9)
+            Ty::Named(n) if self.drop_impl_key(n).is_some() => true,
             Ty::Named(n) => {
                 if let Some((fields, _)) = self.structs.get(n) {
                     fields.iter().any(|(_, t)| self.needs_drop_d(t, depth + 1))
@@ -276,7 +278,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.build_unconditional_branch(end)?;
                 self.builder.position_at_end(end);
             }
-            Ty::Generic(n, args) if n == "Box" && matches!(args.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) => {
+            Ty::Generic(n, args) if n == "Box" && matches!(args.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => {
                 let a = box_alloc_arg(ty);
                 self.dyn_box_glue(f, p, a)?;
             }
@@ -316,7 +318,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let inner = inner.clone();
                 let atomic = n == "Arc";
                 let objt = self.rc_obj_ty(&inner)?;
+                let is_dyn = matches!(inner, Ty::DynTrait(..));
                 let obj = self.builder.build_load(ptrt, p, "rc")?.into_pointer_value();
+                // `Rc<dyn T>`: the vtable is the second word of the handle
+                let dyn_vt = if is_dyn {
+                    let fat = self.fat_ty();
+                    let vp = self.builder.build_struct_gep(fat, p, 1, "vtp")?;
+                    Some(self.builder.build_load(ptrt, vp, "vt")?.into_pointer_value())
+                } else {
+                    None
+                };
                 let (live, last, end) = (self.glue_block(f, "live"), self.glue_block(f, "last"), self.glue_block(f, "end"));
                 let nn = self.builder.build_is_not_null(obj, "nn")?;
                 self.builder.build_conditional_branch(nn, live, end)?;
@@ -327,12 +338,26 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.builder.build_conditional_branch(was_last, last, end)?;
                 self.builder.position_at_end(last);
                 // the last strong owner drops the value, then releases the implicit weak reference
-                if self.needs_drop(&inner) {
+                if let Some(vt) = dyn_vt {
+                    // the concrete drop glue comes from the vtable (null when the value owns nothing)
+                    let vt_ty = self.vtable_ty_pub(0);
+                    let dfp = self.builder.build_struct_gep(vt_ty, vt, 0, "dropp")?;
+                    let dfn = self.builder.build_load(ptrt, dfp, "dropfn")?.into_pointer_value();
+                    let has = self.builder.build_is_not_null(dfn, "has_drop")?;
+                    let (call_bb, after) = (self.glue_block(f, "dyn_drop"), self.glue_block(f, "dyn_after"));
+                    self.builder.build_conditional_branch(has, call_bb, after)?;
+                    self.builder.position_at_end(call_bb);
+                    let vp = self.dyn_rc_value_ptr(obj, vt)?;
+                    let ft = self.context.void_type().fn_type(&[ptrt.into()], false);
+                    self.builder.build_indirect_call(ft, dfn, &[vp.into()], "")?;
+                    self.builder.build_unconditional_branch(after)?;
+                    self.builder.position_at_end(after);
+                } else if self.needs_drop(&inner) {
                     let g = self.drop_glue(&inner)?;
                     let vp = self.builder.build_struct_gep(objt, obj, 2, "value")?;
                     self.builder.build_call(g, &[vp.into()], "")?;
                 }
-                self.rc_release_weak(f, objt, obj, atomic, end)?;
+                self.rc_release_weak(f, objt, obj, atomic, end, dyn_vt)?;
                 self.builder.position_at_end(end);
             }
             Ty::Generic(n, args) if n == "Weak" => {
@@ -343,11 +368,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let atomic = Self::weak_is_arc(args);
                 let objt = self.rc_obj_ty(&inner)?;
                 let obj = self.builder.build_load(ptrt, p, "weak")?.into_pointer_value();
+                let dyn_vt = if matches!(inner, Ty::DynTrait(..)) {
+                    let fat = self.fat_ty();
+                    let vp = self.builder.build_struct_gep(fat, p, 1, "vtp")?;
+                    Some(self.builder.build_load(ptrt, vp, "vt")?.into_pointer_value())
+                } else {
+                    None
+                };
                 let (live, end) = (self.glue_block(f, "live"), self.glue_block(f, "end"));
                 let nn = self.builder.build_is_not_null(obj, "nn")?;
                 self.builder.build_conditional_branch(nn, live, end)?;
                 self.builder.position_at_end(live);
-                self.rc_release_weak(f, objt, obj, atomic, end)?;
+                self.rc_release_weak(f, objt, obj, atomic, end, dyn_vt)?;
                 self.builder.position_at_end(end);
             }
             Ty::Generic(n, _) if n == "Generator" || n == "Future" => self.generator_glue(f, p)?,
@@ -377,6 +409,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Ty::Named(n) if self.structs.contains_key(n) => {
                 let (fields, _) = self.structs[n].clone();
                 let st = self.llty(ty)?;
+                let end = self.glue_block(f, "end");
+                if self.drop_impl_key(n).is_some() {
+                    self.user_drop_prologue(f, p, ty, st.into_struct_type(), fields.len() as u32, end)?;
+                }
                 for (i, (_, ft)) in fields.iter().enumerate() {
                     if self.needs_drop(ft) {
                         let g = self.drop_glue(ft)?;
@@ -384,12 +420,19 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         self.builder.build_call(g, &[fp.into()], "")?;
                     }
                 }
+                self.builder.build_unconditional_branch(end)?;
+                self.builder.position_at_end(end);
             }
             Ty::Named(_) | Ty::OptionTy(_) | Ty::ResultTy(..) => {
                 let variants = self.variants_of(ty).ok_or_else(|| CgErr(format!("internal: no drop glue for `{}`", ty)))?;
                 let layout = self.enum_layout(ty)?;
-                let tag = self.enum_tag(ty, p)?;
                 let end = self.glue_block(f, "end");
+                if let Ty::Named(n) = ty {
+                    if self.drop_impl_key(n).is_some() {
+                        self.user_drop_prologue(f, p, ty, layout.llty, 2, end)?;
+                    }
+                }
+                let tag = self.enum_tag(ty, p)?;
                 let mut cases: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
                 let mut bodies: Vec<(usize, BasicBlock<'ctx>)> = Vec::new();
                 for (i, (_, fs)) in variants.iter().enumerate() {
@@ -419,6 +462,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(())
     }
 
+    /// Start of the glue of a type with a `Drop` impl (Document 6 §9.9 rule 2): when the hidden live
+    /// byte is 0 (a moved-out or never-built slot) go straight to `end`; otherwise clear the byte
+    /// and run the user's `drop(borrow mut self)` BEFORE the fields are dropped (the caller emits the
+    /// field drops after this and ends in `end`).
+    fn user_drop_prologue(&mut self, f: FunctionValue<'ctx>, p: PointerValue<'ctx>, ty: &Ty, st: StructType<'ctx>, flag_idx: u32, end: BasicBlock<'ctx>) -> R<()> {
+        let Ty::Named(n) = ty else { return Err(CgErr("internal: Drop on a non-named type".into())) };
+        let key = self.drop_impl_key(n).ok_or_else(|| CgErr(format!("internal: no `Drop` impl for `{}`", n)))?;
+        let user = self.fns.get(&key).ok_or_else(|| CgErr(format!("internal: the `drop` method of `{}` was not declared", n)))?.val;
+        let i8t = self.context.i8_type();
+        let fp = self.builder.build_struct_gep(st, p, flag_idx, "livep")?;
+        let live = self.builder.build_load(i8t, fp, "live")?.into_int_value();
+        let is_live = self.builder.build_int_compare(IntPredicate::NE, live, i8t.const_zero(), "is_live")?;
+        let run = self.glue_block(f, "user_drop");
+        self.builder.build_conditional_branch(is_live, run, end)?;
+        self.builder.position_at_end(run);
+        // at most once: the byte is cleared before the call, so a second run of the glue is a no-op
+        self.builder.build_store(fp, i8t.const_zero())?;
+        self.builder.build_call(user, &[p.into()], "")?;
+        Ok(())
+    }
+
     // ---- Rc / Arc / Weak (Document 6 §6) ----------------------------------------
     //
     // Heap object: `{ strong: usize, weak: usize, value: T }`. `Rc<T>`, `Arc<T>` and `Weak<T>` are
@@ -428,6 +492,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     pub(super) fn rc_obj_ty(&mut self, inner: &Ty) -> R<StructType<'ctx>> {
         let ut = self.usize_ty();
+        if matches!(inner, Ty::DynTrait(..)) {
+            // `Rc<dyn T>`: only the header `{strong, weak}` is statically known; the value follows it at an
+            // offset that depends on the concrete type's alignment (read from the vtable).
+            return Ok(self.context.struct_type(&[ut.into(), ut.into()], false));
+        }
         let lt = self.llty(inner)?;
         Ok(self.context.struct_type(&[ut.into(), ut.into(), lt], false))
     }
@@ -462,8 +531,48 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(())
     }
 
+    /// `(offset of the value, whole object size, object alignment)` of an `Rc<dyn T>` object whose concrete
+    /// type has the size/alignment recorded in vtable `vt` (the same layout `{usize, usize, T}` has for `Rc<T>`).
+    fn dyn_rc_layout(&mut self, vt: PointerValue<'ctx>) -> R<(IntValue<'ctx>, IntValue<'ctx>, IntValue<'ctx>)> {
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let _ = ptrt;
+        let ut = self.usize_ty();
+        let vt_ty = self.vtable_ty_pub(0);
+        let sp = self.builder.build_struct_gep(vt_ty, vt, 1, "vsize")?;
+        let ap = self.builder.build_struct_gep(vt_ty, vt, 2, "valign")?;
+        let size = self.builder.build_load(ut, sp, "size")?.into_int_value();
+        let align = self.builder.build_load(ut, ap, "align")?.into_int_value();
+        let hdr = ut.const_int(self.td.get_abi_size(&self.context.struct_type(&[ut.into(), ut.into()], false)), false);
+        let one = ut.const_int(1, false);
+        let am1 = self.builder.build_int_sub(align, one, "am1")?;
+        // off = (hdr + align - 1) & !(align - 1)
+        let sum = self.builder.build_int_add(hdr, am1, "sum")?;
+        let mask = self.builder.build_not(am1, "mask")?;
+        let off = self.builder.build_and(sum, mask, "off")?;
+        // object alignment = max(align, alignof(usize))
+        let ualign = ut.const_int(self.td.get_abi_alignment(&ut) as u64, false);
+        let bigger = self.builder.build_int_compare(IntPredicate::UGT, align, ualign, "bigger")?;
+        let oalign = self.builder.build_select(bigger, align, ualign, "oalign")?.into_int_value();
+        // total = round_up(off + size, oalign)
+        let raw = self.builder.build_int_add(off, size, "raw")?;
+        let om1 = self.builder.build_int_sub(oalign, one, "om1")?;
+        let t1 = self.builder.build_int_add(raw, om1, "t1")?;
+        let omask = self.builder.build_not(om1, "omask")?;
+        let total = self.builder.build_and(t1, omask, "total")?;
+        Ok((off, total, oalign))
+    }
+
+    /// Pointer to the value inside an `Rc<dyn T>` object (`obj + offset`).
+    pub(super) fn dyn_rc_value_ptr(&mut self, obj: PointerValue<'ctx>, vt: PointerValue<'ctx>) -> R<PointerValue<'ctx>> {
+        let (off, _, _) = self.dyn_rc_layout(vt)?;
+        let i8t = self.context.i8_type();
+        // SAFETY: `off` is within the allocation made for this object
+        Ok(unsafe { self.builder.build_gep(i8t, obj, &[off], "dynval")? })
+    }
+
     /// Releases one weak reference of `obj`; frees the object when it was the last. Ends in `end`.
-    fn rc_release_weak(&mut self, f: FunctionValue<'ctx>, objt: StructType<'ctx>, obj: PointerValue<'ctx>, atomic: bool, end: BasicBlock<'ctx>) -> R<()> {
+    /// `dyn_vt`: the vtable when the object is an `Rc<dyn T>` (its size then comes from the vtable).
+    fn rc_release_weak(&mut self, f: FunctionValue<'ctx>, objt: StructType<'ctx>, obj: PointerValue<'ctx>, atomic: bool, end: BasicBlock<'ctx>, dyn_vt: Option<PointerValue<'ctx>>) -> R<()> {
         let ut = self.usize_ty();
         let weak = self.builder.build_struct_gep(objt, obj, 1, "weak")?;
         let old = self.rc_dec(weak, atomic)?;
@@ -471,9 +580,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let was_last = self.builder.build_int_compare(IntPredicate::EQ, old, ut.const_int(1, false), "wl")?;
         self.builder.build_conditional_branch(was_last, free, end)?;
         self.builder.position_at_end(free);
-        let size = self.td.get_abi_size(&objt).max(1);
-        let align = (self.td.get_abi_alignment(&objt) as u64).max(1);
-        self.call_dealloc(obj, ut.const_int(size, false), ut.const_int(align, false))?;
+        if let Some(vt) = dyn_vt {
+            let (_, total, oalign) = self.dyn_rc_layout(vt)?;
+            self.call_dealloc(obj, total, oalign)?;
+        } else {
+            let size = self.td.get_abi_size(&objt).max(1);
+            let align = (self.td.get_abi_alignment(&objt) as u64).max(1);
+            self.call_dealloc(obj, ut.const_int(size, false), ut.const_int(align, false))?;
+        }
         self.builder.build_unconditional_branch(end)?;
         Ok(())
     }
@@ -513,19 +627,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             t = (**i).clone();
         }
         let _ = rty;
-        let obj = self.builder.build_load(ptrt, slot, "obj")?.into_pointer_value();
+        let is_dyn = matches!(inner, Ty::DynTrait(..));
+        // a handle is the object pointer, or `{ object pointer, vtable }` for `Rc<dyn T>`
+        let handle: V<'ctx> = if is_dyn { self.builder.build_load(self.fat_ty(), slot, "handle")? } else { self.builder.build_load(ptrt, slot, "obj")? };
+        let obj = if is_dyn { self.builder.build_extract_value(handle.into_struct_value(), 0, "obj")?.into_pointer_value() } else { handle.into_pointer_value() };
         let objt = self.rc_obj_ty(&inner)?;
         let arc_kind = gname == "Arc" || (gname == "Weak" && Self::weak_is_arc(gargs));
         match (gname, name) {
             ("Rc" | "Arc", "clone") => {
                 let sp = self.builder.build_struct_gep(objt, obj, 0, "strong")?;
                 self.rc_inc(sp, arc_kind)?;
-                Ok(obj.into())
+                Ok(handle)
             }
             ("Rc" | "Arc", "downgrade") | ("Weak", "clone") => {
                 let wp = self.builder.build_struct_gep(objt, obj, 1, "weak")?;
                 self.rc_inc(wp, arc_kind)?;
-                Ok(obj.into())
+                Ok(handle)
             }
             ("Weak", "upgrade") => {
                 let ut = self.usize_ty();
@@ -562,7 +679,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     self.builder.build_unconditional_branch(some_bb)?;
                 }
                 self.position(some_bb);
-                let v = self.make_enum(whole_ty, some_idx, vec![obj.into()])?;
+                let v = self.make_enum(whole_ty, some_idx, vec![handle])?;
                 self.builder.build_store(out, v)?;
                 self.builder.build_unconditional_branch(merge)?;
                 self.position(none_bb);

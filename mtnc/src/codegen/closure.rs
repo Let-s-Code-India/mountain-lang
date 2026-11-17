@@ -372,7 +372,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         for (p, t) in params.iter().zip(ptys.iter()) {
             if let PMode::Ref(_) = p.mode {
-                let same = if matches!(p.ty, Ty::DynTrait(_)) || (matches!(p.ty, Ty::Array(_)) && p.mode == PMode::Ref(false)) {
+                let same = if matches!(p.ty, Ty::DynTrait(..)) || (matches!(p.ty, Ty::Array(_)) && p.mode == PMode::Ref(false)) {
                     true
                 } else {
                     self.llty(t)? == self.context.ptr_type(AddressSpace::default()).into()

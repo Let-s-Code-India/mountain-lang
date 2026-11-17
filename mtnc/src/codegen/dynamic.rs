@@ -26,6 +26,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         self.context.struct_type(&[p.into(), p.into()], false)
     }
 
+    pub(super) fn vtable_ty_pub(&self, methods: usize) -> StructType<'ctx> {
+        self.vtable_ty(methods)
+    }
+
     fn vtable_ty(&self, methods: usize) -> StructType<'ctx> {
         let p = self.context.ptr_type(AddressSpace::default());
         let u = self.usize_ty();
@@ -45,8 +49,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     /// The (memoised) vtable global of `conc` implementing `tr`.
-    pub(super) fn vtable_for(&mut self, conc: &Ty, tr: &str) -> R<PointerValue<'ctx>> {
-        let key = format!("{}::{}", conc, tr);
+    pub(super) fn vtable_for(&mut self, conc: &Ty, tr: &str, targs: &[Ty]) -> R<PointerValue<'ctx>> {
+        let label = crate::types::trait_label(tr, targs);
+        let key = format!("{}::{}", conc, label);
         if let Some(v) = self.vtables.get(&key) {
             return Ok(*v);
         }
@@ -67,10 +72,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let mut fields: Vec<inkwell::values::BasicValueEnum<'ctx>> = vec![drop_ptr, ut.const_int(size, false).into(), ut.const_int(align, false).into()];
         let tystr = conc.to_string();
         for (name, self_kind, generic) in &names {
-            let slot: inkwell::values::BasicValueEnum<'ctx> = match (self_kind, generic, self.trait_impl_keys.get(&(tystr.clone(), tr.to_string(), name.clone()))) {
+            let slot: inkwell::values::BasicValueEnum<'ctx> = match (
+                self_kind,
+                generic,
+                if targs.is_empty() { self.trait_impl_keys.get(&(tystr.clone(), tr.to_string(), name.clone())) } else { self.trait_impls.get(&(tystr.clone(), label.clone(), name.clone())) },
+            ) {
                 (Some(PMode::Ref(_)), false, Some(k)) => self.fns[k].val.as_global_value().as_pointer_value().into(),
                 (_, _, None) if matches!(self_kind, Some(PMode::Ref(_))) && !generic => {
-                    return Err(CgErr(format!("`{}` does not implement the method `{}` of trait `{}` (needed for `dyn {}`)", conc, name, tr, tr)));
+                    return Err(CgErr(format!("`{}` does not implement the method `{}` of trait `{}` (needed for `dyn {}`)", conc, name, label, label)));
                 }
                 _ => ptrt.const_null().into(),
             };
@@ -78,7 +87,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         let vt_ty = self.vtable_ty(names.len());
         let init = self.context.const_struct(&fields, false);
-        let gname = format!("__mtn_vtable_{}_{}", Self::sanitize(&tystr), tr);
+        let gname = format!("__mtn_vtable_{}_{}", Self::sanitize(&tystr), Self::sanitize(&label));
         let g = self.module.add_global(vt_ty, None, &gname);
         g.set_constant(true);
         g.set_initializer(&init);
@@ -95,23 +104,45 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     pub(super) fn coerce_to_dyn(&mut self, v: V<'ctx>, src: &Ty, dst: &Ty) -> R<V<'ctx>> {
         match (src, dst) {
             (Ty::Ref(_, a), Ty::Ref(_, d)) => {
-                let Ty::DynTrait(tr) = &**d else { return Err(CgErr("internal: bad trait-object coercion".into())) };
+                let Ty::DynTrait(tr, targs, _) = &**d else { return Err(CgErr("internal: bad trait-object coercion".into())) };
+                let (tr, targs) = (tr.clone(), targs.clone());
+                if matches!(&**a, Ty::DynTrait(..)) {
+                    // `&dyn T + Send` -> `&dyn T`: only the static bounds change, not the representation
+                    return Ok(v);
+                }
                 if let Ty::Generic(n, ga) = &**a {
-                    if n == "Box" && matches!(ga.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(_)))) {
+                    if n == "Box" && matches!(ga.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) {
                         // `&Box<dyn Trait>` -> `&dyn Trait`: the box's own fat pointer
                         let fat = self.fat_ty();
                         return Ok(self.builder.build_load(fat, v.into_pointer_value(), "fat")?);
                     }
                 }
-                let vt = self.vtable_for(a, tr)?;
+                let vt = self.vtable_for(a, &tr, &targs)?;
+                self.build_fat(v, vt)
+            }
+            // `Rc<T>` -> `Rc<dyn Trait>` (also `Arc`, `Weak`): the object pointer plus the vtable of `T`
+            (Ty::Generic(sn, sa), Ty::Generic(dn, da)) if sn == dn && matches!(sn.as_str(), "Rc" | "Arc" | "Weak") => {
+                let (Some(crate::types::GenericArg::Type(c)), Some(crate::types::GenericArg::Type(Ty::DynTrait(tr, targs, _)))) = (sa.first(), da.first()) else {
+                    return Err(CgErr("internal: bad trait-object coercion".into()));
+                };
+                if matches!(c, Ty::DynTrait(..)) {
+                    // `Rc<dyn T + Send>` -> `Rc<dyn T>`: same representation
+                    return Ok(v);
+                }
+                let (c, tr, targs) = (c.clone(), tr.clone(), targs.clone());
+                let vt = self.vtable_for(&c, &tr, &targs)?;
                 self.build_fat(v, vt)
             }
             (Ty::Generic(sn, sa), Ty::Generic(_, da)) if sn == "Box" => {
-                let (Some(crate::types::GenericArg::Type(c)), Some(crate::types::GenericArg::Type(Ty::DynTrait(tr)))) = (sa.first(), da.first()) else {
+                let (Some(crate::types::GenericArg::Type(c)), Some(crate::types::GenericArg::Type(Ty::DynTrait(tr, targs, _)))) = (sa.first(), da.first()) else {
                     return Err(CgErr("internal: bad trait-object coercion".into()));
                 };
-                let (c, tr) = (c.clone(), tr.clone());
-                let vt = self.vtable_for(&c, &tr)?;
+                if matches!(c, Ty::DynTrait(..)) {
+                    // `Box<dyn T + Send>` -> `Box<dyn T>`: same representation
+                    return Ok(v);
+                }
+                let (c, tr, targs) = (c.clone(), tr.clone(), targs.clone());
+                let vt = self.vtable_for(&c, &tr, &targs)?;
                 if da.len() == 2 {
                     // `Box<C, A>` `{data, alloc}` -> `Box<dyn Trait, A>` `{data, vtable, alloc}`
                     let sv = v.into_struct_value();
@@ -129,12 +160,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             // a concrete value -> owned `dyn Trait`: box it first
             (conc, Ty::Generic(_, da)) => {
-                let Some(crate::types::GenericArg::Type(Ty::DynTrait(tr))) = da.first() else {
+                let Some(crate::types::GenericArg::Type(Ty::DynTrait(tr, targs, _))) = da.first() else {
                     return Err(CgErr("internal: bad trait-object coercion".into()));
                 };
-                let tr = tr.clone();
+                let (tr, targs) = (tr.clone(), targs.clone());
                 let p = self.box_new(conc, v)?;
-                let vt = self.vtable_for(conc, &tr)?;
+                let vt = self.vtable_for(conc, &tr, &targs)?;
                 self.build_fat(p, vt)
             }
             _ => Err(CgErr(format!("internal: cannot coerce `{}` to `{}`", src, dst))),
@@ -191,7 +222,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     /// `x.method(args)` where `x` is a `Box<dyn Trait>`, `&dyn Trait` or `&Box<dyn Trait>`.
-    pub(super) fn dyn_method_call(&mut self, receiver: &Expr, rty: &Ty, tr: &str, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+    pub(super) fn dyn_method_call(&mut self, receiver: &Expr, rty: &Ty, tr: &str, targs: &[Ty], name: &str, args: &[Arg]) -> R<V<'ctx>> {
         let fat = self.fat_ty();
         let ptrt = self.context.ptr_type(AddressSpace::default());
         let Some(methods) = self.trait_defs.get(tr) else {
@@ -201,17 +232,39 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             return Err(CgErr(format!("trait `{}` has no method `{}`", tr, name)));
         };
         let m = &methods[idx];
-        let (self_kind, generic, params, ret) = (m.self_kind, m.generic, m.params.clone(), m.ret.clone());
+        let (self_kind, generic, mut params, mut ret) = (m.self_kind, m.generic, m.params.clone(), m.ret.clone());
+        // `dyn Source<i32>`: the trait's own parameters are fixed by the object type
+        if let Some(gn) = self.trait_generics.get(tr).filter(|g| !g.is_empty() && !targs.is_empty()) {
+            let mut names = gn.clone();
+            names.push("Self".to_string());
+            let subst: HashMap<String, Ty> = gn.iter().cloned().zip(targs.iter().cloned()).collect();
+            let fix = |t: &Ty| crate::types::substitute_type_params(&crate::types::mark_type_params(t.clone(), &names), &subst);
+            for p in params.iter_mut() {
+                p.1 = fix(&p.1);
+            }
+            ret = fix(&ret);
+        }
         if generic {
             return Err(CgErr(format!("`{}::{}` has its own generic parameters, so it cannot be called through `dyn {}` (not object safe)", tr, name, tr)));
         }
         if !matches!(self_kind, Some(PMode::Ref(_))) {
             return Err(CgErr(format!("`{}::{}` takes `self` by value or has no `self`, so it cannot be called through `dyn {}` (declare it `borrow self` or `borrow mut self`)", tr, name, tr)));
         }
+        // is the receiver an `Rc<dyn T>` / `Arc<dyn T>` (possibly behind a reference)?
+        let is_rc = {
+            let mut t = rty;
+            while let Ty::Ref(_, i) = t {
+                t = i;
+            }
+            matches!(t, Ty::Generic(n, _) if n == "Rc" || n == "Arc")
+        };
+        if is_rc && matches!(self_kind, Some(PMode::Ref(true))) {
+            return Err(CgErr(format!("cannot call the `borrow mut self` method `dyn {}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Phase 13)", tr, name)));
+        }
         // the fat pointer of the receiver (lent, never moved)
         let fatv = match rty {
-            Ty::Ref(_, i) if matches!(**i, Ty::DynTrait(_)) => self.expr(receiver)?,
-            Ty::Ref(_, i) if matches!(&**i, Ty::Generic(n, _) if n == "Box") => {
+            Ty::Ref(_, i) if matches!(**i, Ty::DynTrait(..)) => self.expr(receiver)?,
+            Ty::Ref(_, i) if matches!(&**i, Ty::Generic(n, _) if matches!(n.as_str(), "Box" | "Rc" | "Arc")) => {
                 let slot = self.expr(receiver)?.into_pointer_value();
                 self.builder.build_load(fat, slot, "fat")?
             }
@@ -221,8 +274,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
         };
         let sv = fatv.into_struct_value();
-        let data = self.builder.build_extract_value(sv, 0, "data")?.into_pointer_value();
+        let mut data = self.builder.build_extract_value(sv, 0, "data")?.into_pointer_value();
         let vt = self.builder.build_extract_value(sv, 1, "vt")?.into_pointer_value();
+        if is_rc {
+            // the handle points at the object header; the value follows it at the vtable-aligned offset
+            data = self.dyn_rc_value_ptr(data, vt)?;
+        }
         let vt_ty = self.vtable_ty(methods_len(self, tr));
         let fp = self.builder.build_struct_gep(vt_ty, vt, FIRST_METHOD_SLOT + idx as u32, "mp")?;
         let fnp = self.builder.build_load(ptrt, fp, "method")?.into_pointer_value();
@@ -235,7 +292,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         for ((_, t, mode), v) in params.iter().zip(vals.iter()) {
             lls.push(match mode {
                 PMode::Value => self.llty(t)?.into(),
-                PMode::Ref(_) if matches!(t, Ty::DynTrait(_)) => fat.into(),
+                PMode::Ref(_) if matches!(t, Ty::DynTrait(..)) => fat.into(),
                 PMode::Ref(_) => ptrt.into(),
                 PMode::Variadic => self.str_ty().into(),
             });
