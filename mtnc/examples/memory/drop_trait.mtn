@@ -1,0 +1,77 @@
+struct Noisy { name: String }
+impl Drop for Noisy {
+    fn drop(borrow mut self) {
+        print("drop "); println(self.name);
+    }
+}
+struct Pair { a: Noisy, b: Noisy }
+impl Drop for Pair {
+    fn drop(borrow mut self) {
+        println("drop pair");
+    }
+}
+enum Slot { Empty, Full(Noisy), Two(Noisy, Noisy) }
+impl Drop for Slot {
+    fn drop(borrow mut self) {
+        println("drop slot");
+    }
+}
+fn mk(s: String) -> Noisy { return Noisy { name: s }; }
+fn early(n: i32) -> i32 {
+    let a = mk(String::from("e1"));
+    if n > 0 { return n; }
+    let b = mk(String::from("e2"));
+    return 0;
+}
+fn consume(x: Noisy) { println("consume"); }
+fn main() {
+    println("-- order");
+    {
+        let a = mk(String::from("a"));
+        let b = mk(String::from("b"));
+    }
+    println("-- nested");
+    {
+        let p = Pair { a: mk(String::from("pa")), b: mk(String::from("pb")) };
+    }
+    println("-- early");
+    println(early(1));
+    println(early(0));
+    println("-- explicit drop");
+    let d = mk(String::from("d"));
+    drop(d);
+    println("after drop(d)");
+    println("-- moved");
+    let m = mk(String::from("m"));
+    consume(m);
+    println("after consume");
+    println("-- reassign");
+    let mut r = mk(String::from("r1"));
+    r = mk(String::from("r2"));
+    println("after reassign");
+    println("-- loop");
+    let mut i = 0;
+    while i < 3 {
+        let l = mk(String::from("loop"));
+        if i == 1 { i = i + 1; continue; }
+        if i == 2 { break; }
+        i = i + 1;
+    }
+    println("-- enum");
+    {
+        let s1 = Slot::Empty;
+        let s2 = Slot::Full(mk(String::from("full")));
+        let s3 = Slot::Two(mk(String::from("t1")), mk(String::from("t2")));
+    }
+    println("-- box");
+    {
+        let b = Box::new(mk(String::from("boxed")));
+    }
+    println("-- rc");
+    {
+        let r1 = Rc::new(mk(String::from("rc")));
+        let r2 = r1.clone();
+        println("cloned");
+    }
+    println("-- end");
+}

@@ -1,0 +1,28 @@
+trait Shape { fn area(borrow self) -> i32; fn name(borrow self) -> i32; }
+struct Loud { id: i32 }
+impl Drop for Loud { fn drop(borrow mut self) { print("drop Loud "); println(self.id); } }
+impl Shape for Loud { fn area(borrow self) -> i32 { return self.id * 10; } fn name(borrow self) -> i32 { return self.id; } }
+@align(32) struct Wide { a: i64, b: i64 }
+impl Shape for Wide { fn area(borrow self) -> i32 { return 3; } fn name(borrow self) -> i32 { return 4; } }
+struct Plain { v: i32 }
+impl Shape for Plain { fn area(borrow self) -> i32 { return self.v; } fn name(borrow self) -> i32 { return 0; } }
+
+fn total(s: borrow dyn Shape) -> i32 { return s.area(); }
+
+fn main() {
+    let a: Rc<dyn Shape> = Rc::new(Loud { id: 1 });
+    let b: Rc<dyn Shape> = Rc::new(Wide { a: 1, b: 2 });
+    let c: Rc<dyn Shape> = Rc::new(Plain { v: 8 });
+    let a2 = a.clone();
+    println(a2.area());
+    println(b.area());
+    println(c.area());
+    println(Rc::strongCount(borrow a));
+    let w: Weak<dyn Shape> = a.downgrade();
+    println(Rc::weakCount(borrow a));
+    drop(a);
+    println(Rc::strongCount(borrow a2));
+    drop(a2);
+    println("after both strong");
+    match w.upgrade() { Some(x) => println(x.area()), None => println("gone") }
+}

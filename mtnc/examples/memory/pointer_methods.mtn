@@ -1,0 +1,53 @@
+struct Pt { x: i32, y: i64 }
+struct Loud { id: i32 }
+impl Drop for Loud { fn drop(borrow mut self) { print("drop loud "); println(self.id); } }
+fn size_of_t<T>() -> usize { return sizeOf::<T>(); }
+fn main() {
+    println(sizeOf::<i32>());
+    println(sizeOf::<u8>());
+    println(sizeOf::<i64>());
+    println(alignOf::<i64>());
+    println(sizeOf::<Pt>());
+    println(alignOf::<Pt>());
+    println(size_of_t::<i16>());
+    println(sizeOf::<()>());
+    unsafe {
+        let raw = alloc(sizeOf::<i32>() * 4, alignOf::<i32>()) as *mut i32;
+        let mut i = 0;
+        while i < 4 {
+            raw.add(i as usize).write(i * 10);
+            i += 1;
+        }
+        println(raw.add(2).read());
+        let end = raw.add(4);
+        println(end.offsetFrom(raw as *const i32));
+        println(raw.isNull());
+        let back = end.sub(1);
+        println(back.read());
+        println(back.offset(-3).read());
+        let dst = alloc(sizeOf::<i32>() * 4, alignOf::<i32>()) as *mut i32;
+        copyNonOverlapping(raw as *const i32, dst, 4);
+        println(dst.add(3).read());
+        copy(raw.add(1) as *const i32, raw, 3);
+        println(raw.read());
+        println(raw.add(2).read());
+        dealloc(dst as *mut u8, sizeOf::<i32>() * 4, alignOf::<i32>());
+        dealloc(raw as *mut u8, sizeOf::<i32>() * 4, alignOf::<i32>());
+        // owned values
+        let lp = alloc(sizeOf::<Loud>(), alignOf::<Loud>()) as *mut Loud;
+        lp.write(Loud { id: 5 });
+        println("written");
+        let l = lp.read();
+        println("read out");
+        lp.write(Loud { id: 6 });
+        dropInPlace(lp);
+        println("dropped in place");
+        dealloc(lp as *mut u8, sizeOf::<Loud>(), alignOf::<Loud>());
+        let sp = alloc(sizeOf::<String>(), alignOf::<String>()) as *mut String;
+        sp.write(String::from("hi there"));
+        let s = sp.read();
+        println(s);
+        dealloc(sp as *mut u8, sizeOf::<String>(), alignOf::<String>());
+    }
+    println("end");
+}

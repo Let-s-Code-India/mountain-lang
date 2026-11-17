@@ -1,0 +1,17 @@
+trait Shape { fn area(borrow self) -> i32; }
+struct Loud { id: i32 }
+impl Drop for Loud { fn drop(borrow mut self) { print("drop Loud "); println(self.id); } }
+impl Shape for Loud { fn area(borrow self) -> i32 { return self.id * 10; } }
+fn main() {
+    let a: Arc<dyn Shape + Send + Sync> = Arc::new(Loud { id: 4 });
+    let a2 = a.clone();
+    let h = spawn move { a2.area() };
+    println(h.join());
+    println(Arc::strongCount(borrow a));
+    let w: Weak<dyn Shape + Send + Sync, Arc> = a.downgrade();
+    let plain: Arc<dyn Shape> = a.clone();
+    println(plain.area());
+    drop(plain);
+    drop(a);
+    match w.upgrade() { Some(x) => println(x.area()), None => println("gone") }
+}

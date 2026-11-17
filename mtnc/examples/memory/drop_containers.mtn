@@ -1,0 +1,53 @@
+struct Wrapper<T> { v: T, tag: i32 }
+impl<T> Drop for Wrapper<T> {
+    fn drop(borrow mut self) {
+        print("drop wrapper "); println(self.tag);
+    }
+}
+struct Loud { id: i32 }
+impl Drop for Loud {
+    fn drop(borrow mut self) { print("drop loud "); println(self.id); }
+}
+trait Shape { fn area(borrow self) -> i32; }
+struct Sq { side: i32 }
+impl Shape for Sq { fn area(borrow self) -> i32 { return self.side * self.side; } }
+impl Drop for Sq { fn drop(borrow mut self) { print("drop sq "); println(self.side); } }
+fn fails(n: i32) -> Result<i32, String> {
+    let l = Loud { id: 50 };
+    if n > 0 { return Err(String::from("bad")); }
+    return Ok(1);
+}
+fn chain(n: i32) -> Result<i32, String> {
+    let l = Loud { id: 60 };
+    let v = fails(n)?;
+    return Ok(v + 1);
+}
+fn main() {
+    {
+        let w = Wrapper { v: 5, tag: 1 };
+        let w2 = Wrapper { v: Loud { id: 7 }, tag: 2 };
+        let w3 = Wrapper { v: String::from("s"), tag: 3 };
+    }
+    println("-- dyn");
+    {
+        let b: Box<dyn Shape> = Box::new(Sq { side: 3 });
+        println(b.area());
+        let r: Rc<Sq> = Rc::new(Sq { side: 4 });
+    }
+    println("-- ?");
+    match chain(1) { Ok(v) => println(v), Err(e) => println(e) }
+    match chain(0) { Ok(v) => println(v), Err(e) => println(e) }
+    println("-- closure");
+    {
+        let l = Loud { id: 70 };
+        let f = move || { println(l.id); };
+        f();
+        println("closure made");
+    }
+    println("-- closure never called");
+    {
+        let l = Loud { id: 71 };
+        let f = move || { println(l.id); };
+    }
+    println("-- end");
+}

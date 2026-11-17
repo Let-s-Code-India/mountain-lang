@@ -1,0 +1,14 @@
+trait Source<T> { fn get(borrow self) -> T; }
+struct A { v: i32 }
+struct B { s: String }
+impl Source<i32> for A { fn get(borrow self) -> i32 { return self.v; } }
+impl Source<bool> for B { fn get(borrow self) -> bool { return true; } }
+impl Source<i64> for A { fn get(borrow self) -> i64 { return 99; } }
+fn main() {
+    let x: Box<dyn Source<i32>> = Box::new(A { v: 7 });
+    let y: Box<dyn Source<bool>> = Box::new(B { s: String::from("hey") });
+    let z: Box<dyn Source<i64>> = Box::new(A { v: 7 });
+    println(x.get());
+    println(y.get());
+    println(z.get());
+}

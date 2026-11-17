@@ -1,0 +1,8 @@
+trait Shape { fn area(borrow self) -> i32; }
+struct Sq { side: i32 }
+impl Shape for Sq { fn area(borrow self) -> i32 { return self.side * self.side; } }
+fn main() {
+    let b: Box<dyn Shape + Send> = Box::new(Sq { side: 3 });
+    let h = spawn move { b.area() };
+    println(h.join());
+}

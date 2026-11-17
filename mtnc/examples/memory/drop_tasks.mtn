@@ -1,0 +1,53 @@
+struct Loud { id: i32 }
+impl Drop for Loud {
+    fn drop(borrow mut self) { print("drop loud "); println(self.id); }
+}
+fn gen(n: i32) -> Generator<i32> {
+    let held = Loud { id: n };
+    yield 1;
+    yield 2;
+    yield 3;
+}
+async fn work(n: i32) -> i32 {
+    let held = Loud { id: n };
+    await yieldNow();
+    return n + 1;
+}
+async fn never_finished(n: i32) -> i32 {
+    let held = Loud { id: n };
+    await yieldNow();
+    await yieldNow();
+    return n;
+}
+fn main() {
+    println("-- generator stopped early");
+    {
+        let mut g = gen(10);
+        match g.next() { Some(v) => println(v), None => println("none") }
+        println("dropping generator");
+    }
+    println("-- generator finished");
+    {
+        let mut g = gen(11);
+        loop {
+            match g.next() { Some(v) => println(v), None => { break; } }
+        }
+        println("done");
+    }
+    println("-- future never polled");
+    {
+        let f = work(20);
+        println("made");
+    }
+    println("-- arc/spawn");
+    let a = Arc::new(Loud { id: 30 });
+    let a2 = a.clone();
+    let h = spawn move { a2.id + 1 };
+    println(h.join());
+    println(Arc::strongCount(borrow a));
+    println("-- spawn owning");
+    let l = Loud { id: 40 };
+    let h2 = spawn move { println(l.id); 5 };
+    println(h2.join());
+    println("-- end");
+}
