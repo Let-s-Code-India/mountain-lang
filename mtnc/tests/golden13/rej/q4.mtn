@@ -1,0 +1,1 @@
+fn main() { let mut x = 5; let p = &mut x as *mut i32; copyNonOverlapping(p as *const i32, p, 1); }

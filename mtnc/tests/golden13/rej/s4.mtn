@@ -1,0 +1,5 @@
+trait Shape { fn area(borrow self) -> i32; fn bump(borrow mut self); }
+struct Sq { side: i32 }
+impl Shape for Sq { fn area(borrow self) -> i32 { return self.side; } fn bump(borrow mut self) { self.side = self.side + 1; } }
+
+fn main() { let a: Rc<dyn Shape> = Rc::new(Sq { side: 3 }); let b: Arc<dyn Shape> = a; }

@@ -1,0 +1,4 @@
+trait Source<T> { fn get(borrow self) -> T; }
+struct A { v: i32 }
+impl Source<i32> for A { fn get(borrow self) -> i32 { return self.v; } }
+fn main() { let x: Box<dyn Source<bool>> = Box::new(A { v: 7 }); }
