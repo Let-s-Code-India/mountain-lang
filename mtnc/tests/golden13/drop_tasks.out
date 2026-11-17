@@ -1,1 +1,21 @@
-
+-- generator stopped early
+1
+dropping generator
+drop loud 10
+-- generator finished
+1
+2
+3
+drop loud 11
+done
+-- future never polled
+made
+-- arc/spawn
+31
+1
+-- spawn owning
+40
+drop loud 40
+5
+-- end
+drop loud 30

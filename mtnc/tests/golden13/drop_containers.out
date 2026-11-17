@@ -1,0 +1,22 @@
+drop wrapper 3
+drop wrapper 2
+drop loud 7
+drop wrapper 1
+-- dyn
+9
+drop sq 4
+drop sq 3
+-- ?
+drop loud 50
+drop loud 60
+bad
+drop loud 50
+drop loud 60
+2
+-- closure
+70
+closure made
+drop loud 70
+-- closure never called
+drop loud 71
+-- end

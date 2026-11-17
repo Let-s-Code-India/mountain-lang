@@ -1,0 +1,41 @@
+-- order
+drop b
+drop a
+-- nested
+drop pair
+drop pa
+drop pb
+-- early
+drop e1
+1
+drop e2
+drop e1
+0
+-- explicit drop
+drop d
+after drop(d)
+-- moved
+consume
+drop m
+after consume
+-- reassign
+drop r1
+after reassign
+-- loop
+drop loop
+drop loop
+drop loop
+-- enum
+drop slot
+drop t1
+drop t2
+drop slot
+drop full
+drop slot
+-- box
+drop boxed
+-- rc
+cloned
+drop rc
+-- end
+drop r2
