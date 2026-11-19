@@ -721,7 +721,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         Type::Named(n, args) => match alias(n) {
             Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
             _ => {
-                if !args.is_empty() && (is_heap_generic(n) || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
+                if !args.is_empty() && (is_heap_generic(n) || n == "Atomic" || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
                     let mut out = Vec::new();
                     for a in args {
                         match a {
@@ -2040,9 +2040,70 @@ impl TypeChecker {
                 }
             }
             ItemKind::Const(c) => self.check_global_init(&c.name, &c.ty, &c.value),
-            ItemKind::Static(c) => self.check_global_init(&c.name, &c.ty, &c.value),
+            ItemKind::Static(c) => {
+                self.atomic_types_in(&c.ty, &c.name);
+                self.check_global_init(&c.name, &c.ty, &c.value)
+            }
+            ItemKind::Struct(sd) => {
+                let ctx = sd.name.clone();
+                if item.attrs.iter().any(|a| a.name == "pack") {
+                    let fields: Vec<&Type> = match &sd.body {
+                        StructBody::Named(fs) => fs.iter().map(|f| &f.ty).collect(),
+                        StructBody::Tuple(ts) => ts.iter().collect(),
+                        StructBody::Unit => Vec::new(),
+                    };
+                    for ft in fields {
+                        if format!("{:?}", resolve_type(ft)).contains("\"Atomic\"") {
+                            self.errors.push(TypeError {
+                                message: format!("`{}` is `@pack` and holds an `Atomic<T>`: a packed field may be misaligned, and atomic instructions need the natural alignment of the value (Document 14 §1)", sd.name),
+                                context: ctx.clone(),
+                            });
+                        }
+                    }
+                }
+                match &sd.body {
+                    StructBody::Named(fs) => fs.iter().for_each(|f| self.atomic_types_in(&f.ty, &ctx)),
+                    StructBody::Tuple(ts) => ts.iter().for_each(|t| self.atomic_types_in(t, &ctx)),
+                    StructBody::Unit => {}
+                }
+            }
+            ItemKind::Enum(ed) => {
+                let ctx = ed.name.clone();
+                for v in &ed.variants {
+                    v.data.iter().for_each(|t| self.atomic_types_in(t, &ctx));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Every `Atomic<T>` written in a declaration must use an element type of Document 14 §9.4.
+    fn atomic_types_in(&mut self, ty: &Type, ctx: &str) {
+        fn walk(tc: &mut TypeChecker, t: &Ty, ctx: &str) {
+            match t {
+                Ty::Generic(n, args) => {
+                    if n == "Atomic" {
+                        if let Some(GenericArg::Type(e)) = args.first() {
+                            tc.check_atomic_elem(e, ctx);
+                        }
+                    }
+                    for a in args {
+                        if let GenericArg::Type(x) = a {
+                            walk(tc, x, ctx);
+                        }
+                    }
+                }
+                Ty::Ref(_, i) | Ty::RawPtr(_, i) | Ty::Array(i) | Ty::Fixed(i, _) | Ty::OptionTy(i) => walk(tc, i, ctx),
+                Ty::Tuple(v) => v.iter().for_each(|x| walk(tc, x, ctx)),
+                Ty::ResultTy(a, b) => {
+                    walk(tc, a, ctx);
+                    walk(tc, b, ctx);
+                }
+                _ => {}
+            }
+        }
+        let t = resolve_type(ty);
+        walk(self, &t, ctx);
     }
 
     /// Phase 11a: a `const`/`static` initializer must have the declared type.
@@ -2054,6 +2115,12 @@ impl TypeChecker {
     }
 
     fn check_fn(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
+        for p in f.params.iter().filter(|p| p.name != "self") {
+            self.atomic_types_in(&p.ty, &f.name);
+        }
+        if let Some(r) = &f.return_type {
+            self.atomic_types_in(r, &f.name);
+        }
         let tp: Vec<String> = f.generics.0.iter().filter_map(|g| match g {
             GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
         }).collect();
@@ -3384,6 +3451,19 @@ impl TypeChecker {
                             }
                             return Ty::Generic("Box".into(), vec![GenericArg::Type(it), GenericArg::Type(alloc_ty)]);
                         }
+                        if tn == "Atomic" && fname == "new" && !self.structs.contains_key("Atomic") {
+                            let inner_exp = match expected {
+                                Some(Ty::Generic(n, a)) if n == "Atomic" && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
+                                _ => None,
+                            };
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: "`Atomic::new` takes exactly one argument, the initial value (Document 14 §9.4)".into(), context: ctx.into() });
+                            }
+                            let it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
+                            let it = if matches!(it, Ty::Infer(_)) { inner_exp.clone().unwrap_or(it) } else { it };
+                            self.check_atomic_elem(&it, ctx);
+                            return Ty::Generic("Atomic".into(), vec![GenericArg::Type(it)]);
+                        }
                         if matches!(tn.as_str(), "Rc" | "Arc") && fname == "new" && !self.structs.contains_key(tn.as_str()) {
                             let inner_exp = match expected {
                                 Some(Ty::Generic(n, a)) if n == tn && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
@@ -3518,6 +3598,29 @@ impl TypeChecker {
                 if let Ty::RawPtr(m, pointee) = &raw_recv {
                     // Document 23 §17.13: `add`, `sub`, `offset`, `offsetFrom`, `isNull`, `read`, `write`
                     return self.check_ptr_method(&raw_recv, *m, (**pointee).clone(), name, args, env, ctx);
+                }
+                if let Ty::ResultTy(..) = &raw_recv {
+                    // Document 14 §2 uses `r.isOk()` on the result of `compareAndSwap`
+                    if matches!(name.as_str(), "isOk" | "isErr") {
+                        if !args.is_empty() {
+                            self.errors.push(TypeError { message: format!("`{}` takes no arguments", name), context: ctx.into() });
+                        }
+                        return Ty::Bool;
+                    }
+                }
+                {
+                    let peeled = peel_box(raw_recv.clone());
+                    if let Ty::Generic(an, aa) = &peeled {
+                        let direct = matches!(&raw_recv, Ty::Generic(n, _) if n == "Atomic");
+                        let atomic_name = matches!(name.as_str(), "load" | "store" | "swap" | "fetchAdd" | "fetchSub" | "fetchAnd" | "fetchOr" | "fetchXor" | "compareAndSwap");
+                        // `arc.clone()` on an `Arc<Atomic<T>>` is the Arc's own method
+                        if an == "Atomic" && !self.structs.contains_key("Atomic") && (direct || atomic_name) {
+                            if let Some(GenericArg::Type(et)) = aa.first() {
+                                let et = et.clone();
+                                return self.check_atomic_method(&et, name, args, env, ctx);
+                            }
+                        }
+                    }
                 }
                 if let Ty::Generic(gn, ga) = &raw_recv {
                     let inner = match ga.first() { Some(GenericArg::Type(t)) => Some(t.clone()), _ => None };
@@ -4416,6 +4519,95 @@ impl TypeChecker {
     }
 
     /// Methods of `*const T` / `*mut T` (Document 23 §17.13). Everything except `isNull` needs `unsafe`.
+    /// `Atomic<T>` may only hold the types of Document 14 §9.4.
+    fn check_atomic_elem(&mut self, t: &Ty, ctx: &str) {
+        if matches!(t, Ty::Infer(_)) || self.mentions_tparam(t) {
+            return;
+        }
+        if !crate::atomics::elem_ok(t) {
+            self.errors.push(TypeError {
+                message: format!("`Atomic<{}>` does not exist: `Atomic<T>` is available for {} (Document 14 §9.4)", t, crate::atomics::ALLOWED),
+                context: ctx.into(),
+            });
+        }
+    }
+
+    /// Methods of `Atomic<T>` (Document 14 §9.4). All take `borrow self`.
+    fn check_atomic_method(&mut self, et: &Ty, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        use crate::atomics::{parse_ordering, Ord5};
+        self.check_atomic_elem(et, ctx);
+        let is_bool = matches!(et, Ty::Bool);
+        let is_ptr = matches!(et, Ty::RawPtr(..));
+        // (number of value arguments, return type)
+        let (nvals, ret): (usize, Ty) = match name {
+            "load" => (0, et.clone()),
+            "store" => (1, Ty::Unit),
+            "swap" => (1, et.clone()),
+            "fetchAdd" | "fetchSub" => {
+                if is_bool || is_ptr {
+                    self.errors.push(TypeError {
+                        message: format!("`{}` is not available on `Atomic<{}>`: {} (Document 14 §9.4)", name, et, if is_bool { "`Atomic<bool>` has `fetchAnd`, `fetchOr` and `fetchXor` only" } else { "an `Atomic<*mut T>` has no arithmetic; use `compareAndSwap` on the address" }),
+                        context: ctx.into(),
+                    });
+                }
+                (1, et.clone())
+            }
+            "fetchAnd" | "fetchOr" | "fetchXor" => {
+                if is_ptr {
+                    self.errors.push(TypeError {
+                        message: format!("`{}` is not available on `Atomic<{}>`: a pointer has no bit operations (Document 14 §9.4)", name, et),
+                        context: ctx.into(),
+                    });
+                }
+                (1, et.clone())
+            }
+            "compareAndSwap" => (2, Ty::ResultTy(Box::new(et.clone()), Box::new(et.clone()))),
+            other => {
+                self.errors.push(TypeError {
+                    message: format!("no method named `{}` on `Atomic<{}>`; the methods are load, store, swap, fetchAdd, fetchSub, fetchAnd, fetchOr, fetchXor, compareAndSwap (Document 14 §9.4)", other, et),
+                    context: ctx.into(),
+                });
+                for a in args {
+                    self.check_expr(&a.value, None, env, ctx);
+                }
+                return Ty::Unit;
+            }
+        };
+        if args.len() != nvals && args.len() != nvals + 1 {
+            self.errors.push(TypeError {
+                message: format!("`Atomic::{}` takes {} value argument(s) and an optional `Ordering`, found {} argument(s) (Document 14 §9.4)", name, nvals, args.len()),
+                context: ctx.into(),
+            });
+            for a in args {
+                self.check_expr(&a.value, None, env, ctx);
+            }
+            return ret;
+        }
+        for a in &args[..nvals] {
+            self.check_expr(&a.value, Some(et), env, ctx);
+        }
+        if args.len() == nvals + 1 {
+            match parse_ordering(&args[nvals].value) {
+                Err(m) => self.errors.push(TypeError { message: m, context: ctx.into() }),
+                Ok(o) => {
+                    if name == "load" && matches!(o, Ord5::Release | Ord5::AcqRel) {
+                        self.errors.push(TypeError {
+                            message: format!("`load` cannot use `Ordering::{}`: a load can only be Relaxed, Acquire or SeqCst, because it writes nothing to release (Document 14 §1.1)", o.name()),
+                            context: ctx.into(),
+                        });
+                    }
+                    if name == "store" && matches!(o, Ord5::Acquire | Ord5::AcqRel) {
+                        self.errors.push(TypeError {
+                            message: format!("`store` cannot use `Ordering::{}`: a store can only be Relaxed, Release or SeqCst, because it reads nothing to acquire (Document 14 §1.1)", o.name()),
+                            context: ctx.into(),
+                        });
+                    }
+                }
+            }
+        }
+        ret
+    }
+
     fn check_ptr_method(&mut self, recv: &Ty, mutable: bool, pointee: Ty, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
         let (want, ret, needs_unsafe): (Vec<Ty>, Ty, bool) = match name {
             "isNull" => (vec![], Ty::Bool, false),
@@ -5809,6 +6001,17 @@ impl TypeChecker {
 
     /// Does `name` (a struct or enum, or the base name of a generic one) implement the compiler-known
     /// `Drop` trait (Document 6 §9.9)?
+    /// Field types of struct `name`, in declaration order.
+    pub fn struct_field_types(&self, name: &str) -> Option<Vec<Ty>> {
+        self.structs.get(name).map(|s| s.fields.iter().map(|(_, t)| t.clone()).collect())
+    }
+
+    /// Payload types of the variant `variant` (last path segment) of enum `name`.
+    pub fn enum_variant_types(&self, name: &str, variant: &str) -> Option<Vec<Ty>> {
+        let v = variant.rsplit("::").next().unwrap_or(variant);
+        self.enums.get(name)?.variants.iter().find(|(n, _)| n == v).map(|(_, t)| t.clone())
+    }
+
     pub fn has_drop_impl_named(&self, name: &str) -> bool {
         self.impls_by_type.get(name).map_or(false, |v| v.iter().any(|r| r.trait_name.as_deref() == Some("Drop")))
             || self.generic_impls.get(name).map_or(false, |v| v.iter().any(|g| g.trait_name.as_deref() == Some("Drop")))
@@ -5823,6 +6026,8 @@ impl TypeChecker {
             Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
             // `ActorRef<A>` is a plain, copyable pointer: actors live until the process exits (M5)
             Ty::Generic(n, _) if n == "ActorRef" => false,
+            // an `Atomic<T>` is not duplicable (it has one address): it is move-tracked, but owns no heap memory
+            Ty::Generic(n, _) if n == "Atomic" => true,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
             // a generic struct/enum with a `Drop` impl is move-tracked before monomorphization too
             Ty::Generic(n, _) if self.has_drop_impl_named(n) => true,
@@ -6418,6 +6623,22 @@ impl TypeChecker {
                         })
                     }
                     "Box" | "Generator" | "JoinHandle" | "Future" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
+                    // `Atomic<T>` is `Sync`, and `Send` when `T` is (Document 14 §9.3). For `Atomic<*mut T>` the
+                    // pointer is not `Send`; the atomic is `Sync` only when the pointee is `Send`.
+                    "Atomic" => {
+                        let inner = targs.first()?;
+                        if let Ty::RawPtr(_, pointee) = inner {
+                            if want_send {
+                                Some((ty.clone(), format!("`{}` holds a raw pointer, which is not `Send` (Document 14 §9.3)", ty)))
+                            } else {
+                                self.auto_trait_walk(pointee, true, seen).map(|(_, why)| (ty.clone(), format!("`{}` is `Sync` only when the pointee is `Send`, but {}", ty, why)))
+                            }
+                        } else if want_send {
+                            self.auto_trait_walk(inner, true, seen)
+                        } else {
+                            None
+                        }
+                    }
                     // an actor reference is a handle on a mailbox: always `Send` and `Sync` (Document 12 §11.5)
                     "ActorRef" => None,
                     _ => {

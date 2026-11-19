@@ -10,6 +10,8 @@ pub mod codegen;
 pub mod desugar;
 pub mod driver;
 pub mod dropcheck;
+pub mod dropmoves;
+pub mod atomics;
 pub mod diagnostics;
 pub mod exhaustive;
 pub mod generator;

@@ -54,10 +54,21 @@ fn inject_async_prelude(program: &mut crate::ast::Program) {
 /// rejected by `dropcheck` before this runs.
 const DROP_PRELUDE: &str = "trait Drop {\n    fn drop(borrow mut self);\n}\n";
 
+/// Document 14 §9.4: the memory orderings of `Atomic<T>`. Skipped when the program declares its own `Ordering`.
+const ORDERING_PRELUDE: &str = "enum Ordering {\n    Relaxed,\n    Acquire,\n    Release,\n    AcqRel,\n    SeqCst,\n}\n";
+
 fn inject_prelude(program: &mut crate::ast::Program) {
     use crate::ast::ItemKind;
     let has_allocator = program.items.iter().any(|i| matches!(&i.kind, ItemKind::Trait(t) if t.name == "Allocator"));
-    let src = if has_allocator { DROP_PRELUDE.to_string() } else { format!("{}{}", PRELUDE, DROP_PRELUDE) };
+    let declares_ordering = program.items.iter().any(|i| match &i.kind {
+        ItemKind::Struct(d) => d.name == "Ordering",
+        ItemKind::Enum(d) => d.name == "Ordering",
+        ItemKind::Trait(d) => d.name == "Ordering",
+        ItemKind::Fn(d) => d.name == "Ordering",
+        _ => false,
+    });
+    let ordering = if declares_ordering { "" } else { ORDERING_PRELUDE };
+    let src = if has_allocator { format!("{}{}", DROP_PRELUDE, ordering) } else { format!("{}{}{}", PRELUDE, DROP_PRELUDE, ordering) };
     let (tokens, _) = lexer::tokenize(&src);
     let (prelude, errs) = parse_program(tokens);
     assert!(errs.is_empty(), "internal: the prelude does not parse");
@@ -66,14 +77,14 @@ fn inject_prelude(program: &mut crate::ast::Program) {
     program.items = items;
 }
 
-/// Document 12 §11.8: `Mutex`, `RwLock`, `Spinlock`, `Atomic`, `channel` and `volatile` arrive in
+/// Document 12 §11.8: `Mutex`, `RwLock`, `Spinlock`, `channel` and `volatile` arrive in
 /// Phase 13. Wherever they are used (path call, type position, `channel::<T>()`, `volatile ..`) the
 /// program is rejected with one clear message per use, instead of an "unknown function/type"
 /// error. A program that declares its own item of that name (`struct Mutex`, `fn channel`, ...)
 /// is left alone. `select` has its own message (raised where the expression is checked).
 fn phase13_names(tokens: &[crate::token::Token]) -> Vec<String> {
     use crate::token::{Keyword, TokenKind};
-    const NAMES: [&str; 4] = ["Mutex", "RwLock", "Spinlock", "Atomic"];
+    const NAMES: [&str; 3] = ["Mutex", "RwLock", "Spinlock"];
     let declares = |name: &str| {
         tokens.windows(2).any(|w| {
             matches!(&w[0].kind, TokenKind::Keyword(Keyword::Struct | Keyword::Enum | Keyword::Trait | Keyword::Fn | Keyword::Type))
@@ -175,6 +186,10 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             if !e2.is_empty() {
                 return Err(e2);
             }
+        }
+        let moves = crate::dropmoves::check(&program, &tc);
+        if !moves.is_empty() {
+            return Err(moves);
         }
         Ok(Checked { program, tc })
     } else {

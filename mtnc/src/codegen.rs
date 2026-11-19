@@ -483,6 +483,15 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
             }
             Ty::Generic(n, a) if n == "Box" && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
+            // `Atomic<T>` is stored as the plain integer (`bool` as a byte, `*mut T` as a pointer)
+            Ty::Generic(n, a) if n == "Atomic" && matches!(a.first(), Some(crate::types::GenericArg::Type(_))) => {
+                let Some(crate::types::GenericArg::Type(t)) = a.first() else { unreachable!() };
+                match t {
+                    Ty::Bool => self.context.i8_type().into(),
+                    Ty::RawPtr(..) => self.context.ptr_type(AddressSpace::default()).into(),
+                    other => self.llty(other)?,
+                }
+            }
             // `Rc<dyn T>` / `Arc<dyn T>` / `Weak<dyn T>`: a fat handle `{ object pointer, vtable }` (Phase 13 M0)
             Ty::Generic(n, a) if matches!(n.as_str(), "Rc" | "Arc" | "Weak") && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
@@ -1000,7 +1009,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let lt = self.llty(&ty)?;
         let g = self.module.add_global(lt, None, &format!("mtn_static_{}", st.name));
         g.set_initializer(&init);
-        g.set_constant(true);
+        // an `Atomic<T>` (or a struct holding one) is written at run time: its global cannot be constant
+        g.set_constant(!format!("{}", ty).contains("Atomic<"));
         if self.statics.insert(st.name.clone(), (g.as_pointer_value(), ty)).is_some() {
             return Err(CgErr(format!("static `{}` is defined more than once", st.name)));
         }
@@ -1030,6 +1040,22 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let bad = || CgErr("a `static` initializer must be a constant literal expression (literals, tuples, arrays, struct literals, other constants)".into());
         match e {
             Expr::Paren(i) => self.const_val(i, ty),
+            // `static C: Atomic<u64> = Atomic::new(0);`
+            Expr::Call { callee, args } if args.len() == 1 && matches!(callee.as_ref(), Expr::Path(p) if p.len() == 2 && p[0] == "Atomic" && p[1] == "new") => {
+                let Ty::Generic(n, ga) = ty else { return Err(bad()) };
+                let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(bad()) };
+                if n != "Atomic" {
+                    return Err(bad());
+                }
+                let inner = inner.clone();
+                let v = self.const_val(&args[0].value, &inner)?;
+                if inner == Ty::Bool {
+                    // stored as a byte
+                    let iv = v.into_int_value();
+                    return Ok(self.context.i8_type().const_int(iv.get_zero_extended_constant().unwrap_or(0), false).into());
+                }
+                Ok(v)
+            }
             Expr::Literal(l) => self.literal(l, ty, false),
             Expr::Unary { op: UnaryOp::Neg, expr } => match expr.as_ref() {
                 Expr::Literal(l @ (Literal::Int(_) | Literal::IntHex(_) | Literal::IntOct(_) | Literal::IntBin(_) | Literal::Float(_))) => self.literal(l, ty, true),
