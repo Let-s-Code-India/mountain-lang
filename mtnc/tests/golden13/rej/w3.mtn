@@ -1,0 +1,3 @@
+struct W { name: String }
+impl Drop for W { fn drop(borrow mut self) { println("d"); } }
+fn main() { let w = W { name: String::from("a") }; let n = w.name; println(n); }

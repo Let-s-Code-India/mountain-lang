@@ -1,0 +1,5 @@
+struct W { name: String, n: i32 }
+impl Drop for W { fn drop(borrow mut self) { println("d"); } }
+fn eat(s: String) { println(s); }
+fn take(w: W) -> String { return w.name; }
+fn main() { let w = W { name: String::from("a"), n: 1 }; eat(w.name); }

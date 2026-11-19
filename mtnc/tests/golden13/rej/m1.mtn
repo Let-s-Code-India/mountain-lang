@@ -1,0 +1,1 @@
+fn main() { let a: Atomic<bool> = Atomic::new(true); a.fetchAdd(true); }

@@ -1,0 +1,1 @@
+fn main() { let a: Atomic<u64> = Atomic::new(0); let h1 = spawn move { a.fetchAdd(1); 1 }; let h2 = spawn move { a.fetchAdd(1); 2 }; println(h1.join() + h2.join()); }

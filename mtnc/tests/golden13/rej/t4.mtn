@@ -1,0 +1,1 @@
+fn main() { let a: Atomic<u64> = Atomic::new(0); let f = move || { a.fetchAdd(1); }; let g = move || { a.fetchAdd(2); }; f(); g(); }

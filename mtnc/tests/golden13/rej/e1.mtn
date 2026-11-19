@@ -1,0 +1,1 @@
+fn main() { let a: Atomic<f64> = Atomic::new(1.5); }

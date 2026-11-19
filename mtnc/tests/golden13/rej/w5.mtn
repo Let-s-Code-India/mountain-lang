@@ -1,0 +1,3 @@
+enum E { A(String), B }
+impl Drop for E { fn drop(borrow mut self) { println("d"); } }
+fn main() { let e = E::A(String::from("a")); match e { E::A(name) => println(name), E::B => println("b") } }

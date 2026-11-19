@@ -1,0 +1,1 @@
+fn main() { let a: Atomic<i32> = Atomic::new(1); println(a.load(Ordering::AcqRel)); }
