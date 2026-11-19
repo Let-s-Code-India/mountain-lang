@@ -201,3 +201,44 @@ fn dyn_dropping_auto_bits_is_allowed() {
 fn dyn_rc_cannot_be_dereferenced_into_a_value() {
     rejected("trait Shape { fn area(borrow self) -> i32; }\nstruct Sq { s: i32 }\nimpl Shape for Sq { fn area(borrow self) -> i32 { return self.s; } }\nfn t(x: borrow dyn Shape) -> i32 { return x.area(); }\nfn main() { let r: Rc<dyn Shape> = Rc::new(Sq { s: 1 }); println(t(borrow *r)); }", "unsized trait object");
 }
+
+// ---------------------------------------------------------------- Drop: layout, and `check` parity
+
+#[test]
+fn drop_layout_sizeof_alignof_include_the_hidden_byte_pack_and_align_work() {
+    golden("drop_layout");
+}
+
+/// Runs `mtnc check` on a file: (exit code, combined output).
+fn check_file(src: &std::path::Path) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_mtnc")).arg("check").arg(src).output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn check_reports_field_move_out_of_a_drop_type() {
+    for f in ["w3", "w6"] {
+        let (code, m) = check_file(&root().join("tests/golden13/rej").join(format!("{}.mtn", f)));
+        assert_ne!(code, 0, "{}: {}", f, m);
+        assert!(m.contains("cannot be taken apart") && m.contains("Document 6 §9.9, rule 5"), "{}: {}", f, m);
+    }
+}
+#[test]
+fn check_reports_pattern_move_out_of_a_drop_type() {
+    let (code, m) = check_file(&root().join("tests/golden13/rej/w5.mtn"));
+    assert_ne!(code, 0, "{}", m);
+    assert!(m.contains("with a pattern") && m.contains("cannot be taken apart"), "{}", m);
+}
+#[test]
+fn check_and_build_agree_on_drop_field_rules() {
+    // borrowing a field, reading a Copy field, matching through `borrow`, and `_` patterns are fine
+    let ok = root().join("tests/golden13/drop_field_ok.mtn");
+    let (code, m) = check_file(&ok);
+    assert_eq!(code, 0, "{}", m);
+    let exe = build(&ok).unwrap();
+    assert_eq!(run_exe(&exe, "1", false).0, "1\nshow\nref\na\ne\nd\n");
+    for f in ["w3", "w5", "w6"] {
+        let p = root().join("tests/golden13/rej").join(format!("{}.mtn", f));
+        assert!(build(&p).is_err(), "{} must not build", f);
+    }
+}

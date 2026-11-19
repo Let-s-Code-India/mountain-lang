@@ -100,10 +100,11 @@ fn phase13_spinlock_path_call_and_type() {
     phase13("struct S { m: Spinlock<i32> }\nfn main() { }", "Spinlock");
 }
 
+// Phase 13 M1 implemented `Atomic<T>`: the old "not yet supported" gate is gone (tests/phase13_m1.rs covers it).
 #[test]
-fn phase13_atomic_path_call_type_and_static() {
-    phase13("fn main() { let a = Atomic::new(1); }", "Atomic");
-    phase13("static C: Atomic<u64> = Atomic::new(0);\nfn main() { }", "Atomic");
+fn atomic_is_no_longer_gated_by_phase13() {
+    assert_eq!(out("fn main() { let a = Atomic::new(1); println(a.load()); }"), "1\n");
+    assert_eq!(out("static C: Atomic<u64> = Atomic::new(7);\nfn main() { println(C.load()); }"), "7\n");
 }
 
 #[test]
