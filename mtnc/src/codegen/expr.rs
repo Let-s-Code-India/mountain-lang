@@ -1450,6 +1450,58 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     }
                 }
             }
+            // `Atomic<T>` (possibly behind a reference, `Box`, `Rc` or `Arc`)
+            {
+                let mut a0 = b0.clone();
+                while let Ty::Generic(n, a) = &a0 {
+                    if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() {
+                        if let crate::types::GenericArg::Type(t) = &a[0] {
+                            let mut t = t.clone();
+                            while let Ty::Ref(_, i) = t {
+                                t = *i;
+                            }
+                            a0 = t;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if let Ty::Generic(an, aa) = &a0 {
+                    if an == "Atomic" && matches!(name, "load" | "store" | "swap" | "fetchAdd" | "fetchSub" | "fetchAnd" | "fetchOr" | "fetchXor" | "compareAndSwap") {
+                        if let Some(crate::types::GenericArg::Type(et)) = aa.first() {
+                            let et = et.clone();
+                            return self.atomic_method(receiver, &rty, &et, name, args);
+                        }
+                    }
+                }
+            }
+            // `r.isOk()` / `r.isErr()` (Document 14 §2): the tag of a `Result`, without moving it
+            if let Ty::ResultTy(..) = &b0 {
+                if matches!(name, "isOk" | "isErr") && args.is_empty() {
+                    let ptrt = self.context.ptr_type(AddressSpace::default());
+                    let p = if matches!(rty, Ty::Ref(..)) {
+                        let mut v = self.expr(receiver)?.into_pointer_value();
+                        let mut cur = rty.clone();
+                        while let Ty::Ref(_, i) = &cur {
+                            cur = (**i).clone();
+                            if matches!(cur, Ty::Ref(..)) {
+                                v = self.builder.build_load(ptrt, v, "deref")?.into_pointer_value();
+                            }
+                        }
+                        v
+                    } else {
+                        self.place_or_spill(receiver)?.0
+                    };
+                    let tag = self.enum_tag(&b0, p)?;
+                    let want = if name == "isOk" { 0 } else { 1 };
+                    let r = self.builder.build_int_compare(IntPredicate::EQ, tag, self.int_ty(32).const_int(want, false), "isres")?;
+                    // a temporary result (`f().isOk()`) is dropped here
+                    if !matches!(rty, Ty::Ref(..)) && !self.is_place_expr(receiver) && self.needs_drop(&b0) {
+                        self.drop_in_place(p, &b0)?;
+                    }
+                    return Ok(r.into());
+                }
+            }
             if let Ty::Generic(gn, ga) = &b0 {
                 if matches!(gn.as_str(), "Rc" | "Arc" | "Weak") && matches!(name, "clone" | "downgrade" | "upgrade") {
                     let whole_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: the type checker recorded no type for a method call".into()))?;
@@ -3001,6 +3053,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         let v = self.expr_as(&args[0].value, &at)?;
                         return self.string_from_str(v);
                     }
+                    if tn == "Atomic" && fname == "new" {
+                        let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `Atomic::new` is not typed as an Atomic".into())) };
+                        let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(CgErr("internal: `Atomic` without a type argument".into())) };
+                        let inner = inner.clone();
+                        let v = self.expr_as(&args[0].value, &inner)?;
+                        return self.atomic_to_storage(&inner, v);
+                    }
                     if matches!(tn.as_str(), "Rc" | "Arc") && fname == "new" {
                         let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `new` is not typed as an Rc/Arc".into())) };
                         let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(CgErr("internal: `Rc` without a type argument".into())) };
@@ -3068,6 +3127,159 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     /// Pointer methods (Document 23 §17.13): `add sub offset offsetFrom isNull read write`.
+    /// A value of the element type as the storage integer/pointer of an `Atomic<T>` (`bool` -> `i8`).
+    fn atomic_to_storage(&mut self, et: &Ty, v: V<'ctx>) -> R<V<'ctx>> {
+        if *et == Ty::Bool {
+            let i8t = self.context.i8_type();
+            return Ok(self.builder.build_int_z_extend(v.into_int_value(), i8t, "abool")?.into());
+        }
+        Ok(v)
+    }
+
+    /// The storage integer of an `Atomic<T>` back to a value of the element type.
+    fn atomic_from_storage(&mut self, et: &Ty, v: V<'ctx>) -> R<V<'ctx>> {
+        if *et == Ty::Bool {
+            let z = self.context.i8_type().const_zero();
+            return Ok(self.builder.build_int_compare(IntPredicate::NE, v.into_int_value(), z, "bval")?.into());
+        }
+        Ok(v)
+    }
+
+    fn llvm_ordering(o: crate::atomics::Ord5) -> inkwell::AtomicOrdering {
+        use crate::atomics::Ord5;
+        match o {
+            Ord5::Relaxed => inkwell::AtomicOrdering::Monotonic,
+            Ord5::Acquire => inkwell::AtomicOrdering::Acquire,
+            Ord5::Release => inkwell::AtomicOrdering::Release,
+            Ord5::AcqRel => inkwell::AtomicOrdering::AcquireRelease,
+            Ord5::SeqCst => inkwell::AtomicOrdering::SequentiallyConsistent,
+        }
+    }
+
+    /// Methods of `Atomic<T>` (Document 14 §9.4): straight LLVM `load atomic` / `store atomic` /
+    /// `atomicrmw` / `cmpxchg` with exactly the requested ordering; no lock, no runtime call.
+    fn atomic_method(&mut self, receiver: &Expr, rty: &Ty, et: &Ty, name: &str, args: &[Arg]) -> R<V<'ctx>> {
+        use crate::atomics::{parse_ordering, Ord5};
+        // the address of the atomic: through references, `Box`, `Rc`, `Arc`
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let mut boxed = false;
+        let mut t = rty.clone();
+        loop {
+            match t {
+                Ty::Ref(_, i) => t = *i,
+                Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => {
+                    boxed = true;
+                    match &a[0] {
+                        crate::types::GenericArg::Type(x) => t = x.clone(),
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        let addr: PointerValue<'ctx> = if boxed {
+            let (p, t0) = self.place_or_spill(receiver)?;
+            let (mut p, mut t0) = (p, t0);
+            while let Ty::Ref(_, i) = &t0 {
+                p = self.builder.build_load(ptrt, p, "deref")?.into_pointer_value();
+                t0 = (**i).clone();
+            }
+            self.peel_box_place(p, t0)?.0
+        } else if matches!(rty, Ty::Ref(..)) {
+            let mut v = self.expr(receiver)?;
+            let mut cur = rty.clone();
+            while let Ty::Ref(_, i) = &cur {
+                if matches!(**i, Ty::Ref(..)) {
+                    v = self.builder.build_load(ptrt, v.into_pointer_value(), "deref")?;
+                    cur = (**i).clone();
+                } else {
+                    break;
+                }
+            }
+            v.into_pointer_value()
+        } else {
+            self.place_or_spill(receiver)?.0
+        };
+        let is_ptr = matches!(et, Ty::RawPtr(..));
+        let ut = self.usize_ty();
+        // the integer type the instruction works on: the element, a byte for `bool`, an address for a pointer
+        let it = if is_ptr {
+            ut
+        } else if *et == Ty::Bool {
+            self.context.i8_type()
+        } else {
+            self.llty(et)?.into_int_type()
+        };
+        let nvals = match name {
+            "load" => 0,
+            "compareAndSwap" => 2,
+            _ => 1,
+        };
+        let ord = if args.len() > nvals { parse_ordering(&args[nvals].value).map_err(CgErr)? } else { Ord5::SeqCst };
+        let lo = Self::llvm_ordering(ord);
+        let align = (self.td.get_abi_size(&it)) as u32;
+        // a value argument in the storage representation (pointer -> address, bool -> byte)
+        let operand = |this: &mut Self, e: &Expr| -> R<IntValue<'ctx>> {
+            let v = this.expr_as(e, et)?;
+            if is_ptr {
+                Ok(this.builder.build_ptr_to_int(v.into_pointer_value(), ut, "p2i")?)
+            } else {
+                Ok(this.atomic_to_storage(et, v)?.into_int_value())
+            }
+        };
+        let finish = |this: &mut Self, v: IntValue<'ctx>| -> R<V<'ctx>> {
+            if is_ptr {
+                Ok(this.builder.build_int_to_ptr(v, ptrt, "i2p")?.into())
+            } else {
+                this.atomic_from_storage(et, v.into())
+            }
+        };
+        match name {
+            "load" => {
+                let l = self.builder.build_load(it, addr, "aload")?;
+                let inst = l.as_instruction_value().ok_or_else(|| CgErr("internal: atomic load".into()))?;
+                inst.set_alignment(align).map_err(|e| CgErr(format!("internal: {:?}", e)))?;
+                inst.set_atomic_ordering(lo).map_err(|e| CgErr(format!("internal: {:?}", e)))?;
+                finish(self, l.into_int_value())
+            }
+            "store" => {
+                let v = operand(self, &args[0].value)?;
+                let st = self.builder.build_store(addr, v)?;
+                st.set_alignment(align).map_err(|e| CgErr(format!("internal: {:?}", e)))?;
+                st.set_atomic_ordering(lo).map_err(|e| CgErr(format!("internal: {:?}", e)))?;
+                Ok(self.unit())
+            }
+            "swap" | "fetchAdd" | "fetchSub" | "fetchAnd" | "fetchOr" | "fetchXor" => {
+                let v = operand(self, &args[0].value)?;
+                let op = match name {
+                    "swap" => inkwell::AtomicRMWBinOp::Xchg,
+                    "fetchAdd" => inkwell::AtomicRMWBinOp::Add,
+                    "fetchSub" => inkwell::AtomicRMWBinOp::Sub,
+                    "fetchAnd" => inkwell::AtomicRMWBinOp::And,
+                    "fetchOr" => inkwell::AtomicRMWBinOp::Or,
+                    _ => inkwell::AtomicRMWBinOp::Xor,
+                };
+                let old = self.builder.build_atomicrmw(op, addr, v, lo)?;
+                finish(self, old)
+            }
+            "compareAndSwap" => {
+                let exp = operand(self, &args[0].value)?;
+                let new = operand(self, &args[1].value)?;
+                let fo = Self::llvm_ordering(ord.cas_failure());
+                let r = self.builder.build_cmpxchg(addr, exp, new, lo, fo)?;
+                let old = self.builder.build_extract_value(r, 0, "cas_old")?.into_int_value();
+                let ok = self.builder.build_extract_value(r, 1, "cas_ok")?.into_int_value();
+                let oldv = finish(self, old)?;
+                // `Result<T, T>`: `Ok(previous)` on success, `Err(actual)` on failure
+                let whole = Ty::ResultTy(Box::new(et.clone()), Box::new(et.clone()));
+                let okv = self.make_enum(&whole, 0, vec![oldv])?;
+                let errv = self.make_enum(&whole, 1, vec![oldv])?;
+                Ok(self.builder.build_select(ok, okv, errv, "cas_res")?)
+            }
+            other => Err(CgErr(format!("internal: atomic method `{}`", other))),
+        }
+    }
+
     fn ptr_method(&mut self, receiver: &Expr, rty: &Ty, name: &str, args: &[Arg]) -> R<V<'ctx>> {
         let Ty::RawPtr(_, pointee) = strip_ref_ty(rty).clone() else { unreachable!() };
         let pointee = *pointee;
