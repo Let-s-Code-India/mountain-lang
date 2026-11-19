@@ -1,0 +1,74 @@
+// Doc 14 §2: lock-free "maximum" with a CAS retry loop, from 8 threads.
+fn raiseTo(m: borrow Atomic<i64>, v: i64) {
+    loop {
+        let cur = m.load(Ordering::Acquire);
+        if v <= cur { break; }
+        if m.compareAndSwap(cur, v, Ordering::AcqRel).isOk() { break; }
+    }
+}
+fn worker(m: Arc<Atomic<i64>>, base: i64) -> i64 {
+    let mut j: i64 = 0;
+    while j < 2000 {
+        raiseTo(borrow *m, base * 1000 + j);
+        j = j + 1;
+    }
+    return base;
+}
+fn lockFreeIncrementBelow(c: borrow Atomic<i32>, limit: i32) -> bool {
+    loop {
+        let cur = c.load(Ordering::Acquire);
+        if cur >= limit { return false; }
+        if c.compareAndSwap(cur, cur + 1, Ordering::AcqRel).isOk() { return true; }
+    }
+}
+fn cnt(c: Arc<Atomic<i32>>) -> i32 {
+    let mut got = 0;
+    let mut i = 0;
+    while i < 5000 {
+        if lockFreeIncrementBelow(borrow *c, 10000) { got = got + 1; }
+        i = i + 1;
+    }
+    return got;
+}
+fn main() {
+    let m: Arc<Atomic<i64>> = Arc::new(Atomic::new(-1));
+    let m0 = m.clone();
+    let h0 = thread::spawnOS(move || { worker(m0, 0) });
+    let m1 = m.clone();
+    let h1 = thread::spawnOS(move || { worker(m1, 1) });
+    let m2 = m.clone();
+    let h2 = thread::spawnOS(move || { worker(m2, 2) });
+    let m3 = m.clone();
+    let h3 = thread::spawnOS(move || { worker(m3, 3) });
+    let m4 = m.clone();
+    let h4 = thread::spawnOS(move || { worker(m4, 4) });
+    let m5 = m.clone();
+    let h5 = thread::spawnOS(move || { worker(m5, 5) });
+    let m6 = m.clone();
+    let h6 = thread::spawnOS(move || { worker(m6, 6) });
+    let m7 = m.clone();
+    let h7 = thread::spawnOS(move || { worker(m7, 7) });
+    let s = h0.join() + h1.join() + h2.join() + h3.join() + h4.join() + h5.join() + h6.join() + h7.join();
+    println(s);
+    println(m.load());
+    let c: Arc<Atomic<i32>> = Arc::new(Atomic::new(0));
+    let c0 = c.clone();
+    let g0 = spawn move { cnt(c0) };
+    let c1 = c.clone();
+    let g1 = spawn move { cnt(c1) };
+    let c2 = c.clone();
+    let g2 = spawn move { cnt(c2) };
+    let c3 = c.clone();
+    let g3 = spawn move { cnt(c3) };
+    let c4 = c.clone();
+    let g4 = spawn move { cnt(c4) };
+    let c5 = c.clone();
+    let g5 = spawn move { cnt(c5) };
+    let c6 = c.clone();
+    let g6 = spawn move { cnt(c6) };
+    let c7 = c.clone();
+    let g7 = spawn move { cnt(c7) };
+    let total = g0.join() + g1.join() + g2.join() + g3.join() + g4.join() + g5.join() + g6.join() + g7.join();
+    println(total);
+    println(c.load());
+}

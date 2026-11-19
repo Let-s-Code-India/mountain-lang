@@ -1,0 +1,16 @@
+// Arc<Atomic<u64>> captured by a `move` closure in a loop
+fn main() {
+    let total: Arc<Atomic<u64>> = Arc::new(Atomic::new(0));
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 5 {
+        let c = total.clone();
+        let k = i;
+        let h = spawn move { c.fetchAdd(10, Ordering::SeqCst); k };
+        sum = sum + h.join();
+        i = i + 1;
+    }
+    println(sum);
+    println(total.load());
+    println(Arc::strongCount(borrow total));
+}

@@ -1,0 +1,51 @@
+// 8 OS threads and 8 tasks, 100,000 fetchAdd each, on one shared counter (Doc 14 §1).
+fn bump(c: Arc<Atomic<u64>>) -> u64 {
+    let mut i = 0;
+    while i < 100000 {
+        c.fetchAdd(1, Ordering::Relaxed);
+        i = i + 1;
+    }
+    return 1;
+}
+fn main() {
+    let counter: Arc<Atomic<u64>> = Arc::new(Atomic::new(0));
+    let c0 = counter.clone();
+    let h0 = thread::spawnOS(move || { bump(c0) });
+    let c1 = counter.clone();
+    let h1 = thread::spawnOS(move || { bump(c1) });
+    let c2 = counter.clone();
+    let h2 = thread::spawnOS(move || { bump(c2) });
+    let c3 = counter.clone();
+    let h3 = thread::spawnOS(move || { bump(c3) });
+    let c4 = counter.clone();
+    let h4 = thread::spawnOS(move || { bump(c4) });
+    let c5 = counter.clone();
+    let h5 = thread::spawnOS(move || { bump(c5) });
+    let c6 = counter.clone();
+    let h6 = thread::spawnOS(move || { bump(c6) });
+    let c7 = counter.clone();
+    let h7 = thread::spawnOS(move || { bump(c7) });
+    let done = h0.join() + h1.join() + h2.join() + h3.join() + h4.join() + h5.join() + h6.join() + h7.join();
+    println(done);
+    println(counter.load());
+    let d0 = counter.clone();
+    let t0 = spawn move { bump(d0) };
+    let d1 = counter.clone();
+    let t1 = spawn move { bump(d1) };
+    let d2 = counter.clone();
+    let t2 = spawn move { bump(d2) };
+    let d3 = counter.clone();
+    let t3 = spawn move { bump(d3) };
+    let d4 = counter.clone();
+    let t4 = spawn move { bump(d4) };
+    let d5 = counter.clone();
+    let t5 = spawn move { bump(d5) };
+    let d6 = counter.clone();
+    let t6 = spawn move { bump(d6) };
+    let d7 = counter.clone();
+    let t7 = spawn move { bump(d7) };
+    let done2 = t0.join() + t1.join() + t2.join() + t3.join() + t4.join() + t5.join() + t6.join() + t7.join();
+    println(done2);
+    println(counter.load());
+    println(Arc::strongCount(borrow counter));
+}

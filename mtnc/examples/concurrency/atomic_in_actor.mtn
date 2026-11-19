@@ -1,0 +1,19 @@
+// an atomic inside a struct inside an actor's state
+struct Meter { hits: Atomic<u64>, last: Atomic<i32> }
+actor Counter {
+    state meter: Meter = Meter { hits: Atomic::new(0), last: Atomic::new(-1) };
+    on hit(v: i32) {
+        self.meter.hits.fetchAdd(1);
+        self.meter.last.store(v);
+    }
+    on report() {
+        println(self.meter.hits.load());
+        println(self.meter.last.load());
+    }
+}
+fn main() {
+    let c = Counter::spawn();
+    c.send(Counter::hit(5));
+    c.send(Counter::hit(9));
+    c.send(Counter::report());
+}

@@ -1,0 +1,18 @@
+// static atomic bumped by tasks and OS threads, read from main afterwards
+static HITS: Atomic<u64> = Atomic::new(0);
+static READY: Atomic<bool> = Atomic::new(false);
+fn work() -> i32 {
+    let mut i = 0;
+    while i < 50000 { HITS.fetchAdd(1, Ordering::Relaxed); i = i + 1; }
+    return 1;
+}
+fn main() {
+    let t1 = spawn { work() };
+    let t2 = spawn { work() };
+    let o1 = thread::spawnOS(move || { work() });
+    let o2 = thread::spawnOS(move || { work() });
+    println(t1.join() + t2.join() + o1.join() + o2.join());
+    READY.store(true, Ordering::Release);
+    println(HITS.load(Ordering::Acquire));
+    println(READY.load());
+}

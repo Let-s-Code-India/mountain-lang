@@ -1,0 +1,22 @@
+// Atomic<bool> start flag; a struct field; handshake between two OS threads.
+// (OS threads, not tasks: a task that spins on a flag could occupy the only worker while the producer
+// task waits in the queue, so the handshake would not be guaranteed to finish with MTN_WORKERS=1.)
+struct Stats { hits: Atomic<u64>, ready: Atomic<bool> }
+fn producer(s: Arc<Stats>) -> i32 {
+    s.hits.fetchAdd(41, Ordering::Relaxed);
+    s.ready.store(true, Ordering::Release);
+    return 1;
+}
+fn consumer(s: Arc<Stats>) -> u64 {
+    while !s.ready.load(Ordering::Acquire) { }
+    return s.hits.load(Ordering::Relaxed) + 1;
+}
+fn main() {
+    let s = Arc::new(Stats { hits: Atomic::new(0), ready: Atomic::new(false) });
+    let s1 = s.clone();
+    let s2 = s.clone();
+    let c = thread::spawnOS(move || { consumer(s2) });
+    let p = thread::spawnOS(move || { producer(s1) });
+    println(p.join());
+    println(c.join());
+}

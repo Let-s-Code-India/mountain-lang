@@ -1,0 +1,18 @@
+// Atomic<*mut T>: swap and compare-and-swap of an address, in unsafe blocks.
+struct Node { v: i32 }
+fn main() {
+    let mut x = Node { v: 1 };
+    let mut y = Node { v: 2 };
+    let px = &mut x as *mut Node;
+    let py = &mut y as *mut Node;
+    let slot: Atomic<*mut Node> = Atomic::new(px);
+    let cur = slot.load(Ordering::Acquire);
+    unsafe { println(cur.read().v); }
+    let old = slot.swap(py, Ordering::AcqRel);
+    unsafe { println(old.read().v); }
+    let r = slot.compareAndSwap(px, py);
+    match r { Ok(p) => { println("ok"); }, Err(p) => { unsafe { println(p.read().v); } } }
+    let r2 = slot.compareAndSwap(py, px);
+    println(r2.isOk());
+    unsafe { println(slot.load().read().v); }
+}

@@ -1,0 +1,25 @@
+fn lockFreeIncrement(counter: borrow Atomic<i32>) {
+    loop {
+        let current = counter.load(Ordering::Acquire);
+        let updated = current + 1;
+        if counter.compareAndSwap(current, updated, Ordering::AcqRel).isOk() {
+            break; // successfully updated, no other thread interfered
+        }
+        // else: another thread changed the value between our load and CAS — retry
+    }
+}
+fn run(c: Arc<Atomic<i32>>) -> i32 {
+    let mut i = 0;
+    while i < 20000 { lockFreeIncrement(borrow *c); i = i + 1; }
+    return 0;
+}
+fn main() {
+    let c: Arc<Atomic<i32>> = Arc::new(Atomic::new(0));
+    let a = c.clone(); let b = c.clone(); let d = c.clone(); let e = c.clone();
+    let h1 = thread::spawnOS(move || { run(a) });
+    let h2 = thread::spawnOS(move || { run(b) });
+    let h3 = thread::spawnOS(move || { run(d) });
+    let h4 = thread::spawnOS(move || { run(e) });
+    println(h1.join() + h2.join() + h3.join() + h4.join());
+    println(c.load());
+}

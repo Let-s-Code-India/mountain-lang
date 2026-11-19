@@ -1,0 +1,27 @@
+// Doc 14 §1: every Atomic operation (load/store/swap/fetchAdd/fetchSub/fetchAnd/fetchOr/fetchXor/compareAndSwap), all integer widths, bool.
+fn main() {
+    let a: Atomic<u8> = Atomic::new(0b1100);
+    println(a.fetchAnd(0b0110));
+    println(a.load());
+    println(a.fetchOr(0b0001, Ordering::AcqRel));
+    println(a.load());
+    println(a.fetchXor(0b1111));
+    println(a.load());
+    let w: Atomic<u8> = Atomic::new(250);
+    println(w.fetchAdd(10));
+    println(w.load());
+    println(w.fetchSub(10));
+    println(w.load());
+    let f = Atomic::new(false);
+    println(f.fetchOr(true));
+    println(f.fetchXor(true));
+    println(f.fetchAnd(true));
+    println(f.load());
+    let s: Atomic<i16> = Atomic::new(-5);
+    println(s.fetchAdd(2));
+    let z: Atomic<usize> = Atomic::new(1);
+    println(z.fetchAdd(1));
+    let q: Atomic<i64> = Atomic::new(9000000000);
+    println(q.swap(1));
+    println(q.load());
+}
