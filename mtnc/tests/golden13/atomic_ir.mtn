@@ -1,0 +1,7 @@
+fn probe(a: borrow Atomic<i32>) -> i32 {
+    a.store(1, Ordering::Release);
+    a.fetchAdd(2, Ordering::AcqRel);
+    let r = a.compareAndSwap(1, 2, Ordering::Release);
+    return a.load(Ordering::Acquire);
+}
+fn main() { let a: Atomic<i32> = Atomic::new(0); println(probe(borrow a)); }

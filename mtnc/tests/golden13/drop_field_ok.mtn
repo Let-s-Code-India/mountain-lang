@@ -1,0 +1,13 @@
+struct W { name: String, n: i32 }
+impl Drop for W { fn drop(borrow mut self) { println("d"); } }
+enum E { A(String), B }
+impl Drop for E { fn drop(borrow mut self) { println("e"); } }
+fn show(s: borrow String) { println("show"); }
+fn main() {
+  let w = W { name: String::from("a"), n: 1 };
+  let k = w.n; println(k);
+  show(borrow w.name);
+  let e = E::A(String::from("x"));
+  match borrow e { E::A(s) => println("ref"), E::B => println("b") }
+  match e { E::A(_) => println("a"), E::B => println("b") }
+}
