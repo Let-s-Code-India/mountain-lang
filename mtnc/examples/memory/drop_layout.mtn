@@ -1,0 +1,29 @@
+// Drop types carry one hidden "live" byte: sizeOf/alignOf report the real layout (Doc 6 §9.9),
+// and @pack / @align keep working on them.
+struct Plain { a: i64 }
+struct Dropping { a: i64 }
+impl Drop for Dropping { fn drop(borrow mut self) { print("drop Dropping "); println(self.a); } }
+@pack struct Packed { a: i32, b: i8 }
+@pack struct PackedDrop { a: i32, b: i8 }
+impl Drop for PackedDrop { fn drop(borrow mut self) { print("drop PackedDrop "); println(self.a); } }
+@align(32) struct Aligned { a: i32 }
+@align(32) struct AlignedDrop { a: i32 }
+impl Drop for AlignedDrop { fn drop(borrow mut self) { print("drop AlignedDrop "); println(self.a); } }
+
+fn main() {
+    println(sizeOf::<Plain>());
+    println(sizeOf::<Dropping>());
+    println(alignOf::<Dropping>());
+    println(sizeOf::<Packed>());
+    println(sizeOf::<PackedDrop>());
+    println(alignOf::<PackedDrop>());
+    println(sizeOf::<Aligned>());
+    println(sizeOf::<AlignedDrop>());
+    println(alignOf::<AlignedDrop>());
+    let d = Dropping { a: 1 };
+    let p = PackedDrop { a: 7, b: 1 };
+    let q = AlignedDrop { a: 9 };
+    let bx = Box::new(AlignedDrop { a: 10 });
+    println(p.a);
+    println(q.a);
+}
