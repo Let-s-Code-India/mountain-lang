@@ -82,22 +82,12 @@ fn phase13(src: &str, name: &str) {
     rejects(src, &format!("`{}` is not yet supported by codegen — Phase 13", name));
 }
 
+// Phase 13 M2 implemented `Mutex<T>`, `RwLock<T>` and `Spinlock`: the old gate is gone (tests/phase13_m2.rs covers them).
 #[test]
-fn phase13_mutex_path_call_and_type() {
-    phase13("fn main() { let m = Mutex::new(1); }", "Mutex");
-    phase13("fn f(m: Mutex<i32>) { }\nfn main() { }", "Mutex");
-}
-
-#[test]
-fn phase13_rwlock_path_call_and_type() {
-    phase13("fn main() { let m = RwLock::new(1); }", "RwLock");
-    phase13("fn f(m: RwLock<i32>) { }\nfn main() { }", "RwLock");
-}
-
-#[test]
-fn phase13_spinlock_path_call_and_type() {
-    phase13("fn main() { let m = Spinlock::new(1); }", "Spinlock");
-    phase13("struct S { m: Spinlock<i32> }\nfn main() { }", "Spinlock");
+fn locks_are_no_longer_gated_by_phase13() {
+    assert_eq!(out("fn f(m: borrow Mutex<i32>) -> i32 { *m.lock() }\nfn main() { let m = Mutex::new(1); println(f(borrow m)); }"), "1\n");
+    assert_eq!(out("struct S { m: RwLock<i32> }\nfn main() { let s = S { m: RwLock::new(2) }; println(*s.m.read()); }"), "2\n");
+    assert_eq!(out("fn main() { let s = Spinlock::new(); { let g = s.acquire(); } println(1); }"), "1\n");
 }
 
 // Phase 13 M1 implemented `Atomic<T>`: the old "not yet supported" gate is gone (tests/phase13_m1.rs covers it).

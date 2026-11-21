@@ -230,7 +230,7 @@ fn sharing_rules_are_still_enforced() {
     for (f, needle) in [
         ("t1", "this task may outlive `n`"),                  // a plain `mut` shared across spawn
         ("t2", "use of moved value `a`"),                     // an Atomic moved into two tasks without Arc
-        ("t3", "holds a raw pointer, which is not `Send`"),   // Arc<Atomic<*mut T>> is not Send
+        ("t3", "is `Send` only when the pointee `Rc<i32>` is `Send`"),   // Atomic<*mut Rc<i32>> is not Send
         ("t4", "use of moved value `a`"),                     // an Atomic taken by value into two closures
     ] {
         let m = build(&root().join("tests/golden13/rej").join(format!("{}.mtn", f))).err().unwrap_or_else(|| panic!("{} accepted", f));
