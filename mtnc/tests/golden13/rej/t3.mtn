@@ -1,2 +1,2 @@
 struct N { v: i32 }
-fn main() { let mut n = N { v: 1 }; let s: Arc<Atomic<*mut N>> = Arc::new(Atomic::new(&mut n as *mut N)); let c = s.clone(); let h = spawn move { 1 + { let _x = c; 0 } }; println(h.join()); }
+fn main() { let mut n = Rc::new(5); let s: Arc<Atomic<*mut Rc<i32>>> = Arc::new(Atomic::new(&mut n as *mut Rc<i32>)); let c = s.clone(); let h = spawn move { 1 + { let _x = c; 0 } }; println(h.join()); }
