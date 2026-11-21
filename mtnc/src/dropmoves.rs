@@ -145,7 +145,7 @@ impl<'a> Walker<'a> {
             }
             Expr::MethodCall { receiver, args, .. } => {
                 self.visit(receiver, false);
-                args.iter().for_each(|a| self.visit(&a.value, false));
+                args.iter().for_each(|a| self.visit(&a.value, true));
             }
             Expr::If(i) => self.if_expr(i, mv),
             Expr::Match(m) => {

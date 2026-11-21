@@ -205,7 +205,7 @@ fn peel_box(t: Ty) -> Ty {
     let mut t = strip_refs(t);
     loop {
         match t {
-            Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+            Ty::Generic(ref n, ref a) if (matches!(n.as_str(), "Box" | "Rc" | "Arc") || crate::locks::is_guard_generic(n)) && !a.is_empty() => match &a[0] {
                 GenericArg::Type(inner) => t = strip_refs(inner.clone()),
                 _ => return t,
             },
@@ -721,7 +721,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         Type::Named(n, args) => match alias(n) {
             Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
             _ => {
-                if !args.is_empty() && (is_heap_generic(n) || n == "Atomic" || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
+                if !args.is_empty() && (is_heap_generic(n) || n == "Atomic" || crate::locks::is_lock_generic(n) || crate::locks::is_guard_generic(n) || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
                     let mut out = Vec::new();
                     for a in args {
                         match a {
@@ -1107,6 +1107,8 @@ pub struct TypeChecker {
     functions: HashMap<String, FunctionShape>,
     traits: HashMap<String, TraitShape>,
     impls_by_type: HashMap<String, Vec<ImplRecord>>,
+    /// (impl target, method) pairs declared `borrow mut self`: a read guard / `Rc` / `Arc` cannot call them.
+    mut_self_methods: std::collections::HashSet<(String, String)>,
     /// Phase 11a: `const`/`static` items (name -> declared type); an identifier
     /// that is not a local resolves here.
     globals: HashMap<String, Ty>,
@@ -1142,6 +1144,8 @@ pub struct TypeChecker {
     future_spawns: Vec<(String, String)>,
     /// Receivers of `JoinHandle::join` (it consumes the handle; Phase 12 M3).
     join_receivers: std::collections::HashSet<usize>,
+    /// Calls that return a lock guard (`lock`, `tryRead`, ..): the borrow checker ties the guard to its lock.
+    guard_exprs: std::collections::HashSet<usize>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
     /// the "unresolved, stay silent" result. `check_propagate` consults
     /// it to tell "`?` applied to an unresolvable stdlib call" (silent)
@@ -1452,9 +1456,11 @@ impl TypeChecker {
             async_fns: std::collections::HashSet::new(),
             future_spawns: Vec::new(),
             join_receivers: std::collections::HashSet::new(),
+            guard_exprs: std::collections::HashSet::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
             impls_by_type: HashMap::new(),
+            mut_self_methods: std::collections::HashSet::new(),
             loop_frames: Vec::new(),
             prop_targets: Vec::new(),
             saw_unresolved: false,
@@ -1934,6 +1940,13 @@ impl TypeChecker {
                     });
                 }
             }
+            for ii in &impl_decl.items {
+                if let ImplItem::Fn(f) = ii {
+                    if f.params.iter().any(|p| p.name == "self" && p.ownership == OwnershipMod::BorrowMut) {
+                        self.mut_self_methods.insert((target_name.clone(), f.name.clone()));
+                    }
+                }
+            }
             self.impls_by_type.entry(target_name).or_default().push(ImplRecord { trait_name, trait_args, methods });
         } else if let ItemKind::Mod(m) = &item.kind {
             for inner in &m.items {
@@ -2042,6 +2055,7 @@ impl TypeChecker {
             ItemKind::Const(c) => self.check_global_init(&c.name, &c.ty, &c.value),
             ItemKind::Static(c) => {
                 self.atomic_types_in(&c.ty, &c.name);
+                self.guard_escape_in(&c.ty, &c.name, "a `static`");
                 self.check_global_init(&c.name, &c.ty, &c.value)
             }
             ItemKind::Struct(sd) => {
@@ -2059,18 +2073,25 @@ impl TypeChecker {
                                 context: ctx.clone(),
                             });
                         }
+                        let dbg = format!("{:?}", resolve_type(ft));
+                        if ["\"Mutex\"", "\"RwLock\"", "\"Spinlock\""].iter().any(|n| dbg.contains(n)) {
+                            self.errors.push(TypeError {
+                                message: format!("`{}` is `@pack` and holds a lock: a packed field may be misaligned, and a lock's atomic words need their natural alignment (Document 14 §9.5)", sd.name),
+                                context: ctx.clone(),
+                            });
+                        }
                     }
                 }
                 match &sd.body {
-                    StructBody::Named(fs) => fs.iter().for_each(|f| self.atomic_types_in(&f.ty, &ctx)),
-                    StructBody::Tuple(ts) => ts.iter().for_each(|t| self.atomic_types_in(t, &ctx)),
+                    StructBody::Named(fs) => fs.iter().for_each(|f| { self.atomic_types_in(&f.ty, &ctx); self.guard_escape_in(&f.ty, &ctx, "a struct field"); }),
+                    StructBody::Tuple(ts) => ts.iter().for_each(|t| { self.atomic_types_in(t, &ctx); self.guard_escape_in(t, &ctx, "a struct field"); }),
                     StructBody::Unit => {}
                 }
             }
             ItemKind::Enum(ed) => {
                 let ctx = ed.name.clone();
                 for v in &ed.variants {
-                    v.data.iter().for_each(|t| self.atomic_types_in(t, &ctx));
+                    v.data.iter().for_each(|t| { self.atomic_types_in(t, &ctx); self.guard_escape_in(t, &ctx, "an enum variant"); });
                 }
             }
             _ => {}
@@ -2106,6 +2127,22 @@ impl TypeChecker {
         walk(self, &t, ctx);
     }
 
+    /// A lock guard borrows its lock for as long as it lives, and Mountain has no lifetimes to express
+    /// that across a function boundary or inside another value (Document 6 §5): a guard may not be a
+    /// function's result, a struct field, an enum payload or a `static`. Keep it in a local and let it drop.
+    fn guard_escape_in(&mut self, ty: &Type, ctx: &str, place: &str) {
+        let t = resolve_type(ty);
+        if crate::locks::mentions_guard(&t) {
+            self.errors.push(TypeError {
+                message: format!(
+                    "a lock guard cannot be {} (`{}`): it borrows the lock it came from and Mountain has no lifetimes to say how long (Document 6 §5, Document 14 §9.5); keep the guard in a local variable, or pass the lock itself (`borrow Mutex<T>`) and lock inside the callee",
+                    place, t
+                ),
+                context: ctx.into(),
+            });
+        }
+    }
+
     /// Phase 11a: a `const`/`static` initializer must have the declared type.
     fn check_global_init(&mut self, name: &str, ty: &Type, value: &Expr) {
         let declared = resolve_type(ty);
@@ -2120,6 +2157,7 @@ impl TypeChecker {
         }
         if let Some(r) = &f.return_type {
             self.atomic_types_in(r, &f.name);
+            self.guard_escape_in(r, &f.name, "a return type");
         }
         let tp: Vec<String> = f.generics.0.iter().filter_map(|g| match g {
             GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => Some(name.clone()),
@@ -2372,6 +2410,11 @@ impl TypeChecker {
         }
         let Expr::Ident(n) = root else { return };
         if !env.is_immut(n) {
+            return;
+        }
+        // writing through a lock guard held in an immutable binding: the lock is the permission, the guard
+        // binding itself is never reassigned
+        if !whole && env.get(n).map(|t| crate::locks::is_guard(&t)).unwrap_or(false) {
             return;
         }
         // writing through a reference / raw pointer held in an immutable binding
@@ -2944,10 +2987,17 @@ impl TypeChecker {
                         }
                         *pointee
                     }
-                    Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+                    Ty::Generic(ref n, ref a) if (matches!(n.as_str(), "Box" | "Rc" | "Arc") || crate::locks::is_guard_generic(n)) && !a.is_empty() => match &a[0] {
                         GenericArg::Type(inner) => inner.clone(),
                         _ => Ty::Unit,
                     },
+                    ref other @ Ty::Generic(ref n, _) if crate::locks::is_lock_generic(n) => {
+                        self.errors.push(TypeError {
+                            message: format!("cannot dereference `{}`: the protected value is only reachable through a guard; call `{}` first (Document 14 §9.5)", other, if n == "Mutex" { "lock()" } else { "read() or write()" }),
+                            context: ctx.into(),
+                        });
+                        Ty::Unit
+                    }
                     other => {
                         self.errors.push(TypeError {
                             message: format!("cannot dereference a value of type `{}`: prefix `*` needs a raw pointer `*const T` / `*mut T` (Document 23 §17.9)", other),
@@ -3002,6 +3052,12 @@ impl TypeChecker {
                         }
                     }
                 }
+                if self.expr_through_read_guard(lhs) {
+                    self.errors.push(TypeError {
+                        message: "cannot assign through a read guard: `RwLock::read` gives shared access only; take `write()` to change the value (Document 14 §9.5)".into(),
+                        context: ctx.into(),
+                    });
+                }
                 if self.expr_through_shared(lhs) {
                     self.errors.push(TypeError {
                         message: "cannot assign through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Document 12/14; Document 6 §6)".into(),
@@ -3044,6 +3100,15 @@ impl TypeChecker {
 
             Expr::Field { expr: inner, name } => {
                 let t = peel_box(self.check_expr(inner, None, env, ctx));
+                if let Ty::Generic(n, _) = &t {
+                    if crate::locks::is_lock_generic(n) && !self.structs.contains_key(n.as_str()) {
+                        self.errors.push(TypeError {
+                            message: format!("cannot read field `{}` of `{}`: the protected value is only reachable through a guard; call `{}` first (Document 14 §9.5)", name, t, if n == "Mutex" { "lock()" } else { "read() or write()" }),
+                            context: ctx.into(),
+                        });
+                        return Ty::Unit;
+                    }
+                }
                 self.field_type(&t, name, ctx)
             }
 
@@ -3451,6 +3516,26 @@ impl TypeChecker {
                             }
                             return Ty::Generic("Box".into(), vec![GenericArg::Type(it), GenericArg::Type(alloc_ty)]);
                         }
+                        if crate::locks::is_lock_generic(tn) && fname == "new" && !self.structs.contains_key(tn.as_str()) {
+                            let inner_exp = match expected {
+                                Some(Ty::Generic(n, a)) if n == tn && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
+                                _ => None,
+                            };
+                            if args.len() != 1 {
+                                self.errors.push(TypeError { message: format!("`{}::new` takes exactly one argument, the protected value (Document 14 §9.5)", tn), context: ctx.into() });
+                            }
+                            let it = match args.first() { Some(a) => self.check_expr(&a.value, inner_exp.as_ref(), env, ctx), None => Ty::Unit };
+                            return Ty::Generic(tn.clone(), vec![GenericArg::Type(it)]);
+                        }
+                        if tn == "Spinlock" && fname == "new" && !self.structs.contains_key("Spinlock") {
+                            if !args.is_empty() {
+                                self.errors.push(TypeError { message: "`Spinlock::new` takes no argument: a spinlock protects code, not a value (Document 14 §6)".into(), context: ctx.into() });
+                                for a in args {
+                                    self.check_expr(&a.value, None, env, ctx);
+                                }
+                            }
+                            return Ty::Named("Spinlock".into());
+                        }
                         if tn == "Atomic" && fname == "new" && !self.structs.contains_key("Atomic") {
                             let inner_exp = match expected {
                                 Some(Ty::Generic(n, a)) if n == "Atomic" && !a.is_empty() => match &a[0] { GenericArg::Type(t) => Some(t.clone()), _ => None },
@@ -3589,6 +3674,17 @@ impl TypeChecker {
                 for arg in args {
                     self.check_expr(&arg.value, None, env, ctx);
                 }
+                // `P(a: 1, b: 2)` on a tuple struct (the constructor call was not lowered because it
+                // names its arguments): report it here so `check` and `build` agree.
+                if let Expr::Ident(n) = callee.as_ref() {
+                    if self.structs.get(n).map(|s| s.is_tuple).unwrap_or(false) && !self.functions.contains_key(n.as_str()) && args.iter().any(|a| a.name.is_some()) {
+                        self.errors.push(TypeError {
+                            message: format!("named arguments are only allowed when calling a function, not the tuple-struct constructor `{}` (Document 7 §2.4, Document 10 §2)", n),
+                            context: ctx.into(),
+                        });
+                        return Ty::Named(n.clone());
+                    }
+                }
                 self.saw_unresolved = true;
                 expected.cloned().unwrap_or(Ty::Unit)
             }
@@ -3620,6 +3716,20 @@ impl TypeChecker {
                                 return self.check_atomic_method(&et, name, args, env, ctx);
                             }
                         }
+                    }
+                }
+                {
+                    let peeled = peel_box(raw_recv.clone());
+                    let lock_methods = ["lock", "tryLock", "read", "write", "tryRead", "tryWrite", "acquire"];
+                    let direct = matches!(&raw_recv, Ty::Generic(n, _) if crate::locks::is_lock_generic(n)) || matches!(&raw_recv, Ty::Named(n) if n == "Spinlock");
+                    let is_lock = match &peeled {
+                        Ty::Generic(n, _) => crate::locks::is_lock_generic(n) && !self.structs.contains_key(n.as_str()),
+                        Ty::Named(n) => n == "Spinlock" && !self.structs.contains_key("Spinlock"),
+                        _ => false,
+                    };
+                    // `arc.clone()` on an `Arc<Mutex<T>>` is the Arc's own method
+                    if is_lock && (direct || lock_methods.contains(&name.as_str())) {
+                        return self.check_lock_method(expr as *const Expr as usize, &peeled, name, args, env, ctx);
                     }
                 }
                 if let Ty::Generic(gn, ga) = &raw_recv {
@@ -3715,6 +3825,25 @@ impl TypeChecker {
                         return t;
                     }
                 }
+                if let Some(key) = ty_lookup_name(&recv_ty) {
+                    if self.mut_self_methods.contains(&(key, name.clone())) {
+                        let recv_rg = match self.expr_types.get(&(receiver.as_ref() as *const Expr as usize)) {
+                            Some(t) => crate::locks::is_read_guard(t) || matches!(t, Ty::Ref(_, i) if crate::locks::is_read_guard(i)),
+                            None => false,
+                        };
+                        if recv_rg || self.expr_through_read_guard(receiver) {
+                            self.errors.push(TypeError {
+                                message: format!("cannot call the `borrow mut self` method `{}` through a read guard: `RwLock::read` gives shared access only; take `write()` (Document 14 §9.5)", name),
+                                context: ctx.into(),
+                            });
+                        } else if self.expr_through_shared(receiver) || matches!(self.expr_types.get(&(receiver.as_ref() as *const Expr as usize)), Some(Ty::Generic(n, _)) if n == "Rc" || n == "Arc") || matches!(self.expr_types.get(&(receiver.as_ref() as *const Expr as usize)), Some(Ty::Ref(_, i)) if matches!(&**i, Ty::Generic(n, _) if n == "Rc" || n == "Arc")) {
+                            self.errors.push(TypeError {
+                                message: format!("cannot call the `borrow mut self` method `{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Document 12/14; Document 6 §6)", name),
+                                context: ctx.into(),
+                            });
+                        }
+                    }
+                }
                 let sig = self.resolve_method(&recv_ty, name);
                 match sig {
                     Some(sig) if !sig.own.is_empty() => self.check_generic_method_call(call_addr, &recv_ty, name, sig, args, gens, env, ctx),
@@ -3782,6 +3911,12 @@ impl TypeChecker {
                     _ => None,
                 };
                 let t = self.check_expr(inner, inner_expected.as_ref(), env, ctx);
+                if *mutable && self.expr_through_read_guard(inner) {
+                    self.errors.push(TypeError {
+                        message: "cannot `borrow mut` through a read guard: `RwLock::read` gives shared access only; take `write()` (Document 14 §9.5)".into(),
+                        context: ctx.into(),
+                    });
+                }
                 if *mutable && self.expr_through_shared(inner) {
                     self.errors.push(TypeError {
                         message: "cannot `borrow mut` through an `Rc`/`Arc`: it gives shared, immutable access (Document 6 §6)".into(),
@@ -4530,6 +4665,46 @@ impl TypeChecker {
                 context: ctx.into(),
             });
         }
+    }
+
+    /// Methods of `Spinlock`, `Mutex<T>`, `RwLock<T>` (Document 14 §9.5). All take `borrow self`, so a lock in a
+    /// `static`, behind an `Arc` or in a struct field works. The result is a guard (or `Option<guard>`).
+    fn check_lock_method(&mut self, call_addr: usize, lock: &Ty, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        use crate::locks::{guard_of, spin_guard, write_guard_of};
+        let (kind, elem) = match lock {
+            Ty::Generic(n, a) => (n.as_str().to_string(), match a.first() { Some(GenericArg::Type(t)) => t.clone(), _ => Ty::Unit }),
+            _ => ("Spinlock".to_string(), Ty::Unit),
+        };
+        let ret = match (kind.as_str(), name) {
+            ("Mutex", "lock") => Some(guard_of("Mutex", &elem)),
+            ("Mutex", "tryLock") => Some(Ty::OptionTy(Box::new(guard_of("Mutex", &elem)))),
+            ("RwLock", "read") => Some(guard_of("RwLock", &elem)),
+            ("RwLock", "write") => Some(write_guard_of(&elem)),
+            ("RwLock", "tryRead") => Some(Ty::OptionTy(Box::new(guard_of("RwLock", &elem)))),
+            ("RwLock", "tryWrite") => Some(Ty::OptionTy(Box::new(write_guard_of(&elem)))),
+            ("Spinlock", "acquire") => Some(spin_guard()),
+            _ => None,
+        };
+        for a in args {
+            self.check_expr(&a.value, None, env, ctx);
+        }
+        let Some(ret) = ret else {
+            let have = match kind.as_str() {
+                "Mutex" => "lock, tryLock",
+                "RwLock" => "read, write, tryRead, tryWrite",
+                _ => "acquire",
+            };
+            self.errors.push(TypeError {
+                message: format!("no method named `{}` on `{}`: the protected value is only reachable through a guard; the methods are {} (Document 14 §9.5)", name, lock, have),
+                context: ctx.into(),
+            });
+            return Ty::Unit;
+        };
+        if !args.is_empty() {
+            self.errors.push(TypeError { message: format!("`{}` takes no arguments, found {} (Document 14 §9.5)", name, args.len()), context: ctx.into() });
+        }
+        self.guard_exprs.insert(call_addr);
+        ret
     }
 
     /// Methods of `Atomic<T>` (Document 14 §9.4). All take `borrow self`.
@@ -5989,6 +6164,11 @@ impl TypeChecker {
         self.functions.keys().cloned().collect()
     }
 
+    /// Calls that return a lock guard (Phase 13 M2).
+    pub fn guard_expr_addrs(&self) -> std::collections::HashSet<usize> {
+        self.guard_exprs.clone()
+    }
+
     /// Receiver expressions of `JoinHandle::join` calls (Phase 12 M3).
     pub fn join_receiver_addrs(&self) -> std::collections::HashSet<usize> {
         self.join_receivers.clone()
@@ -6028,6 +6208,9 @@ impl TypeChecker {
             Ty::Generic(n, _) if n == "ActorRef" => false,
             // an `Atomic<T>` is not duplicable (it has one address): it is move-tracked, but owns no heap memory
             Ty::Generic(n, _) if n == "Atomic" => true,
+            // locks and guards are never copied: move-tracked (a lock has one address; a guard one release)
+            Ty::Generic(n, _) if crate::locks::is_lock_generic(n) || crate::locks::is_guard_generic(n) => true,
+            Ty::Named(n) if (n == "Spinlock" || n == "SpinlockGuard") && !self.structs.contains_key(n.as_str()) => true,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
             // a generic struct/enum with a `Drop` impl is move-tracked before monomorphization too
             Ty::Generic(n, _) if self.has_drop_impl_named(n) => true,
@@ -6063,12 +6246,26 @@ impl TypeChecker {
         }
     }
 
+    /// Does the place `e` go through the guard of `RwLock::read` (shared access only, Document 14 §9.5)?
+    pub fn expr_through_read_guard(&self, e: &Expr) -> bool {
+        let rg = |x: &Expr| match self.expr_types.get(&(x as *const Expr as usize)) {
+            Some(t) => crate::locks::is_read_guard(t) || matches!(t, Ty::Ref(_, i) if crate::locks::is_read_guard(i)),
+            None => false,
+        };
+        match e {
+            Expr::Paren(i) => self.expr_through_read_guard(i),
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => rg(expr) || self.expr_through_read_guard(expr),
+            Expr::Deref(inner) => rg(inner) || self.expr_through_read_guard(inner),
+            _ => false,
+        }
+    }
+
     /// Is the place expression `e` reached through a reference (so it is borrowed, not owned)?
     fn expr_behind_ref(&self, e: &Expr) -> bool {
         // behind a reference, or inside a shared `Rc`/`Arc` (whose content is never moved out)
         let is_ref = |x: &Expr| match self.expr_types.get(&(x as *const Expr as usize)) {
             Some(Ty::Ref(..)) => true,
-            Some(Ty::Generic(n, _)) => n == "Rc" || n == "Arc",
+            Some(Ty::Generic(n, _)) => n == "Rc" || n == "Arc" || crate::locks::is_guard_generic(n),
             _ => false,
         };
         match e {
@@ -6623,16 +6820,27 @@ impl TypeChecker {
                         })
                     }
                     "Box" | "Generator" | "JoinHandle" | "Future" => targs.first().and_then(|t| self.auto_trait_walk(t, want_send, seen)),
-                    // `Atomic<T>` is `Sync`, and `Send` when `T` is (Document 14 §9.3). For `Atomic<*mut T>` the
-                    // pointer is not `Send`; the atomic is `Sync` only when the pointee is `Send`.
+                    // `Atomic<T>` is `Sync`, and `Send` when `T` is (Document 14 §9.4). `Atomic<*mut T>` is both
+                    // `Send` and `Sync` when `T` is `Send` (ruling of 2026-11-19): the atomic only hands out a
+                    // pointer value, dereferencing it is `unsafe`. A plain `*mut T` stays non-`Send`.
+                    // `Mutex<T>` / `RwLock<T>` are `Send` and `Sync` when `T` is `Send` (Document 14 §9.3, §9.5)
+                    "Mutex" | "RwLock" if !self.structs.contains_key(n.as_str()) => {
+                        let inner = targs.first()?;
+                        self.auto_trait_walk(inner, true, seen).map(|(_, why)| {
+                            (ty.clone(), format!("`{}` is `{}` only when `{}` is `Send` (Document 14 §9.3): {}", ty, kind, inner, why))
+                        })
+                    }
+                    // a guard must be released by the thread that took the lock (Document 14 §9.1)
+                    "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" if !self.structs.contains_key(n.as_str()) => Some((
+                        ty.clone(),
+                        format!("a lock guard (`{}`) must be released by the thread that took the lock, so it is not `{}` (Document 14 §9.1); a future that holds one across an `await` is therefore not `Send`", ty, kind),
+                    )),
                     "Atomic" => {
                         let inner = targs.first()?;
                         if let Ty::RawPtr(_, pointee) = inner {
-                            if want_send {
-                                Some((ty.clone(), format!("`{}` holds a raw pointer, which is not `Send` (Document 14 §9.3)", ty)))
-                            } else {
-                                self.auto_trait_walk(pointee, true, seen).map(|(_, why)| (ty.clone(), format!("`{}` is `Sync` only when the pointee is `Send`, but {}", ty, why)))
-                            }
+                            self.auto_trait_walk(pointee, true, seen).map(|(_, why)| {
+                                (ty.clone(), format!("`{}` is `{}` only when the pointee `{}` is `Send` (Document 14 §9.4): {}", ty, kind, pointee, why))
+                            })
                         } else if want_send {
                             self.auto_trait_walk(inner, true, seen)
                         } else {
@@ -6658,6 +6866,10 @@ impl TypeChecker {
                     }
                 }
             }
+            Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key("SpinlockGuard") => Some((
+                ty.clone(),
+                format!("a lock guard (`SpinlockGuard`) must be released by the thread that took the lock, so it is not `{}` (Document 14 §9.1)", kind),
+            )),
             Ty::Named(n) => {
                 if !seen.insert(format!("{}#{}", n, kind)) {
                     return None;

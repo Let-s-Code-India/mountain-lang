@@ -423,6 +423,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 self.context.struct_type(&fs, false).into()
             }
+            // `Spinlock` is one word; its guard (like every guard) is one pointer to the lock (Phase 13 M2)
+            Ty::Named(n) if n == "Spinlock" && !self.structs.contains_key(n) => self.int_ty(32).into(),
+            Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key(n) => self.context.ptr_type(AddressSpace::default()).into(),
             Ty::Named(n) => {
                 if let Some((fields, _)) = self.structs.get(n).cloned() {
                     let mut fs = Vec::new();
@@ -492,6 +495,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     other => self.llty(other)?,
                 }
             }
+            // `Mutex<T>` / `RwLock<T>`: `{ [8 x i32] lock words, T }`; their guards: a pointer to the lock (Phase 13 M2)
+            Ty::Generic(n, a) if crate::locks::is_lock_generic(n) && matches!(a.first(), Some(crate::types::GenericArg::Type(_))) => {
+                let Some(crate::types::GenericArg::Type(t)) = a.first() else { unreachable!() };
+                let t = t.clone();
+                self.lock_obj_ty(&t)?.into()
+            }
+            Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             // `Rc<dyn T>` / `Arc<dyn T>` / `Weak<dyn T>`: a fat handle `{ object pointer, vtable }` (Phase 13 M0)
             Ty::Generic(n, a) if matches!(n.as_str(), "Rc" | "Arc" | "Weak") && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
@@ -1010,7 +1020,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         let g = self.module.add_global(lt, None, &format!("mtn_static_{}", st.name));
         g.set_initializer(&init);
         // an `Atomic<T>` (or a struct holding one) is written at run time: its global cannot be constant
-        g.set_constant(!format!("{}", ty).contains("Atomic<"));
+        g.set_constant(!{ let t = format!("{}", ty); t.contains("Atomic<") || t.contains("Mutex<") || t.contains("RwLock<") || t.contains("Spinlock") });
         if self.statics.insert(st.name.clone(), (g.as_pointer_value(), ty)).is_some() {
             return Err(CgErr(format!("static `{}` is defined more than once", st.name)));
         }
@@ -1055,6 +1065,20 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return Ok(self.context.i8_type().const_int(iv.get_zero_extended_constant().unwrap_or(0), false).into());
                 }
                 Ok(v)
+            }
+            // `static M: Mutex<i32> = Mutex::new(0);`, `static L: Spinlock = Spinlock::new();`
+            Expr::Call { callee, args } if matches!(callee.as_ref(), Expr::Path(p) if p.len() == 2 && p[1] == "new" && (crate::locks::is_lock_generic(&p[0]) || p[0] == "Spinlock")) => {
+                match ty {
+                    Ty::Named(n) if n == "Spinlock" && args.is_empty() => Ok(self.int_ty(32).const_zero().into()),
+                    Ty::Generic(n, ga) if crate::locks::is_lock_generic(n) && args.len() == 1 => {
+                        let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(bad()) };
+                        let inner = inner.clone();
+                        let v = self.const_val(&args[0].value, &inner)?;
+                        let state = self.int_ty(32).array_type(8).const_zero();
+                        Ok(self.context.const_struct(&[state.into(), v], false).into())
+                    }
+                    _ => Err(bad()),
+                }
             }
             Expr::Literal(l) => self.literal(l, ty, false),
             Expr::Unary { op: UnaryOp::Neg, expr } => match expr.as_ref() {
@@ -1437,6 +1461,7 @@ mod drops;
 mod dynamic;
 mod expr;
 mod generator;
+mod locks;
 mod task;
 mod actor;
 mod print;

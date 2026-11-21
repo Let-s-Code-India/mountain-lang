@@ -77,14 +77,13 @@ fn inject_prelude(program: &mut crate::ast::Program) {
     program.items = items;
 }
 
-/// Document 12 §11.8: `Mutex`, `RwLock`, `Spinlock`, `channel` and `volatile` arrive in
-/// Phase 13. Wherever they are used (path call, type position, `channel::<T>()`, `volatile ..`) the
-/// program is rejected with one clear message per use, instead of an "unknown function/type"
-/// error. A program that declares its own item of that name (`struct Mutex`, `fn channel`, ...)
-/// is left alone. `select` has its own message (raised where the expression is checked).
+/// Document 12 §11.8 gate for names that arrive in Phase 13. `Atomic` (M1) and `Mutex`, `RwLock`,
+/// `Spinlock` (M2) are implemented, so the list is empty; `channel` and `select` (M3/M4) and
+/// `volatile` (M6) are still reported where they are used. A program that declares its own item of
+/// a listed name (`struct X`, `fn X`, ...) is left alone.
 fn phase13_names(tokens: &[crate::token::Token]) -> Vec<String> {
     use crate::token::{Keyword, TokenKind};
-    const NAMES: [&str; 3] = ["Mutex", "RwLock", "Spinlock"];
+    const NAMES: [&str; 0] = [];
     let declares = |name: &str| {
         tokens.windows(2).any(|w| {
             matches!(&w[0].kind, TokenKind::Keyword(Keyword::Struct | Keyword::Enum | Keyword::Trait | Keyword::Fn | Keyword::Type))
@@ -127,6 +126,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
         inject_async_prelude(&mut program);
     }
     desugar::desugar_join(&mut program);
+    desugar::desugar_tuple_ctors(&mut program);
     let actor_errors = desugar::desugar_actors(&mut program);
     if !actor_errors.is_empty() {
         return Err(actor_errors);
@@ -141,6 +141,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     bc.set_owning_exprs(tc.owning_expr_addrs());
     bc.set_fn_exprs(tc.fn_expr_addrs());
     bc.set_join_receivers(tc.join_receiver_addrs());
+    bc.set_guard_exprs(tc.guard_expr_addrs());
     bc.check_program(&program);
     errors.extend(bc.errors.iter().map(|e| e.to_string()));
     if errors.is_empty() {
@@ -181,6 +182,7 @@ pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
             bc2.set_owning_exprs(tc.owning_expr_addrs());
             bc2.set_fn_exprs(tc.fn_expr_addrs());
             bc2.set_join_receivers(tc.join_receiver_addrs());
+    bc2.set_guard_exprs(tc.guard_expr_addrs());
             bc2.check_program(&program);
             e2.extend(bc2.errors.iter().map(|e| e.to_string()));
             if !e2.is_empty() {
@@ -249,6 +251,7 @@ fn with_module<T>(src: &str, opts: &Options, f: impl FnOnce(&inkwell::module::Mo
     cbc.set_owning_exprs(tc.owning_expr_addrs());
     cbc.set_fn_exprs(tc.fn_expr_addrs());
     cbc.set_join_receivers(tc.join_receiver_addrs());
+    cbc.set_guard_exprs(tc.guard_expr_addrs());
     cbc.check_program(&program);
     cg.set_closure_infos(cbc.closure_info.clone());
     cg.generate(&program)?;
@@ -272,7 +275,8 @@ pub fn emit_ir(src: &str, opts: &Options) -> Result<String, Vec<String>> {
 pub fn build_executable(src: &str, out: &Path, opts: &Options) -> Result<(), Vec<String>> {
     let obj = out.with_extension("o");
     let uses_rt = with_module(src, opts, |m, tm| {
-        let uses_rt = m.get_function("__mtn_rt_init").is_some();
+        // tasks/threads start the runtime (`__mtn_rt_init`); locks alone only need its lock section linked in
+        let uses_rt = m.get_function("__mtn_rt_init").is_some() || m.get_functions().any(|f| f.get_name().to_string_lossy().starts_with("__mtn_lock_"));
         // generators are LLVM coroutines: the coroutine passes must run even without optimization
         let pipeline = if opts.release { Some("default<O2>") } else if has_coroutines(m) { Some("default<O0>") } else { None };
         if let Some(p) = pipeline {

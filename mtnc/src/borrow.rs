@@ -241,6 +241,8 @@ pub struct BorrowChecker {
     /// Addresses of expressions of function type `fn(..) -> ..` (Phase 12 M1).
     fn_exprs: std::collections::HashSet<usize>,
     join_receivers: std::collections::HashSet<usize>,
+    /// Calls that return a lock guard (Phase 13 M2): the guard is tied to the lock it came from.
+    guard_exprs: std::collections::HashSet<usize>,
     /// Capture analysis of every closure literal, by AST address (Phase 12 M1).
     pub closure_info: HashMap<usize, ClosureInfo>,
     pub errors: Vec<BorrowError>,
@@ -255,6 +257,7 @@ impl BorrowChecker {
             owning: std::collections::HashSet::new(),
             fn_exprs: std::collections::HashSet::new(),
             join_receivers: std::collections::HashSet::new(),
+            guard_exprs: std::collections::HashSet::new(),
             closure_info: HashMap::new(),
             errors: Vec::new(),
         }
@@ -264,6 +267,11 @@ impl BorrowChecker {
     pub fn set_join_receivers(&mut self, s: std::collections::HashSet<usize>) {
         self.join_receivers = s;
     }
+
+    pub fn set_guard_exprs(&mut self, s: std::collections::HashSet<usize>) {
+        self.guard_exprs = s;
+    }
+
 
     pub fn set_fn_exprs(&mut self, fn_exprs: std::collections::HashSet<usize>) {
         self.fn_exprs = fn_exprs;
@@ -977,6 +985,10 @@ impl<'a> FnChecker<'a> {
     /// or updates an existing one in place (a plain `name = value;`
     /// re-assignment, e.g. Document 6 §5.1's `result = longest(...);`).
     fn declare_binding(&mut self, name: &str, init: &Expr, block: &Block, idx: usize, new_scope: bool) {
+        // a guard bound to a name lives to the end of its block (its drop is at scope end, not at its last use)
+        if let Some(root) = guard_root(&self.checker.guard_exprs, init) {
+            self.record_borrow(&root, name, block.stmts.len());
+        }
         if let Expr::Borrow { mutable, expr: inner } = init {
             if let Expr::Ident(place) = inner.as_ref() {
                 self.use_ident(place);
@@ -1498,6 +1510,11 @@ impl<'a> FnChecker<'a> {
                     self.check_expr(receiver, block, idx);
                 }
                 self.check_call_args(args, block, idx);
+                // a guard made inside this statement (a `match m.tryLock()` scrutinee, a temporary) is tied to
+                // its lock for the whole statement
+                if let Some(root) = guard_root(&self.checker.guard_exprs, expr) {
+                    self.record_borrow(&root, "a lock guard", idx);
+                }
                 self.forbid_escaping_borrowing_closure(expr);
             }
             Expr::Borrow { mutable, expr: inner } => {
@@ -1954,4 +1971,32 @@ fn or_state(acc: &mut Vec<HashMap<String, bool>>, other: &[HashMap<String, bool>
 /// Like `block_diverges` but a `break` also ends the path (it never reaches the next iteration).
 fn block_diverges_in_loop(b: &Block) -> bool {
     block_diverges(b, true)
+}
+
+/// If `e` is a call that returns a lock guard (`m.lock()`, `s.m.tryRead()`, ..), the root variable of its
+/// receiver. A guard points INTO its lock and releases it when dropped (at the end of its scope), so
+/// the lock's variable may not be moved or reassigned while the guard can still be alive (Document 14 §9.5;
+/// a moved lock leaves a zeroed slot behind, and the guard would release the wrong lock).
+pub(crate) fn guard_root(guards: &std::collections::HashSet<usize>, e: &Expr) -> Option<String> {
+    let mut e = e;
+    while let Expr::Paren(i) = e {
+        e = i;
+    }
+    let Expr::MethodCall { receiver, .. } = e else { return None };
+    if !guards.contains(&(e as *const Expr as usize)) {
+        return None;
+    }
+    let mut r: &Expr = receiver;
+    loop {
+        match r {
+            Expr::Paren(i) | Expr::Deref(i) => r = i,
+            Expr::Field { expr, .. } | Expr::Index { expr, .. } => r = expr,
+            Expr::Borrow { expr, .. } => r = expr,
+            _ => break,
+        }
+    }
+    match r {
+        Expr::Ident(n) => Some(n.clone()),
+        _ => None,
+    }
 }

@@ -1153,6 +1153,83 @@ pub fn desugar_join(program: &mut Program) {
     });
 }
 
+/// Tuple structs (Document 7 §2.4): `struct P(A, B);` is built with `P(a, b)`. The constructor call is
+/// the struct literal `P { 0: a, 1: b }` (the fields of a tuple struct are named `0`, `1`, .. internally),
+/// so generics, monomorphisation, the borrow checker and codegen share the struct-literal path.
+/// A call whose name is also a function, or that uses named arguments, is left alone.
+pub fn desugar_tuple_ctors(program: &mut Program) {
+    let names = std::cell::RefCell::new(HashSet::<String>::new());
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| match &it.kind {
+        ItemKind::Struct(s) if matches!(s.body, StructBody::Tuple(_)) => {
+            names.borrow_mut().insert(s.name.clone());
+        }
+        ItemKind::Fn(f) => {
+            names.borrow_mut().remove(&f.name);
+        }
+        _ => {}
+    });
+    let mut names = names.into_inner();
+    // a function declared after the struct in item order was removed above only if visited later; do a second pass
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| {
+        if let ItemKind::Fn(f) = &it.kind {
+            names.remove(&f.name);
+        }
+    });
+    if names.is_empty() {
+        return;
+    }
+    fn rw_block(b: &mut Block, names: &HashSet<String>) {
+        for c in block_children_mut(b) {
+            match c {
+                ChildMut::E(x) => rw_expr(x, names),
+                ChildMut::B(x) => rw_block(x, names),
+            }
+        }
+    }
+    fn rw_expr(e: &mut Expr, names: &HashSet<String>) {
+        for c in expr_children_mut(e) {
+            match c {
+                ChildMut::E(x) => rw_expr(x, names),
+                ChildMut::B(x) => rw_block(x, names),
+            }
+        }
+        let hit = matches!(e, Expr::Call { callee, args } if matches!(&**callee, Expr::Ident(n) if names.contains(n)) && args.iter().all(|a| a.name.is_none()));
+        if !hit {
+            return;
+        }
+        let Expr::Call { callee, args } = std::mem::replace(e, Expr::Tuple(Vec::new())) else { unreachable!() };
+        let Expr::Ident(name) = *callee else { unreachable!() };
+        let fields = args.into_iter().enumerate().map(|(i, a)| (i.to_string(), a.value)).collect();
+        *e = Expr::StructLit { name, fields, spread: None };
+    }
+    crate::scope::for_each_item_mut(&mut program.items, &mut |it| match &mut it.kind {
+        ItemKind::Fn(f) => {
+            if let Some(b) = &mut f.body {
+                rw_block(b, &names);
+            }
+        }
+        ItemKind::Impl(im) => {
+            for ii in im.items.iter_mut() {
+                if let ImplItem::Fn(f) = ii {
+                    if let Some(b) = &mut f.body {
+                        rw_block(b, &names);
+                    }
+                }
+            }
+        }
+        ItemKind::Trait(t) => {
+            for ti in t.items.iter_mut() {
+                if let TraitItem::Fn(f) = ti {
+                    if let Some(b) = &mut f.body {
+                        rw_block(b, &names);
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+}
+
 // ---------------------------------------------------------------- actors (Phase 12 M5)
 
 /// Document 12 §8, §11.5: lowers every top-level `actor A { state f: T = init; on h(p: P) { .. } }`

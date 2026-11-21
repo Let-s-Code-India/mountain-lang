@@ -12,6 +12,7 @@ pub mod driver;
 pub mod dropcheck;
 pub mod dropmoves;
 pub mod atomics;
+pub mod locks;
 pub mod diagnostics;
 pub mod exhaustive;
 pub mod generator;
