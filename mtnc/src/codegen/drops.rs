@@ -38,6 +38,13 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         match ty {
             Ty::StringTy | Ty::Array(_) | Ty::Fn(..) => true,
             Ty::Generic(n, _) if n == "ActorRef" => false,
+            // a lock drops what it protects; a guard releases its lock (Phase 13 M2)
+            Ty::Generic(n, a) if crate::locks::is_lock_generic(n) => match a.first() {
+                Some(crate::types::GenericArg::Type(t)) => self.needs_drop_d(t, depth + 1),
+                _ => false,
+            },
+            Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => true,
+            Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key(n) => true,
             Ty::Generic(n, _) => crate::types::is_heap_generic(n),
             Ty::Tuple(ts) => ts.iter().any(|t| self.needs_drop_d(t, depth + 1)),
             Ty::Fixed(t, _) => self.needs_drop_d(t, depth + 1),
@@ -310,6 +317,20 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 }
                 self.builder.build_unconditional_branch(end)?;
                 self.builder.position_at_end(end);
+            }
+            // a guard releases its lock; a moved-out guard is a null pointer and does nothing
+            Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => self.guard_glue(f, p, ty)?,
+            Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key(n) => self.guard_glue(f, p, ty)?,
+            // a lock drops the value it protects (the lock words need no clean-up)
+            Ty::Generic(n, a) if crate::locks::is_lock_generic(n) => {
+                let Some(crate::types::GenericArg::Type(inner)) = a.first() else { return Err(CgErr("internal: lock without a type argument".into())) };
+                let inner = inner.clone();
+                if self.needs_drop(&inner) {
+                    let obj = self.lock_obj_ty(&inner)?;
+                    let vp = self.builder.build_struct_gep(obj, p, 1, "lockval")?;
+                    let g = self.drop_glue(&inner)?;
+                    self.builder.build_call(g, &[vp.into()], "")?;
+                }
             }
             Ty::Generic(n, args) if n == "Rc" || n == "Arc" => {
                 let Some(crate::types::GenericArg::Type(inner)) = args.first() else {

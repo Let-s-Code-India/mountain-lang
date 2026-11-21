@@ -547,9 +547,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::Deref(inner) => {
                 let ty = self.ty_of(e)?;
                 let ity = self.ty_of(inner)?;
-                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc") {
+                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc" || crate::locks::is_guard_generic(n)) {
                     if self.needs_drop(&ty) {
-                        return Err(CgErr(format!("cannot move a `{}` out of a shared `{}` (use `.clone()` on the pointer, or borrow through it)", ty, ity)));
+                        return Err(CgErr(format!("cannot move a `{}` out of a shared `{}` (use `.clone()` on the pointer, or borrow through it; a lock guard only lends its value)", ty, ity)));
                     }
                     let (bp, _) = self.place_or_spill(inner)?;
                     let (vp, _) = self.peel_box_place(bp, ity.clone())?;
@@ -816,7 +816,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     /// Follows `Box` layers: `p` addresses a value of type `ty`; returns the address and type of the
     /// content when `ty` is a `Box<T>` (repeatedly), otherwise `p` and `ty` unchanged.
-    fn peel_box_place(&mut self, mut p: PointerValue<'ctx>, mut ty: Ty) -> R<(PointerValue<'ctx>, Ty)> {
+    pub(super) fn peel_box_place(&mut self, mut p: PointerValue<'ctx>, mut ty: Ty) -> R<(PointerValue<'ctx>, Ty)> {
         let ptrt = self.context.ptr_type(AddressSpace::default());
         loop {
             match &ty {
@@ -837,6 +837,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     p = self.builder.build_struct_gep(objt, obj, 2, "rcval")?;
                     ty = inner;
                 }
+                // a lock guard derefs like a `Box`: the slot holds a pointer to the lock, the value is inside it
+                Ty::Generic(n, a) if crate::locks::is_guard_generic(n) && !a.is_empty() => {
+                    let Some(crate::types::GenericArg::Type(inner)) = a.first() else { return Err(CgErr("internal: guard without a type argument".into())) };
+                    let inner = inner.clone();
+                    let g = self.builder.build_load(ptrt, p, "guard")?.into_pointer_value();
+                    p = self.guard_value_ptr(&ty, g)?;
+                    ty = inner;
+                }
                 _ => return Ok((p, ty)),
             }
         }
@@ -849,7 +857,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             while let Ty::Ref(_, i) = t {
                 t = *i;
             }
-            matches!(&t, Ty::Generic(n, _) if n == "Rc" || n == "Arc")
+            matches!(&t, Ty::Generic(n, _) if n == "Rc" || n == "Arc" || n == "RwLockReadGuard")
         };
         match e {
             Expr::Paren(i) => self.through_shared(i),
@@ -939,7 +947,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::Deref(inner) => {
                 let ty = self.ty_of(e)?;
                 let ity = self.ty_of(inner)?;
-                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc") {
+                if matches!(&ity, Ty::Generic(n, _) if n == "Rc" || n == "Arc" || crate::locks::is_guard_generic(n)) {
                     let (bp, _) = self.place_or_spill(inner)?;
                     let (vp, _) = self.peel_box_place(bp, ity.clone())?;
                     return Ok((vp, ty));
@@ -1454,7 +1462,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             {
                 let mut a0 = b0.clone();
                 while let Ty::Generic(n, a) = &a0 {
-                    if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() {
+                    if (matches!(n.as_str(), "Box" | "Rc" | "Arc") || crate::locks::is_guard_generic(n)) && !a.is_empty() {
                         if let crate::types::GenericArg::Type(t) = &a[0] {
                             let mut t = t.clone();
                             while let Ty::Ref(_, i) = t {
@@ -1473,6 +1481,32 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                             return self.atomic_method(receiver, &rty, &et, name, args);
                         }
                     }
+                }
+            }
+            // `Spinlock` / `Mutex<T>` / `RwLock<T>` (possibly behind a reference, `Box`, `Rc` or `Arc`)
+            if matches!(name, "lock" | "tryLock" | "read" | "write" | "tryRead" | "tryWrite" | "acquire") {
+                let mut a0 = b0.clone();
+                while let Ty::Generic(n, a) = &a0 {
+                    if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() {
+                        if let crate::types::GenericArg::Type(t) = &a[0] {
+                            let mut t = t.clone();
+                            while let Ty::Ref(_, i) = t {
+                                t = *i;
+                            }
+                            a0 = t;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                let is_lock = match &a0 {
+                    Ty::Generic(n, _) => crate::locks::is_lock_generic(n),
+                    Ty::Named(n) => n == "Spinlock",
+                    _ => false,
+                };
+                if is_lock {
+                    let call_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: no type recorded for a lock call".into()))?;
+                    return self.lock_method(receiver, &rty, name, &call_ty);
                 }
             }
             // `r.isOk()` / `r.isErr()` (Document 14 §2): the tag of a `Result`, without moving it
@@ -1514,7 +1548,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         loop {
             match base {
                 Ty::Ref(_, i) => base = *i,
-                Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => {
+                Ty::Generic(ref n, ref a) if (matches!(n.as_str(), "Box" | "Rc" | "Arc") || crate::locks::is_guard_generic(n)) && !a.is_empty() => {
                     boxed = true;
                     match &a[0] {
                         crate::types::GenericArg::Type(t) => base = t.clone(),
@@ -1554,7 +1588,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         let recv: V<'ctx> = match kind {
             PMode::Ref(true) if self.through_shared(receiver) => {
-                return Err(CgErr(format!("cannot call the `borrow mut self` method `{}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Phase 13)", tystr, name)));
+                return Err(CgErr(format!("cannot call the `borrow mut self` method `{}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Document 12/14)", tystr, name)));
             }
             PMode::Ref(_) if boxed => {
                 // auto-deref through `Box<T>`: the receiver is the pointer to the content
@@ -1614,7 +1648,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
         if let Expr::Ident(n) = root {
             if self.lookup_local(n).is_none() && (self.statics.contains_key(n.as_str()) || self.consts.contains_key(n.as_str())) {
-                return Err(CgErr(format!("cannot assign to the constant/static `{}` (statics are immutable; interior mutability needs `Atomic<T>`, Phase 13)", n)));
+                return Err(CgErr(format!("cannot assign to the constant/static `{}` (statics are immutable; interior mutability needs `Atomic<T>`, `Mutex<T>` or `RwLock<T>`, Document 14)", n)));
             }
         }
         let (p, lty) = self.place(lhs)?;
@@ -3053,6 +3087,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         let v = self.expr_as(&args[0].value, &at)?;
                         return self.string_from_str(v);
                     }
+                    if fname == "new" && !self.structs.contains_key(tn.as_str()) && (crate::locks::is_lock_generic(tn) || tn == "Spinlock") {
+                        return self.lock_new(&ty, args);
+                    }
                     if tn == "Atomic" && fname == "new" {
                         let Ty::Generic(_, ga) = &ty else { return Err(CgErr("internal: `Atomic::new` is not typed as an Atomic".into())) };
                         let Some(crate::types::GenericArg::Type(inner)) = ga.first() else { return Err(CgErr("internal: `Atomic` without a type argument".into())) };
@@ -3167,7 +3204,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         loop {
             match t {
                 Ty::Ref(_, i) => t = *i,
-                Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => {
+                Ty::Generic(ref n, ref a) if (matches!(n.as_str(), "Box" | "Rc" | "Arc") || crate::locks::is_guard_generic(n)) && !a.is_empty() => {
                     boxed = true;
                     match &a[0] {
                         crate::types::GenericArg::Type(x) => t = x.clone(),

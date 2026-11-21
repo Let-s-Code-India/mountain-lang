@@ -259,7 +259,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             matches!(t, Ty::Generic(n, _) if n == "Rc" || n == "Arc")
         };
         if is_rc && matches!(self_kind, Some(PMode::Ref(true))) {
-            return Err(CgErr(format!("cannot call the `borrow mut self` method `dyn {}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Phase 13)", tr, name)));
+            return Err(CgErr(format!("cannot call the `borrow mut self` method `dyn {}::{}` through an `Rc`/`Arc`: it gives shared, immutable access (interior mutation needs `Atomic`/`Mutex`, Document 12/14)", tr, name)));
         }
         // the fat pointer of the receiver (lent, never moved)
         let fatv = match rty {
