@@ -1,0 +1,66 @@
+// Tuple structs (Document 7 §2.4): constructor, .0/.1 read and write, patterns, generics,
+// nesting, parameters and returns, impl blocks, Drop, @copy and @pack.
+struct P(i32, i32);
+struct Wrap<T>(T);
+struct Pair<A, B>(A, B);
+struct Outer(P, i64);
+@copy struct C(i32, f64);
+@pack struct K(u8, u32);
+struct Guard(i32);
+impl Drop for Guard { fn drop(borrow mut self) { println(self.0); } }
+struct Holder<T>(T, i32);
+impl<T> Drop for Holder<T> { fn drop(borrow mut self) { println(self.1); } }
+
+impl P {
+    fn sum(borrow self) -> i32 { self.0 + self.1 }
+    fn bump(borrow mut self) { self.0 = self.0 + 1; }
+    fn make(a: i32) -> P { P(a, a * 2) }
+}
+fn swap(p: P) -> P { P(p.1, p.0) }
+fn first(p: borrow P) -> i32 { p.0 }
+fn id<T>(x: T) -> T { x }
+fn takes(g: Guard) { println(100); }
+
+fn main() {
+    let mut p = P(1, 2);
+    println(p.0);
+    p.0 = 10;
+    p.bump();
+    println(p.sum());
+    let q = swap(p);
+    println(q.0);
+    println(first(&q));
+    let w = Wrap(5);
+    println(w.0);
+    let w2: Wrap<i64> = Wrap(7);
+    println(w2.0);
+    let pr = Pair(3, true);
+    println(pr.0);
+    println(pr.1);
+    let o = Outer(P(4, 5), 9);
+    println(o.0.1);
+    println(o.1);
+    let c = C(2, 1.5);
+    let d = c;
+    println(c.0);
+    println(d.1);
+    let k = K(1, 2);
+    println(k.1);
+    println(sizeOf::<K>());
+    let P(a, b) = P::make(6);
+    println(a + b);
+    match P(8, 9) { P(x, y) => println(x * y) }
+    let m = Wrap(Wrap(1));
+    println(m.0.0);
+    let mut n = P(1, 1);
+    n.1 += 5;
+    println(n.1);
+    let z = id(P(9, 9));
+    println(z.0);
+    let g1 = Guard(1);
+    let g2 = Guard(2);
+    takes(g2);
+    let h = Holder(Guard(3), 4);
+    let bx = Box::new(Guard(6));
+    println(300);
+}
