@@ -41,9 +41,26 @@
  *    drop glue runs once, then the state block and the actor are released.
  *  - Stats line: every message is counted as one `spawned`/`completed` task (the line is unchanged).
  */
+/* Locks (Phase 13 M2; Document 14 §6, §7, §9.1, §9.5; Document 12 §7)
+ *  - `Spinlock`: one flag word, test-and-test-and-set with a CPU relax hint (a CAS retry loop, no parking;
+ *    `sched_yield` once in a long while so a descheduled holder on a busy machine can run).
+ *  - `Mutex` / `RwLock`: a TICKET lock (a monotonic ticket counter, served in strict arrival order, so a waiter
+ *    is never overtaken and nobody starves). A waiter spins a bounded number of rounds, then PARKS on a global
+ *    parking lot: 64 buckets, each a pthread mutex + condition variable, chosen by the lock's address. A lock
+ *    itself is only 32 bytes of zero-initialised atomics (a `static` lock needs no run-time set-up).
+ *  - `RwLock` = the ticket lock as a GATE + a reader count. A reader passes through the gate (in ticket order),
+ *    counts itself in and leaves the gate; a writer holds the gate and waits for the count to reach 0. Readers
+ *    that arrive while a writer waits queue behind it at the gate, so a stream of readers cannot starve a writer,
+ *    and a stream of writers cannot starve a reader.
+ *  - A thread that holds a lock never runs OTHER queued tasks from a helping `join` (see __mtn_rt_join): such a
+ *    task could block on that very lock, below the holder on the same stack, forever.
+ *  - Not re-entrant: locking a lock the thread already holds deadlocks (Document 14 §9.5).
+ *  - A waiter blocks its thread (a pool worker included); critical sections should be short (Doc 14 §7).
+ */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +156,7 @@ static Actor *g_actors;
 
 static __thread int t_worker = -1;
 static __thread Task *t_cur; /* the future task being polled on this thread */
+static __thread int t_locks_held; /* locks (guards) this thread holds right now: see the lock section */
 
 static void rt_die(const char *msg) {
     (void)!write(2, msg, strlen(msg));
@@ -198,6 +216,24 @@ static Task *take_task(int me) {
         t->state = S_RUNNING;
     }
     return t;
+}
+
+/* Takes exactly `t` out of whichever deque holds it, if it is still queued. Caller holds g_mu. */
+static Task *take_specific(Task *t) {
+    if (t->done || t->state != S_QUEUED || g_queued == 0) return NULL;
+    for (int i = 0; i < g_nworkers; i++) {
+        Deque *d = &g_dq[i];
+        int in = 0;
+        for (Task *x = d->head; x; x = x->next) if (x == t) { in = 1; break; }
+        if (!in) continue;
+        if (t->prev) t->prev->next = t->next; else d->head = t->next;
+        if (t->next) t->next->prev = t->prev; else d->tail = t->prev;
+        t->next = t->prev = NULL;
+        g_queued--;
+        t->state = S_RUNNING;
+        return t;
+    }
+    return NULL;
 }
 
 static void task_free(Task *t) {
@@ -476,7 +512,9 @@ void __mtn_rt_join(void *h, void *out) {
     Task *t = h;
     pthread_mutex_lock(&g_mu);
     while (!t->done) {
-        Task *other = t_worker >= 0 ? take_task(t_worker) : NULL;
+        /* A worker that holds a lock may only run the awaited task itself: any other task could block on
+           that lock and never return to the frame that holds it. */
+        Task *other = t_worker < 0 ? NULL : (t_locks_held == 0 ? take_task(t_worker) : take_specific(t));
         if (other) {
             pthread_mutex_unlock(&g_mu);
             run_task(other);
@@ -676,4 +714,192 @@ void __mtn_rt_shutdown(void) {
     free(g_heap);
     free(g_dq);
     free(g_threads);
+}
+
+
+/* ================================================================================================
+ * Locks (Phase 13 M2).  See the header comment.  Exported names are `__mtn_lock_*`.
+ * Memory orders: every choice is explained where it is made.
+ * ================================================================================================ */
+
+/* 32 bytes, 4-byte aligned, all zero = unlocked; the compiler lays a lock out as `[8 x i32]`. */
+typedef struct {
+    _Atomic uint32_t next;     /* next ticket to hand out */
+    _Atomic uint32_t serving;  /* the ticket that owns the lock now */
+    _Atomic uint32_t parked;   /* waiters asleep (or about to sleep) on `serving` */
+    _Atomic uint32_t readers;  /* RwLock: readers inside */
+    _Atomic uint32_t wparked;  /* RwLock: a writer asleep (or about to sleep) waiting for `readers == 0` */
+    uint32_t pad[3];
+} mtn_lk;
+_Static_assert(sizeof(mtn_lk) == 32, "the compiler lays a lock out as [8 x i32]");
+
+#define LK_SPIN 300 /* rounds of spinning before a waiter parks */
+#define PL_BUCKETS 64
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+} PlBucket;
+static PlBucket g_pl[PL_BUCKETS] = {[0 ... PL_BUCKETS - 1] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER}};
+
+static PlBucket *pl_bucket(const void *addr) {
+    return &g_pl[(((uintptr_t)addr >> 5) * 0x9E3779B97F4A7C15ull) >> 58]; /* top 6 bits of a multiplicative hash */
+}
+
+static inline void cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+/* Wakes everything parked in the bucket of `addr`. The caller has ALREADY changed the state the waiters
+   test; taking the bucket mutex here orders this broadcast after any waiter that is between "I tested the
+   state" and "I am in cond_wait" (it holds the mutex for that whole span), so a wakeup cannot be lost. */
+static void pl_wake(const void *addr) {
+    PlBucket *b = pl_bucket(addr);
+    pthread_mutex_lock(&b->mu);
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+
+/* ---- ticket gate (used by Mutex directly and by RwLock as its entry gate) ---- */
+
+static void gate_lock(mtn_lk *l) {
+    /* relaxed: the ticket counter only has to hand out distinct numbers; the data of the critical section is
+       ordered by the acquire load of `serving` below, which pairs with the release store in gate_unlock */
+    uint32_t t = atomic_fetch_add_explicit(&l->next, 1, memory_order_relaxed);
+    for (int i = 0; i < LK_SPIN; i++) {
+        /* acquire: if it is our turn, everything the previous holder wrote before its release is visible */
+        if (atomic_load_explicit(&l->serving, memory_order_acquire) == t) return;
+        cpu_relax();
+    }
+    PlBucket *b = pl_bucket(l);
+    pthread_mutex_lock(&b->mu);
+    /* seq_cst on `parked` (RMW) and on the `serving` loads/stores: this is a Dekker-style handshake with
+       gate_unlock (store `serving`, then read `parked`). In the single total order of seq_cst operations either
+       the waiter sees the new `serving` (it does not sleep) or the unlocker sees `parked > 0` (it wakes us). */
+    atomic_fetch_add_explicit(&l->parked, 1, memory_order_seq_cst);
+    while (atomic_load_explicit(&l->serving, memory_order_seq_cst) != t) pthread_cond_wait(&b->cv, &b->mu);
+    atomic_fetch_sub_explicit(&l->parked, 1, memory_order_relaxed); /* under the bucket mutex; only a hint for the unlocker */
+    pthread_mutex_unlock(&b->mu);
+}
+
+static int gate_try(mtn_lk *l) {
+    /* acquire: pairs with the release (seq_cst) store of `serving` made by the last unlock */
+    uint32_t s = atomic_load_explicit(&l->serving, memory_order_acquire);
+    uint32_t exp = s;
+    /* `next == serving` means nobody holds the lock and nobody waits; taking ticket `s` makes us the holder.
+       Success needs no ordering of its own (the acquire above did it); failure changes nothing. */
+    return atomic_compare_exchange_strong_explicit(&l->next, &exp, s + 1, memory_order_relaxed, memory_order_relaxed);
+}
+
+static void gate_unlock(mtn_lk *l) {
+    /* only the holder writes `serving`, so a relaxed read of our own last value is exact */
+    uint32_t s = atomic_load_explicit(&l->serving, memory_order_relaxed);
+    /* seq_cst store: release for the critical section's writes, and the first half of the Dekker handshake */
+    atomic_store_explicit(&l->serving, s + 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&l->parked, memory_order_seq_cst) != 0) pl_wake(l);
+}
+
+void __mtn_lock_mutex_lock(void *p) {
+    gate_lock(p);
+    t_locks_held++;
+}
+int __mtn_lock_mutex_trylock(void *p) {
+    if (!gate_try(p)) return 0;
+    t_locks_held++;
+    return 1;
+}
+void __mtn_lock_mutex_unlock(void *p) {
+    t_locks_held--;
+    gate_unlock(p);
+}
+
+/* ---- RwLock ---- */
+
+void __mtn_lock_rw_write(void *p) {
+    mtn_lk *l = p;
+    gate_lock(l); /* we are first in line: no new reader can enter while we wait for the old ones */
+    for (int i = 0; i < LK_SPIN; i++) {
+        /* acquire: the readers' critical sections (their release in rw_read_unlock) happen before our writes */
+        if (atomic_load_explicit(&l->readers, memory_order_acquire) == 0) goto held;
+        cpu_relax();
+    }
+    {
+        PlBucket *b = pl_bucket(&l->readers);
+        pthread_mutex_lock(&b->mu);
+        /* Dekker with rw_read_unlock (fetch_sub `readers`, then read `wparked`): all four operations seq_cst */
+        atomic_fetch_add_explicit(&l->wparked, 1, memory_order_seq_cst);
+        while (atomic_load_explicit(&l->readers, memory_order_seq_cst) != 0) pthread_cond_wait(&b->cv, &b->mu);
+        atomic_fetch_sub_explicit(&l->wparked, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&b->mu);
+    }
+held:
+    t_locks_held++;
+}
+int __mtn_lock_rw_try_write(void *p) {
+    mtn_lk *l = p;
+    if (!gate_try(l)) return 0;
+    if (atomic_load_explicit(&l->readers, memory_order_acquire) != 0) { /* readers inside: give the gate back */
+        gate_unlock(l);
+        return 0;
+    }
+    t_locks_held++;
+    return 1;
+}
+void __mtn_lock_rw_write_unlock(void *p) {
+    t_locks_held--;
+    gate_unlock(p);
+}
+
+void __mtn_lock_rw_read(void *p) {
+    mtn_lk *l = p;
+    gate_lock(l); /* in ticket order behind any waiting writer */
+    /* acquire: the previous writer's writes (released by its gate_unlock) are visible to this reader */
+    atomic_fetch_add_explicit(&l->readers, 1, memory_order_acquire);
+    gate_unlock(l);
+    t_locks_held++;
+}
+int __mtn_lock_rw_try_read(void *p) {
+    mtn_lk *l = p;
+    if (!gate_try(l)) return 0; /* a writer holds or awaits the gate: do not overtake it */
+    atomic_fetch_add_explicit(&l->readers, 1, memory_order_acquire);
+    gate_unlock(l);
+    t_locks_held++;
+    return 1;
+}
+void __mtn_lock_rw_read_unlock(void *p) {
+    mtn_lk *l = p;
+    t_locks_held--;
+    /* seq_cst: release for the reader's accesses (a writer's acquire load of `readers` pairs with it) and the
+       first half of the Dekker handshake with the parking writer */
+    uint32_t old = atomic_fetch_sub_explicit(&l->readers, 1, memory_order_seq_cst);
+    if (old == 1 && atomic_load_explicit(&l->wparked, memory_order_seq_cst) != 0) pl_wake(&l->readers);
+}
+
+/* ---- Spinlock ---- */
+
+void __mtn_lock_spin_acquire(void *p) {
+    _Atomic uint32_t *f = p;
+    for (unsigned long i = 1;; i++) {
+        /* test-and-test-and-set: spin on a plain load (no cache-line ping-pong), then try the exchange;
+           acquire on the exchange pairs with the release store in spin_release */
+        if (atomic_load_explicit(f, memory_order_relaxed) == 0 && atomic_exchange_explicit(f, 1, memory_order_acquire) == 0) break;
+        cpu_relax();
+        if ((i & 0xFFFFul) == 0) sched_yield(); /* still no parking: just let a descheduled holder run */
+    }
+    t_locks_held++;
+}
+int __mtn_lock_spin_try(void *p) {
+    _Atomic uint32_t *f = p;
+    if (atomic_exchange_explicit(f, 1, memory_order_acquire) != 0) return 0;
+    t_locks_held++;
+    return 1;
+}
+void __mtn_lock_spin_release(void *p) {
+    t_locks_held--;
+    /* release: publishes the critical section to the next acquirer */
+    atomic_store_explicit((_Atomic uint32_t *)p, 0, memory_order_release);
 }
