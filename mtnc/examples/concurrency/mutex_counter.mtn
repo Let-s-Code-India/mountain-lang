@@ -1,0 +1,54 @@
+// Arc<Mutex<i64>> incremented by four OS threads and by 100 tasks (Document 14 §7, §9.5).
+// The guard releases the lock when it is dropped at the end of the block.
+fn bump(c: Arc<Mutex<i64>>, times: i64) {
+    let mut i: i64 = 0;
+    while i < times {
+        let mut g = c.lock();
+        *g = *g + 1;
+        i = i + 1;
+    }
+}
+
+fn main() {
+    let total: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
+    let a = total.clone();
+    let b = total.clone();
+    let c = total.clone();
+    let d = total.clone();
+    let t1 = thread::spawnOS(move || { bump(a, 5000); 0 });
+    let t2 = thread::spawnOS(move || { bump(b, 5000); 0 });
+    let t3 = thread::spawnOS(move || { bump(c, 5000); 0 });
+    let t4 = thread::spawnOS(move || { bump(d, 5000); 0 });
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    println(*total.lock());
+
+    // tasks on the worker pool, ten at a time
+    let mut round = 0;
+    while round < 10 {
+        let h0 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h1 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h2 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h3 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h4 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h5 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h6 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h7 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h8 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        let h9 = { let x = total.clone(); spawn move { bump(x, 100); 0 } };
+        h0.join();
+        h1.join();
+        h2.join();
+        h3.join();
+        h4.join();
+        h5.join();
+        h6.join();
+        h7.join();
+        h8.join();
+        h9.join();
+        round = round + 1;
+    }
+    println(*total.lock());
+}

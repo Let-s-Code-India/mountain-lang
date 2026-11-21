@@ -1,0 +1,22 @@
+// Atomic<*mut T> is Send and Sync when T is Send (Document 14 §9.4): a struct holding one is
+// shared through Arc by four tasks and one OS thread. Dereferencing the pointer stays `unsafe`.
+struct Cell { v: i64 }
+struct Registry { cur: Atomic<*mut Cell>, reads: Atomic<u64> }
+
+fn main() {
+    let mut a = Cell { v: 7 };
+    let reg = Arc::new(Registry { cur: Atomic::new(&mut a as *mut Cell), reads: Atomic::new(0) });
+    let c1 = reg.clone();
+    let c2 = reg.clone();
+    let c3 = reg.clone();
+    let c4 = reg.clone();
+    let c5 = reg.clone();
+    let h1 = spawn move { let p = c1.cur.load(Ordering::Acquire); c1.reads.fetchAdd(1); unsafe { p.read().v } };
+    let h2 = spawn move { let p = c2.cur.load(Ordering::Acquire); c2.reads.fetchAdd(1); unsafe { p.read().v } };
+    let h3 = spawn move { let p = c3.cur.load(Ordering::Acquire); c3.reads.fetchAdd(1); unsafe { p.read().v } };
+    let h4 = spawn move { let p = c4.cur.load(Ordering::Acquire); c4.reads.fetchAdd(1); unsafe { p.read().v } };
+    let t = thread::spawnOS(move || { let p = c5.cur.load(Ordering::Acquire); c5.reads.fetchAdd(1); unsafe { p.read().v } });
+    let total = h1.join() + h2.join() + h3.join() + h4.join() + t.join();
+    println(total);
+    println(reg.reads.load(Ordering::SeqCst));
+}

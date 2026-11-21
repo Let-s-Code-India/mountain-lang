@@ -1,0 +1,30 @@
+// Spinlock protecting a counter kept outside the lock (Document 14 §9.5).
+// The guard releases on drop; hold a spinlock only for a few instructions.
+struct Shared { lock: Spinlock, count: Atomic<i64> }
+
+fn work(s: Arc<Shared>, times: i64) {
+    let mut i: i64 = 0;
+    while i < times {
+        let g = s.lock.acquire();
+        let v = s.count.load(Ordering::Relaxed);
+        s.count.store(v + 1, Ordering::Relaxed);
+        i = i + 1;
+    }
+}
+
+fn main() {
+    let s = Arc::new(Shared { lock: Spinlock::new(), count: Atomic::new(0) });
+    let a = s.clone();
+    let b = s.clone();
+    let c = s.clone();
+    let d = s.clone();
+    let t1 = thread::spawnOS(move || { work(a, 10000); 0 });
+    let t2 = thread::spawnOS(move || { work(b, 10000); 0 });
+    let t3 = thread::spawnOS(move || { work(c, 10000); 0 });
+    let t4 = thread::spawnOS(move || { work(d, 10000); 0 });
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    println(s.count.load(Ordering::SeqCst));
+}

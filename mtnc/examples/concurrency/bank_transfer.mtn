@@ -1,0 +1,42 @@
+// Two Mutex accounts, always locked in the same order (lowest id first),
+// so concurrent transfers in both directions cannot deadlock.
+struct Account { id: i64, balance: Mutex<i64> }
+
+fn transfer(from: Arc<Account>, to: Arc<Account>, amount: i64) {
+    if from.id < to.id {
+        let mut a = from.balance.lock();
+        let mut b = to.balance.lock();
+        *a = *a - amount;
+        *b = *b + amount;
+    } else {
+        let mut b = to.balance.lock();
+        let mut a = from.balance.lock();
+        *a = *a - amount;
+        *b = *b + amount;
+    }
+}
+
+fn shuttle(x: Arc<Account>, y: Arc<Account>, times: i64) {
+    let mut i: i64 = 0;
+    while i < times {
+        transfer(x.clone(), y.clone(), 3);
+        transfer(y.clone(), x.clone(), 1);
+        i = i + 1;
+    }
+}
+
+fn main() {
+    let a = Arc::new(Account { id: 1, balance: Mutex::new(1000) });
+    let b = Arc::new(Account { id: 2, balance: Mutex::new(1000) });
+    let h0 = { let x = a.clone(); let y = b.clone(); spawn move { shuttle(x, y, 500); 0 } };
+    let h1 = { let x = b.clone(); let y = a.clone(); spawn move { shuttle(x, y, 500); 0 } };
+    let h2 = { let x = a.clone(); let y = b.clone(); spawn move { shuttle(x, y, 500); 0 } };
+    h0.join();
+    h1.join();
+    h2.join();
+    let ba = *a.balance.lock();
+    let bb = *b.balance.lock();
+    println(ba);
+    println(bb);
+    println(ba + bb);
+}

@@ -1,0 +1,30 @@
+// RwLock: four reader tasks and one writer (Document 14 §9.5).
+// Readers see a consistent pair; the writer keeps the pair equal.
+struct Pair { a: i64, b: i64 }
+
+fn main() {
+    let lock = Arc::new(RwLock::new(Pair { a: 0, b: 0 }));
+
+    let w = lock.clone();
+    let writer = spawn move {
+        let mut i: i64 = 0;
+        while i < 1000 {
+            let mut g = w.write();
+            g.a = g.a + 1;
+            g.b = g.b + 1;
+            i = i + 1;
+        }
+        0
+    };
+
+    let r0 = { let x = lock.clone(); spawn move { let mut bad = 0; let mut i = 0; while i < 1000 { let g = x.read(); if g.a != g.b { bad = bad + 1; } i = i + 1; } bad } };
+    let r1 = { let x = lock.clone(); spawn move { let mut bad = 0; let mut i = 0; while i < 1000 { let g = x.read(); if g.a != g.b { bad = bad + 1; } i = i + 1; } bad } };
+    let r2 = { let x = lock.clone(); spawn move { let mut bad = 0; let mut i = 0; while i < 1000 { let g = x.read(); if g.a != g.b { bad = bad + 1; } i = i + 1; } bad } };
+    let r3 = { let x = lock.clone(); spawn move { let mut bad = 0; let mut i = 0; while i < 1000 { let g = x.read(); if g.a != g.b { bad = bad + 1; } i = i + 1; } bad } };
+
+    writer.join();
+    println(r0.join() + r1.join() + r2.join() + r3.join());
+    let g = lock.read();
+    println(g.a);
+    println(g.b);
+}
