@@ -13,6 +13,7 @@ pub mod dropcheck;
 pub mod dropmoves;
 pub mod atomics;
 pub mod locks;
+pub mod channels;
 pub mod diagnostics;
 pub mod exhaustive;
 pub mod generator;

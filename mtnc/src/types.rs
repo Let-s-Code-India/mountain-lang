@@ -721,7 +721,7 @@ fn resolve_type_depth(t: &Type, depth: u32) -> Ty {
         Type::Named(n, args) => match alias(n) {
             Some(a) if depth < 16 => resolve_type_depth(&a, depth + 1),
             _ => {
-                if !args.is_empty() && (is_heap_generic(n) || n == "Atomic" || crate::locks::is_lock_generic(n) || crate::locks::is_guard_generic(n) || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
+                if !args.is_empty() && (is_heap_generic(n) || n == "Atomic" || crate::locks::is_lock_generic(n) || crate::locks::is_guard_generic(n) || crate::channels::is_chan_generic(n) || GENERIC_TYPES.with(|g| g.borrow().contains(n))) {
                     let mut out = Vec::new();
                     for a in args {
                         match a {
@@ -1144,6 +1144,10 @@ pub struct TypeChecker {
     future_spawns: Vec<(String, String)>,
     /// Receivers of `JoinHandle::join` (it consumes the handle; Phase 12 M3).
     join_receivers: std::collections::HashSet<usize>,
+    /// addresses of `send` / `recv` calls on channel handles (they are awaitable in async code)
+    chan_ops: std::collections::HashSet<usize>,
+    /// the channel call that is the operand of the `await` being checked
+    awaited_chan: Option<usize>,
     /// Calls that return a lock guard (`lock`, `tryRead`, ..): the borrow checker ties the guard to its lock.
     guard_exprs: std::collections::HashSet<usize>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
@@ -1456,6 +1460,8 @@ impl TypeChecker {
             async_fns: std::collections::HashSet::new(),
             future_spawns: Vec::new(),
             join_receivers: std::collections::HashSet::new(),
+            chan_ops: std::collections::HashSet::new(),
+            awaited_chan: None,
             guard_exprs: std::collections::HashSet::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
@@ -2180,7 +2186,7 @@ impl TypeChecker {
     /// Whether values of `t` are trivially duplicable (`copy`, Doc 3 Category C / Doc 23 §17.8).
     /// Type parameters and unresolved inference variables are given the benefit of the doubt
     /// here: the instantiated copy is checked again with the concrete type.
-    fn is_copy_ty(&self, t: &Ty) -> bool {
+    pub fn is_copy_ty(&self, t: &Ty) -> bool {
         match t {
             Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize
             | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize
@@ -3303,6 +3309,51 @@ impl TypeChecker {
                         }
                     }
                 }
+                // `channel::<T>()`, `channel::<T>(n)`, `channelUnbounded::<T>()` (Document 12 §11.13)
+                if let Expr::TurbofishPath { path, gens } = callee.as_ref() {
+                    if path.len() == 1 && (path[0] == "channel" || path[0] == "channelUnbounded") && !self.functions.contains_key(path[0].as_str()) {
+                        let unbounded = path[0] == "channelUnbounded";
+                        let max_args = if unbounded { 0 } else { 1 };
+                        if gens.len() != 1 || gens[0].1.len() != 1 {
+                            self.errors.push(TypeError {
+                                message: format!("`{0}` takes exactly one type argument: `{0}::<T>()` (Document 12 §11.13)", path[0]),
+                                context: ctx.into(),
+                            });
+                            return Ty::Unit;
+                        }
+                        if args.len() > max_args {
+                            self.errors.push(TypeError {
+                                message: if unbounded {
+                                    "`channelUnbounded::<T>()` takes no arguments (Document 12 §11.13)".to_string()
+                                } else {
+                                    format!("`channel::<T>(n)` takes at most one argument, the capacity; found {} (Document 12 §11.13)", args.len())
+                                },
+                                context: ctx.into(),
+                            });
+                        }
+                        for a in args {
+                            let at = self.check_expr(&a.value, Some(&Ty::Usize), env, ctx);
+                            let at = self.zonk(&at);
+                            if !ty_has_infer(&at) && !matches!(at, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize) {
+                                self.errors.push(TypeError {
+                                    message: format!("the capacity of `channel::<T>(n)` must be an integer, found `{}` (Document 12 §11.13)", at),
+                                    context: ctx.into(),
+                                });
+                            }
+                        }
+                        let elem = resolve_type(&gens[0].1[0]);
+                        return Ty::Tuple(vec![crate::channels::sender_of(&elem), crate::channels::receiver_of(&elem)]);
+                    }
+                }
+                if let Expr::Ident(n) = callee.as_ref() {
+                    if (n == "channel" || n == "channelUnbounded") && !self.functions.contains_key(n.as_str()) && env.get(n).is_none() {
+                        self.errors.push(TypeError {
+                            message: format!("`{0}` needs its message type: write `{0}::<T>()` (Document 12 §11.13)", n),
+                            context: ctx.into(),
+                        });
+                        return Ty::Unit;
+                    }
+                }
                 // `sizeOf::<T>()` / `alignOf::<T>()` (Document 23 §17.13): compiler-known, safe
                 if let Expr::TurbofishPath { path, gens } = callee.as_ref() {
                     if path.len() == 1 && (path[0] == "sizeOf" || path[0] == "alignOf") && !self.functions.contains_key(path[0].as_str()) {
@@ -3783,6 +3834,9 @@ impl TypeChecker {
                             }
                             return Ty::OptionTy(Box::new(t));
                         }
+                        ("Sender" | "Receiver", _, Some(t)) if !self.structs.contains_key(gn.as_str()) => {
+                            return self.check_chan_method(expr as *const Expr as usize, gn == "Sender", &raw_recv, &t, name, args, env, ctx);
+                        }
                         ("Rc" | "Arc", "clone", Some(_)) if args.is_empty() => return raw_recv.clone(),
                         ("Rc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t)]),
                         ("Arc", "downgrade", Some(t)) if args.is_empty() => return Ty::Generic("Weak".into(), vec![GenericArg::Type(t), GenericArg::Type(Ty::Named("Arc".into()))]),
@@ -3956,8 +4010,11 @@ impl TypeChecker {
 
             Expr::Await(inner) => {
                 // Phase 12 M4 (Doc 12 §3, §11.4): `await` of a `Future<T>` or a `JoinHandle<T>` is a `T`
+                self.awaited_chan = Some(inner.as_ref() as *const Expr as usize);
                 let it = self.check_expr(inner, None, env, ctx);
+                self.awaited_chan = None;
                 let it = self.zonk(&it);
+                let is_chan_op = self.chan_ops.contains(&(inner.as_ref() as *const Expr as usize));
                 if !self.await_ok {
                     let why = self.await_why.clone();
                     self.errors.push(TypeError { message: why, context: ctx.into() });
@@ -3971,6 +4028,7 @@ impl TypeChecker {
                     return Ty::Unit;
                 }
                 let result = match (future_item(&it), join_handle_item(&it)) {
+                    _ if is_chan_op => it.clone(),
                     (Some(u), _) | (_, Some(u)) => u,
                     _ => {
                         if !ty_has_infer(&it) && it != Ty::Never {
@@ -4705,6 +4763,58 @@ impl TypeChecker {
         }
         self.guard_exprs.insert(call_addr);
         ret
+    }
+
+    /// Methods of `Sender<T>` / `Receiver<T>` (Document 12 §11.13): `send`, `trySend`, `recv`, `tryRecv`, `clone`.
+    fn check_chan_method(&mut self, call_addr: usize, is_tx: bool, handle: &Ty, elem: &Ty, name: &str, args: &[Arg], env: &mut Env, ctx: &str) -> Ty {
+        let elem = self.zonk(elem);
+        match (is_tx, name) {
+            (true, "send" | "trySend") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { message: format!("`{}` takes exactly one argument, the message, found {} (Document 12 §11.13)", name, args.len()), context: ctx.into() });
+                    for a in args {
+                        self.check_expr(&a.value, None, env, ctx);
+                    }
+                } else {
+                    // a message of the wrong type is reported by the argument check itself (`expected T, found U`)
+                    self.check_expr(&args[0].value, Some(&elem), env, ctx);
+                }
+            }
+            (false, "recv" | "tryRecv") | (_, "clone") => {
+                if !args.is_empty() {
+                    self.errors.push(TypeError { message: format!("`{}` takes no arguments, found {} (Document 12 §11.13)", name, args.len()), context: ctx.into() });
+                    for a in args {
+                        self.check_expr(&a.value, None, env, ctx);
+                    }
+                }
+            }
+            _ => {
+                for a in args {
+                    self.check_expr(&a.value, None, env, ctx);
+                }
+                let have = if is_tx { "send, trySend, clone" } else { "recv, tryRecv, clone" };
+                self.errors.push(TypeError {
+                    message: format!("no method named `{}` on `{}`; the methods are {} (Document 12 §11.13)", name, handle, have),
+                    context: ctx.into(),
+                });
+                return Ty::Unit;
+            }
+        }
+        if matches!(name, "send" | "recv") {
+            self.chan_ops.insert(call_addr);
+            // inside an `async fn` the blocking forms are written with `await` (Document 12 §11.13 item 4)
+            if self.cur_async_fn.is_some() && self.awaited_chan != Some(call_addr) {
+                self.errors.push(TypeError {
+                    message: format!("`{0}` blocks the worker: inside an `async fn` write `await {1}.{0}({2})`, which suspends the task instead (Document 12 §11.13)", name, if is_tx { "tx" } else { "rx" }, if is_tx { "v" } else { "" }),
+                    context: ctx.into(),
+                });
+            }
+        }
+        match name {
+            "send" | "trySend" => Ty::ResultTy(Box::new(Ty::Unit), Box::new(elem)),
+            "recv" | "tryRecv" => Ty::OptionTy(Box::new(elem)),
+            _ => handle.clone(),
+        }
     }
 
     /// Methods of `Atomic<T>` (Document 14 §9.4). All take `borrow self`.
@@ -6169,6 +6279,18 @@ impl TypeChecker {
         self.guard_exprs.clone()
     }
 
+    /// For every expression of tuple type: which elements are `Copy`. The borrow pass uses it to move-track the
+    /// names a destructuring `let (a, b) = ..` binds (Phase 13 M3).
+    pub fn tuple_copy_map(&self) -> HashMap<usize, Vec<bool>> {
+        self.expr_types
+            .iter()
+            .filter_map(|(k, t)| match t {
+                Ty::Tuple(ts) => Some((*k, ts.iter().map(|x| self.is_copy_ty(x)).collect())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Receiver expressions of `JoinHandle::join` calls (Phase 12 M3).
     pub fn join_receiver_addrs(&self) -> std::collections::HashSet<usize> {
         self.join_receivers.clone()
@@ -6210,6 +6332,8 @@ impl TypeChecker {
             Ty::Generic(n, _) if n == "Atomic" => true,
             // locks and guards are never copied: move-tracked (a lock has one address; a guard one release)
             Ty::Generic(n, _) if crate::locks::is_lock_generic(n) || crate::locks::is_guard_generic(n) => true,
+            // a channel handle is one counted reference: move-tracked, dropped once (Document 12 §11.13)
+            Ty::Generic(n, _) if crate::channels::is_chan_generic(n) && !self.structs.contains_key(n.as_str()) => true,
             Ty::Named(n) if (n == "Spinlock" || n == "SpinlockGuard") && !self.structs.contains_key(n.as_str()) => true,
             Ty::Generic(n, _) if is_heap_generic(n) => true,
             // a generic struct/enum with a `Drop` impl is move-tracked before monomorphization too
@@ -6828,6 +6952,13 @@ impl TypeChecker {
                         let inner = targs.first()?;
                         self.auto_trait_walk(inner, true, seen).map(|(_, why)| {
                             (ty.clone(), format!("`{}` is `{}` only when `{}` is `Send` (Document 14 §9.3): {}", ty, kind, inner, why))
+                        })
+                    }
+                    // `Sender<T>` / `Receiver<T>` are `Send` and `Sync` when `T` is `Send` (Document 12 §11.13 item 2)
+                    "Sender" | "Receiver" if !self.structs.contains_key(n.as_str()) => {
+                        let inner = targs.first()?;
+                        self.auto_trait_walk(inner, true, seen).map(|(_, why)| {
+                            (ty.clone(), format!("`{}` is `{}` only when the message type `{}` is `Send` (Document 12 §11.13): {}", ty, kind, inner, why))
                         })
                     }
                     // a guard must be released by the thread that took the lock (Document 14 §9.1)

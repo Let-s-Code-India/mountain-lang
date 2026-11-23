@@ -502,6 +502,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 self.lock_obj_ty(&t)?.into()
             }
             Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
+            // `Sender<T>` / `Receiver<T>`: one pointer to the runtime channel object (Phase 13 M3)
+            Ty::Generic(n, _) if crate::channels::is_chan_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
             // `Rc<dyn T>` / `Arc<dyn T>` / `Weak<dyn T>`: a fat handle `{ object pointer, vtable }` (Phase 13 M0)
             Ty::Generic(n, a) if matches!(n.as_str(), "Rc" | "Arc" | "Weak") && matches!(a.first(), Some(crate::types::GenericArg::Type(Ty::DynTrait(..)))) => self.fat_ty().into(),
             Ty::Generic(n, _) if crate::types::is_heap_generic(n) => self.context.ptr_type(AddressSpace::default()).into(),
@@ -1462,6 +1464,7 @@ mod dynamic;
 mod expr;
 mod generator;
 mod locks;
+mod channels;
 mod task;
 mod actor;
 mod print;

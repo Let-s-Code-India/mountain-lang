@@ -243,6 +243,8 @@ pub struct BorrowChecker {
     join_receivers: std::collections::HashSet<usize>,
     /// Calls that return a lock guard (Phase 13 M2): the guard is tied to the lock it came from.
     guard_exprs: std::collections::HashSet<usize>,
+    /// Which elements of each tuple-typed expression are `Copy` (Phase 13 M3).
+    tuple_copy: HashMap<usize, Vec<bool>>,
     /// Capture analysis of every closure literal, by AST address (Phase 12 M1).
     pub closure_info: HashMap<usize, ClosureInfo>,
     pub errors: Vec<BorrowError>,
@@ -258,6 +260,7 @@ impl BorrowChecker {
             fn_exprs: std::collections::HashSet::new(),
             join_receivers: std::collections::HashSet::new(),
             guard_exprs: std::collections::HashSet::new(),
+            tuple_copy: HashMap::new(),
             closure_info: HashMap::new(),
             errors: Vec::new(),
         }
@@ -270,6 +273,10 @@ impl BorrowChecker {
 
     pub fn set_guard_exprs(&mut self, s: std::collections::HashSet<usize>) {
         self.guard_exprs = s;
+    }
+
+    pub fn set_tuple_copy(&mut self, m: HashMap<usize, Vec<bool>>) {
+        self.tuple_copy = m;
     }
 
 
@@ -866,6 +873,28 @@ impl<'a> FnChecker<'a> {
         self.scopes.pop();
     }
 
+    /// Declares every name `pattern` binds in the current scope. A tuple pattern against a tuple-typed
+    /// initializer gives each element its own copy-ness; any other shape stays untracked (`is_copy`).
+    fn declare_pattern_bindings(&mut self, pattern: &Pattern, copy: Option<bool>, elems: Option<&Vec<bool>>) {
+        match pattern {
+            Pattern::Ident(n) | Pattern::Mut(n) => {
+                self.scopes.last_mut().unwrap().bindings.insert(n.clone(), Binding { is_copy: copy.unwrap_or(true), moved: false, borrow_sources: Vec::new() });
+            }
+            Pattern::Tuple(ps) => {
+                let elems = elems.filter(|e| e.len() == ps.len());
+                for (i, p) in ps.iter().enumerate() {
+                    self.declare_pattern_bindings(p, elems.map(|e| e[i]), None);
+                }
+            }
+            Pattern::TupleStruct(_, ps) | Pattern::Or(ps) | Pattern::Array(ps, _) => {
+                for p in ps {
+                    self.declare_pattern_bindings(p, None, None);
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt, block: &Block, idx: usize) {
         match stmt {
             Stmt::Let { pattern, value, .. } => {
@@ -880,6 +909,10 @@ impl<'a> FnChecker<'a> {
                         // the resulting bindings aren't tracked (see
                         // `binding_name`'s doc comment).
                         self.check_expr(v, block, idx);
+                        // the names a destructuring `let` binds are declared (so a closure can capture them and
+                        // a moved handle is caught); a tuple element is move-tracked by its own type
+                        let elems = self.checker.tuple_copy.get(&(v as *const Expr as usize)).cloned();
+                        self.declare_pattern_bindings(pattern, None, elems.as_ref());
                     }
                 } else if let Some(name) = name {
                     self.scopes.last_mut().unwrap().bindings.insert(
