@@ -1,0 +1,54 @@
+// How a channel closes (Doc 12 §11.13). It closes for receivers when the last Sender is dropped (the queued
+// messages are still delivered, then `recv` gives None) and for senders when the last Receiver is dropped
+// (`send` gives the message back as Err(v)). `trySend` and `tryRecv` never wait.
+fn main() {
+    println("-- dropping every sender");
+    let (tx, rx) = channel::<i64>(4);
+    let tx2 = tx.clone();
+    tx.send(1);
+    tx2.send(2);
+    drop(tx);
+    println("one sender is left, the channel is open");
+    tx2.send(3);
+    drop(tx2);
+    loop {
+        match rx.recv() {
+            Some(v) => println(v),
+            None => { println("closed and drained"); break; }
+        }
+    }
+
+    println("-- dropping every receiver");
+    let (stx, srx) = channel::<String>(2);
+    let srx2 = srx.clone();
+    drop(srx);
+    match stx.send(String::from("first")) {
+        Ok(_) => println("delivered"),
+        Err(s) => println(s),
+    }
+    drop(srx2);
+    match stx.send(String::from("undelivered")) {
+        Ok(_) => println("delivered"),
+        Err(s) => { print("returned: "); println(s); }
+    }
+
+    println("-- trySend on a full channel, tryRecv on an empty one");
+    let (ftx, frx) = channel::<i64>(2);
+    println(ftx.trySend(10).isOk());
+    println(ftx.trySend(20).isOk());
+    match ftx.trySend(30) {
+        Ok(_) => println("queued 30"),
+        Err(v) => { print("full, got back "); println(v); }
+    }
+    match frx.recv() {
+        Some(v) => println(v),
+        None => println("none"),
+    }
+    println(ftx.trySend(30).isOk());
+    loop {
+        match frx.tryRecv() {
+            Some(v) => println(v),
+            None => { println("empty"); break; }
+        }
+    }
+}

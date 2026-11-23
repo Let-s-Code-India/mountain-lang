@@ -1,0 +1,60 @@
+// A pipeline over two bounded channels (Doc 12 §6, §11.13): one producer task sends the numbers 1..=1000 into
+// `jobs`; four worker tasks share the receiving end, square each number and send it on into `results`; the
+// collector (here, `main`) adds them up. A channel closes when its last `Sender` is dropped, so each stage ends
+// by itself: the workers stop when the producer is done, the collector when the last worker is done.
+fn producer(tx: Sender<i64>, n: i64) -> i64 {
+    let mut i: i64 = 1;
+    while i <= n {
+        tx.send(i);
+        i = i + 1;
+    }
+    n
+}
+
+fn worker(jobs: Receiver<i64>, out: Sender<i64>) -> i64 {
+    let mut done: i64 = 0;
+    loop {
+        match jobs.recv() {
+            Some(v) => {
+                out.send(v * v);
+                done = done + 1;
+            }
+            None => { break; }
+        }
+    }
+    done
+}
+
+// starts workers i..=n (each with its own clone of both handles) and returns how many jobs they did in all
+fn workers(jobs: Receiver<i64>, out: Sender<i64>, i: i64, n: i64) -> i64 {
+    if i > n {
+        return 0;
+    }
+    let j = jobs.clone();
+    let o = out.clone();
+    let h = spawn move { worker(j, o) };
+    let rest = workers(jobs, out, i + 1, n);
+    h.join() + rest
+}
+
+fn main() {
+    let (jtx, jrx) = channel::<i64>(16);
+    let (rtx, rrx) = channel::<i64>(16);
+    let p = spawn move { producer(jtx, 1000) };
+    let w = spawn move { workers(jrx, rtx, 1, 4) };
+    let mut sum: i64 = 0;
+    let mut count: i64 = 0;
+    loop {
+        match rrx.recv() {
+            Some(v) => {
+                sum = sum + v;
+                count = count + 1;
+            }
+            None => { break; }
+        }
+    }
+    println(p.join());
+    println(w.join());
+    println(sum);
+    println(count);
+}

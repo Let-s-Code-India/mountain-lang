@@ -1,0 +1,33 @@
+// An async task and an OS thread talking over two channels (Doc 12 §11.13). The OS thread uses the blocking
+// forms; the async side writes `await tx.send(v)` / `await rx.recv()`, which suspends the task and keeps the
+// worker free instead of blocking it.
+async fn main() {
+    let (req_tx, req_rx) = channel::<i64>(4);
+    let (resp_tx, resp_rx) = channel::<i64>(4);
+    let t = thread::spawnOS(move || {
+        let mut served: i64 = 0;
+        loop {
+            match req_rx.recv() {
+                Some(v) => {
+                    resp_tx.send(v * 2);
+                    served = served + 1;
+                }
+                None => { break; }
+            }
+        }
+        served
+    });
+    let mut i: i64 = 1;
+    let mut total: i64 = 0;
+    while i <= 50 {
+        await req_tx.send(i);
+        match await resp_rx.recv() {
+            Some(v) => { total = total + v; }
+            None => { println("the thread went away"); }
+        }
+        i = i + 1;
+    }
+    drop(req_tx);
+    println(total);
+    println(t.join());
+}
