@@ -1,0 +1,18 @@
+-- dropping every sender
+one sender is left, the channel is open
+1
+2
+3
+closed and drained
+-- dropping every receiver
+delivered
+returned: undelivered
+-- trySend on a full channel, tryRecv on an empty one
+true
+true
+full, got back 30
+10
+true
+20
+30
+empty
