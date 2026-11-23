@@ -97,10 +97,11 @@ fn atomic_is_no_longer_gated_by_phase13() {
     assert_eq!(out("static C: Atomic<u64> = Atomic::new(7);\nfn main() { println(C.load()); }"), "7\n");
 }
 
+// Phase 13 M3 implemented `channel` / `Sender<T>` / `Receiver<T>`: the old gate is gone (tests/phase13_m3.rs covers them).
 #[test]
-fn phase13_channel_with_and_without_turbofish() {
-    phase13("fn main() { let c = channel::<i32>(); }", "channel");
-    phase13("fn main() { let (tx, rx) = channel(); }", "channel");
+fn channel_is_no_longer_gated_by_phase13() {
+    assert_eq!(out("fn main() { let (tx, rx) = channel::<i32>(); tx.send(5); println(match rx.recv() { Some(v) => v, None => 0 }); }"), "5\n");
+    rejects("fn main() { let (tx, rx) = channel(); }", "`channel` needs its message type: write `channel::<T>()`");
 }
 
 #[test]
