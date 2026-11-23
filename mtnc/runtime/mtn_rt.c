@@ -100,6 +100,8 @@ typedef struct Task {
     struct Task *waiters;     /* tasks suspended in `await` of this one */
     struct Task *wait_next;   /* link in the target's waiter list */
     struct Task *waiting_on;
+    struct Chan *chan_wait;   /* channel whose wait list holds this task (async send/recv), or NULL */
+    struct Task *chan_next;   /* link in that wait list */
     pthread_t thread; /* is_os only */
     struct Task *next, *prev; /* deque links */
     struct Task *os_next;     /* list of OS tasks */
@@ -157,6 +159,12 @@ static Actor *g_actors;
 static __thread int t_worker = -1;
 static __thread Task *t_cur; /* the future task being polled on this thread */
 static __thread int t_locks_held; /* locks (guards) this thread holds right now: see the lock section */
+static __thread int t_is_pool;    /* this thread is a pool worker (original or compensating): see the channel section */
+static int g_blocked;             /* pool workers currently blocked in a channel wait */
+static int g_extra;               /* compensating workers started so far (never exit before shutdown) */
+static pthread_t *g_xthreads;
+static int g_capx;
+#define MAX_EXTRA 2048
 
 static void rt_die(const char *msg) {
     (void)!write(2, msg, strlen(msg));
@@ -347,6 +355,7 @@ static void run_task(Task *t) {
 
 static void *worker_main(void *arg) {
     t_worker = (int)(intptr_t)arg;
+    t_is_pool = 1;
     for (;;) {
         pthread_mutex_lock(&g_mu);
         Task *t;
@@ -692,6 +701,8 @@ void __mtn_rt_shutdown(void) {
     int timer = g_timer_started;
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < g_nworkers; i++) pthread_join(g_threads[i], NULL);
+    for (int i = 0; i < g_extra; i++) pthread_join(g_xthreads[i], NULL); /* compensating workers (channel section) */
+    free(g_xthreads);
     if (timer) pthread_join(g_timer_thread, NULL);
     while (os) {
         Task *n = os->os_next;
@@ -902,4 +913,660 @@ void __mtn_lock_spin_release(void *p) {
     t_locks_held--;
     /* release: publishes the critical section to the next acquirer */
     atomic_store_explicit((_Atomic uint32_t *)p, 0, memory_order_release);
+}
+
+
+/* ================================================================================================
+ * Channels (Phase 13 M3; Document 12 §6, §11.13; Document 14 §3, §9.6).  Exported names: `__mtn_chan_*`.
+ *
+ *  - Bounded channel  = Vyukov bounded MPMC ring buffer (a sequence number per slot, positions claimed by CAS).
+ *    Capacity is EXACTLY `cap` slots (any `cap >= 1`; slots are found with `pos % cap`, not a mask).
+ *  - Unbounded channel = Michael-Scott queue (1996), including the "help the lagging tail" step.  Nodes are
+ *    reclaimed with HAZARD POINTERS (Michael 2004), the "equivalent hazard-pointer scheme" of Document 14 §5:
+ *    a node is freed only when no thread has published it, so a recycled address can never be mistaken for the
+ *    old node (no ABA).  Nodes are plain malloc'd blocks and are never reused while published.
+ *  - A message is a byte copy of the compiler's value (the sender gives up ownership when `send` succeeds).
+ *    Values still queued when the last handle goes away are dropped once, with the channel's drop glue.
+ *  - Handles are counted: `senders`, `receivers` (closing) and `refs` (memory: one per handle).
+ *    `send` fails when `receivers == 0`; `recv` reports "closed" only when the queue is empty AND `senders == 0`.
+ *  - Waiting.  A blocked thread SPINS briefly, then registers as a waiter and sleeps on the channel's condition
+ *    variable.  An async task registers itself in the channel's wait list and suspends (its worker is free).
+ *    Wake-ups are lost-wakeup free: see `ch_notify_*` (a store-load handshake, all four accesses seq_cst).
+ *  - A POOL WORKER THAT BLOCKS IN A SYNCHRONOUS send/recv IS COMPENSATED: the pool starts one extra worker
+ *    thread so that at least `MTN_WORKERS` workers can still run tasks (see comp_enter).  "Helping" (running
+ *    another queued task on top of the blocked frame, as `join` does) is NOT used for channels: the helped task
+ *    could be the very consumer (or producer) the blocked frame is waiting for and, sitting above it on the same
+ *    stack, could never let it continue (stack inversion deadlock; PROGRESS register item 51).
+ *  - Memory orders: every non-relaxed or relaxed choice is explained where it is made.
+ * ================================================================================================ */
+
+#define CH_SPIN 100
+#define HP_PER 2
+#define HP_SCAN 64
+
+/* ---- hazard pointers --------------------------------------------------------------------------- */
+
+typedef struct HpRec {
+    _Atomic(void *) hp[HP_PER];
+    struct HpRec *next;      /* registry link: set once before the record is published, then read-only */
+    atomic_int active;       /* 1 while a live thread owns the record */
+    void **retired;          /* nodes this record's owner has unlinked, not yet freed */
+    size_t nret, capret;
+} HpRec;
+
+static _Atomic(HpRec *) g_hp_head;
+static __thread HpRec *t_hp;
+static pthread_key_t g_hp_key;
+static pthread_once_t g_hp_once = PTHREAD_ONCE_INIT;
+
+static void hp_thread_exit(void *p) {
+    HpRec *r = p;
+    for (int i = 0; i < HP_PER; i++) atomic_store_explicit(&r->hp[i], NULL, memory_order_release); /* unprotect */
+    atomic_store_explicit(&r->active, 0, memory_order_release); /* the record (and its retired list) may be reused */
+}
+
+static void hp_free_all(void) { /* atexit: every other thread has finished (workers/OS threads are joined before) */
+    HpRec *r = atomic_load_explicit(&g_hp_head, memory_order_acquire);
+    atomic_store_explicit(&g_hp_head, NULL, memory_order_relaxed);
+    while (r) {
+        HpRec *n = r->next;
+        for (size_t i = 0; i < r->nret; i++) free(r->retired[i]);
+        free(r->retired);
+        free(r);
+        r = n;
+    }
+}
+
+static void hp_once_init(void) {
+    pthread_key_create(&g_hp_key, hp_thread_exit);
+    atexit(hp_free_all);
+}
+
+static HpRec *hp_rec(void) {
+    if (t_hp) return t_hp;
+    pthread_once(&g_hp_once, hp_once_init);
+    HpRec *r;
+    /* reuse a record whose thread has exited: CAS 0 -> 1 (acquire: see the retired list its old owner left) */
+    for (r = atomic_load_explicit(&g_hp_head, memory_order_acquire); r; r = r->next) {
+        int z = 0;
+        if (atomic_compare_exchange_strong_explicit(&r->active, &z, 1, memory_order_acquire, memory_order_relaxed)) break;
+    }
+    if (!r) {
+        r = calloc(1, sizeof(HpRec));
+        if (!r) rt_die("runtime: out of memory\n");
+        atomic_init(&r->active, 1);
+        r->next = atomic_load_explicit(&g_hp_head, memory_order_relaxed);
+        /* publish with release: the fields above are visible to whoever walks the list (acquire) */
+        while (!atomic_compare_exchange_weak_explicit(&g_hp_head, &r->next, r, memory_order_release, memory_order_relaxed)) {}
+    }
+    pthread_setspecific(g_hp_key, r); /* registers the destructor for this thread */
+    t_hp = r;
+    return r;
+}
+
+/* Loads `*src` and publishes it as hazard `i`, retrying until the published value is still current. */
+static void *hp_protect(HpRec *r, int i, _Atomic(void *) *src) {
+    void *p = atomic_load_explicit(src, memory_order_acquire); /* acquire: the node's fields are visible */
+    for (;;) {
+        /* seq_cst store: the hazard must be visible to a scanner BEFORE we re-validate (store-load order) */
+        atomic_store_explicit(&r->hp[i], p, memory_order_seq_cst);
+        void *q = atomic_load_explicit(src, memory_order_seq_cst); /* still the same node => not yet retired */
+        if (q == p) return p;
+        p = q;
+    }
+}
+
+static void hp_clear(HpRec *r) {
+    /* release: our reads of the node happen before a scanner may see the hazard gone and free it */
+    for (int i = 0; i < HP_PER; i++) atomic_store_explicit(&r->hp[i], NULL, memory_order_release);
+}
+
+static void hp_scan(HpRec *self) {
+    size_t cap = 16, n = 0;
+    void **prot = malloc(cap * sizeof(void *));
+    if (!prot) rt_die("runtime: out of memory\n");
+    for (HpRec *r = atomic_load_explicit(&g_hp_head, memory_order_acquire); r; r = r->next)
+        for (int i = 0; i < HP_PER; i++) {
+            /* seq_cst: pairs with the seq_cst hazard store in hp_protect (we retired the node first, so a
+               thread that published it later re-validates and sees it is no longer current) */
+            void *p = atomic_load_explicit(&r->hp[i], memory_order_seq_cst);
+            if (!p) continue;
+            if (n == cap) {
+                cap *= 2;
+                prot = realloc(prot, cap * sizeof(void *));
+                if (!prot) rt_die("runtime: out of memory\n");
+            }
+            prot[n++] = p;
+        }
+    size_t keep = 0;
+    for (size_t i = 0; i < self->nret; i++) {
+        void *node = self->retired[i];
+        int hazard = 0;
+        for (size_t j = 0; j < n; j++) if (prot[j] == node) { hazard = 1; break; }
+        if (hazard) self->retired[keep++] = node; else free(node);
+    }
+    self->nret = keep;
+    free(prot);
+}
+
+static void hp_retire(HpRec *r, void *node) {
+    if (r->nret == r->capret) {
+        r->capret = r->capret ? r->capret * 2 : 128;
+        r->retired = realloc(r->retired, r->capret * sizeof(void *));
+        if (!r->retired) rt_die("runtime: out of memory\n");
+    }
+    r->retired[r->nret++] = node;
+    if (r->nret >= HP_SCAN) hp_scan(r);
+}
+
+/* ---- the channel -------------------------------------------------------------------------------- */
+
+typedef struct ChNode {
+    _Atomic(struct ChNode *) next;
+    /* the payload starts at `doff` */
+} ChNode;
+
+typedef struct Chan {
+    size_t esize, ealign, doff, cellsz, cap; /* cap = ring cells (at least 2) */
+    size_t lim;                              /* the logical capacity the program asked for (1 <= lim <= cap) */
+    drop_fn drop;
+    int bounded;
+    unsigned char *cells;                  /* bounded: cap cells of `cellsz` bytes: { atomic size_t seq; payload at doff } */
+    _Alignas(64) atomic_size_t enq;        /* bounded: next position to write (producers claim it by CAS) */
+    _Alignas(64) atomic_size_t deq;        /* bounded: next position to read */
+    _Alignas(64) _Atomic(ChNode *) head;   /* unbounded: the dummy node; the oldest message is head->next */
+    _Atomic(ChNode *) tail;                /* unbounded: last node, or one behind it ("lagging") */
+    _Alignas(64) atomic_int senders, receivers, refs;
+    atomic_int r_waiters, s_waiters;       /* threads sleeping in / tasks registered for recv resp. send */
+    pthread_mutex_t mu;                    /* protects the wait lists and is held across cond_wait */
+    pthread_cond_t cv_r, cv_s;
+    Task *rq, *sq;                         /* async tasks waiting to receive / to send */
+} Chan;
+
+static size_t ch_align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+static void *ch_alloc(size_t align, size_t size) {
+    void *p = NULL;
+    if (align < 16) align = 16;
+    if (posix_memalign(&p, align, ch_align_up(size ? size : 1, align)) != 0) rt_die("runtime: out of memory\n");
+    return p;
+}
+
+/* A handle pair is created with one sender and one receiver. cap == 0 means unbounded. */
+void *__mtn_chan_new(size_t esize, size_t ealign, drop_fn drop, size_t cap) {
+    Chan *c = ch_alloc(64, sizeof(Chan));
+    memset(c, 0, sizeof(Chan));
+    if (ealign < 1) ealign = 1;
+    c->esize = esize;
+    c->ealign = ealign;
+    c->drop = drop;
+    c->doff = ch_align_up(sizeof(_Atomic(ChNode *)) > sizeof(size_t) ? sizeof(_Atomic(ChNode *)) : sizeof(size_t), ealign);
+    c->bounded = cap != 0;
+    c->lim = cap;
+    cap = cap == 1 ? 2 : cap; /* Vyukov's ring needs >= 2 cells: with 1, `pos + cap` and `pos + 1` coincide */
+    c->cap = cap;
+    if (c->bounded) {
+        c->cellsz = ch_align_up(c->doff + esize, ealign > 8 ? ealign : 8);
+        c->cells = ch_alloc(c->cellsz > 64 ? 64 : 16, c->cellsz * cap);
+        for (size_t i = 0; i < cap; i++) atomic_init((atomic_size_t *)(c->cells + i * c->cellsz), i); /* slot i is free for position i */
+        atomic_init(&c->enq, 0);
+        atomic_init(&c->deq, 0);
+    } else {
+        ChNode *dummy = ch_alloc(ealign, c->doff + esize);
+        atomic_init(&dummy->next, NULL);
+        atomic_init(&c->head, dummy);
+        atomic_init(&c->tail, dummy);
+    }
+    atomic_init(&c->senders, 1);
+    atomic_init(&c->receivers, 1);
+    atomic_init(&c->refs, 2);
+    atomic_init(&c->r_waiters, 0);
+    atomic_init(&c->s_waiters, 0);
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv_r, NULL);
+    pthread_cond_init(&c->cv_s, NULL);
+    return c;
+}
+
+/* ---- bounded queue: Vyukov -------------------------------------------------------------------- */
+
+/* `sc` selects seq_cst loads (the waiter's re-check, see ch_notify_*); otherwise acquire. 1 = pushed, 0 = full. */
+static int bq_push(Chan *c, const void *val, int sc) {
+    memory_order lo = sc ? memory_order_seq_cst : memory_order_acquire;
+    size_t pos = atomic_load_explicit(&c->enq, sc ? memory_order_seq_cst : memory_order_relaxed); /* relaxed: only a hint; the CAS and the slot's sequence decide */
+    unsigned char *cell;
+    for (;;) {
+        if (c->lim < c->cap) {
+            /* logical capacity 1 on a 2-cell ring: refuse when `lim` messages are unread. A stale `pos` can make
+               the difference negative (signed compare: not full). A stale `deq` is ruled out for a sleeper's
+               re-check because the consumer's claim of `deq` is a seq_cst CAS (see bq_pop) and this load is
+               seq_cst: it cannot miss a claim that happens before the consumer's seq_cst notification. */
+            intptr_t used = (intptr_t)(pos - atomic_load_explicit(&c->deq, memory_order_seq_cst));
+            if (used >= (intptr_t)c->lim) return 0;
+        }
+        cell = c->cells + (pos % c->cap) * c->cellsz;
+        /* acquire: pairs with the consumer's release/seq_cst store of `pos + cap` (the slot is free and the
+           consumer has finished reading the old payload) */
+        size_t seq = atomic_load_explicit((atomic_size_t *)cell, lo);
+        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        if (dif == 0) {
+            /* relaxed CAS: it only claims position `pos` among producers; the payload is handed over through
+               the slot's sequence number, not through `enq` */
+            if (atomic_compare_exchange_weak_explicit(&c->enq, &pos, pos + 1, memory_order_relaxed, memory_order_relaxed)) break;
+        } else if (dif < 0) {
+            return 0; /* the slot still holds an unread message from one lap ago: full */
+        } else {
+            pos = atomic_load_explicit(&c->enq, memory_order_relaxed); /* another producer got ahead: retry */
+        }
+    }
+    memcpy(cell + c->doff, val, c->esize);
+    /* seq_cst store: release (the payload above is visible to the consumer that acquire-loads this sequence) AND
+       the first half of the store-load handshake with a receiver that is about to sleep (ch_notify_recv) */
+    atomic_store_explicit((atomic_size_t *)cell, pos + 1, memory_order_seq_cst);
+    return 1;
+}
+
+/* 1 = popped into `out`, 0 = empty. */
+static int bq_pop(Chan *c, void *out, int sc) {
+    memory_order lo = sc ? memory_order_seq_cst : memory_order_acquire;
+    size_t pos = atomic_load_explicit(&c->deq, sc ? memory_order_seq_cst : memory_order_relaxed); /* relaxed: a hint */
+    unsigned char *cell;
+    for (;;) {
+        cell = c->cells + (pos % c->cap) * c->cellsz;
+        /* acquire: pairs with the producer's seq_cst store of `pos + 1` (the payload is complete) */
+        size_t seq = atomic_load_explicit((atomic_size_t *)cell, lo);
+        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        if (dif == 0) {
+            /* seq_cst CAS: claims position `pos` among consumers (the payload comes through the sequence number);
+               seq_cst because a capacity-1 sender's re-check reads `deq` (bq_push) and must not miss this claim */
+            if (atomic_compare_exchange_weak_explicit(&c->deq, &pos, pos + 1, memory_order_seq_cst, memory_order_relaxed)) break;
+        } else if (dif < 0) {
+            return 0; /* nothing published at this position: empty */
+        } else {
+            pos = atomic_load_explicit(&c->deq, memory_order_relaxed);
+        }
+    }
+    memcpy(out, cell + c->doff, c->esize);
+    /* seq_cst store: release (our read of the payload is finished before a producer may overwrite the slot) AND
+       the first half of the handshake with a sender that is about to sleep on a full channel (ch_notify_send) */
+    atomic_store_explicit((atomic_size_t *)cell, pos + c->cap, memory_order_seq_cst);
+    return 1;
+}
+
+/* ---- unbounded queue: Michael-Scott with hazard pointers --------------------------------------- */
+
+static void uq_push(Chan *c, const void *val) {
+    ChNode *n = ch_alloc(c->ealign, c->doff + c->esize);
+    atomic_init(&n->next, NULL); /* not yet shared: a plain init */
+    memcpy((unsigned char *)n + c->doff, val, c->esize);
+    HpRec *r = hp_rec();
+    for (;;) {
+        ChNode *t = hp_protect(r, 0, (_Atomic(void *) *)&c->tail);
+        ChNode *nx = atomic_load_explicit(&t->next, memory_order_acquire); /* acquire: nx's fields are visible */
+        if (t != atomic_load_explicit(&c->tail, memory_order_acquire)) continue; /* the tail moved on: retry */
+        if (nx) {
+            /* the tail lags (another producer linked a node but did not swing the tail yet): HELP it forward.
+               release: the node's contents are published to whoever loads the tail with acquire */
+            ChNode *te = t;
+            atomic_compare_exchange_strong_explicit(&c->tail, &te, nx, memory_order_release, memory_order_relaxed);
+            continue;
+        }
+        ChNode *exp = NULL;
+        /* seq_cst CAS: the linearisation point. Release (payload visible to the consumer that acquire-loads
+           `next`) AND the first half of the handshake with a receiver about to sleep (ch_notify_recv) */
+        if (atomic_compare_exchange_strong_explicit(&t->next, &exp, n, memory_order_seq_cst, memory_order_relaxed)) {
+            ChNode *te = t;
+            /* swing the tail; failure is fine (a helper already did it). release: see above */
+            atomic_compare_exchange_strong_explicit(&c->tail, &te, n, memory_order_release, memory_order_relaxed);
+            break;
+        }
+    }
+    hp_clear(r);
+}
+
+static int uq_pop(Chan *c, void *out, int sc) {
+    HpRec *r = hp_rec();
+    for (;;) {
+        ChNode *h = hp_protect(r, 0, (_Atomic(void *) *)&c->head);
+        ChNode *t = atomic_load_explicit(&c->tail, memory_order_acquire);
+        /* seq_cst when this is a waiter's re-check (second half of the handshake), else acquire (pairs with the
+           producer's seq_cst CAS that linked the node) */
+        ChNode *nx = atomic_load_explicit(&h->next, sc ? memory_order_seq_cst : memory_order_acquire);
+        atomic_store_explicit(&r->hp[1], nx, memory_order_seq_cst); /* protect `nx` BEFORE validating (store-load order) */
+        if (h != atomic_load_explicit(&c->head, memory_order_seq_cst)) continue; /* head moved: h and nx may be stale */
+        if (!nx) {
+            hp_clear(r);
+            return 0; /* empty */
+        }
+        if (h == t) {
+            /* the tail lags behind a linked node: help it forward before dequeuing past it */
+            ChNode *te = t;
+            atomic_compare_exchange_strong_explicit(&c->tail, &te, nx, memory_order_release, memory_order_relaxed);
+            continue;
+        }
+        ChNode *he = h;
+        /* acq_rel: acquire pairs with the producer's publication of nx; release orders our hazard reads before
+           anyone who sees the new head */
+        if (atomic_compare_exchange_strong_explicit(&c->head, &he, nx, memory_order_acq_rel, memory_order_relaxed)) {
+            /* we won nx: it is the new dummy and its payload is ours alone. `nx` is still protected by hazard 1,
+               so a concurrent dequeuer that retires it later cannot free it before we have copied. */
+            memcpy(out, (unsigned char *)nx + c->doff, c->esize);
+            hp_clear(r);
+            hp_retire(r, h); /* the old dummy is unreachable now; freed once no hazard names it */
+            return 1;
+        }
+    }
+}
+
+static int ch_push(Chan *c, const void *val, int sc) {
+    if (c->bounded) return bq_push(c, val, sc);
+    uq_push(c, val);
+    return 1;
+}
+
+static int ch_pop(Chan *c, void *out, int sc) {
+    return c->bounded ? bq_pop(c, out, sc) : uq_pop(c, out, sc);
+}
+
+/* ---- closing, counting, waking ----------------------------------------------------------------- */
+
+static void ch_destroy(Chan *c) {
+    /* no handle exists any more: nothing else touches the queue. Drop every message that is still queued, once. */
+    if (c->bounded) {
+        size_t d = atomic_load_explicit(&c->deq, memory_order_relaxed), e = atomic_load_explicit(&c->enq, memory_order_relaxed);
+        for (size_t pos = d; pos != e; pos++) {
+            unsigned char *cell = c->cells + (pos % c->cap) * c->cellsz;
+            /* a claimed slot is published before its sender returns, and no sender is running now */
+            if (atomic_load_explicit((atomic_size_t *)cell, memory_order_relaxed) == pos + 1 && c->drop) c->drop(cell + c->doff);
+        }
+        free(c->cells);
+    } else {
+        ChNode *n = atomic_load_explicit(&c->head, memory_order_relaxed); /* the dummy: its payload was already moved out */
+        ChNode *nx = atomic_load_explicit(&n->next, memory_order_relaxed);
+        free(n);
+        while (nx) {
+            n = nx;
+            nx = atomic_load_explicit(&n->next, memory_order_relaxed);
+            if (c->drop) c->drop((unsigned char *)n + c->doff);
+            free(n);
+        }
+    }
+    pthread_mutex_destroy(&c->mu);
+    pthread_cond_destroy(&c->cv_r);
+    pthread_cond_destroy(&c->cv_s);
+    free(c);
+}
+
+static void ch_unref(Chan *c) {
+    /* acq_rel: release our last use of the channel; the thread that frees it acquires everyone else's */
+    if (atomic_fetch_sub_explicit(&c->refs, 1, memory_order_acq_rel) == 1) ch_destroy(c);
+}
+
+/* Wakes every async task in `*list`, clearing their registration (caller holds c->mu). */
+static void ch_wake_list(Chan *c, Task **list, atomic_int *counter) {
+    (void)c;
+    Task *w = *list;
+    *list = NULL;
+    if (!w) return;
+    pthread_mutex_lock(&g_mu); /* lock order: c->mu, then g_mu (never the other way round) */
+    int n = 0;
+    while (w) {
+        Task *nx = w->chan_next;
+        w->chan_next = NULL;
+        w->chan_wait = NULL;
+        wake(w);
+        n++;
+        w = nx;
+    }
+    pthread_mutex_unlock(&g_mu);
+    atomic_fetch_sub_explicit(counter, n, memory_order_seq_cst);
+}
+
+/* LOST-WAKEUP PROTOCOL (receivers; `ch_notify_send` is the mirror image).
+ *   notifier:  publish a message (seq_cst store / CAS)  ... then load `r_waiters` (seq_cst)
+ *   waiter:    `r_waiters++` (seq_cst RMW)              ... then re-check the queue (seq_cst loads), then sleep
+ * All four accesses are seq_cst, so they sit in one total order: either the notifier sees the waiter (and wakes
+ * it, taking `mu`, which the waiter holds until it is really asleep in cond_wait) or the waiter sees the message
+ * and does not sleep. Closing a side uses the same pattern (`senders` / `receivers` are seq_cst). */
+static void ch_notify_recv(Chan *c) {
+    if (atomic_load_explicit(&c->r_waiters, memory_order_seq_cst) == 0) return; /* fast path: nobody is waiting */
+    pthread_mutex_lock(&c->mu);
+    pthread_cond_broadcast(&c->cv_r);
+    ch_wake_list(c, &c->rq, &c->r_waiters);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void ch_notify_send(Chan *c) {
+    if (atomic_load_explicit(&c->s_waiters, memory_order_seq_cst) == 0) return;
+    pthread_mutex_lock(&c->mu);
+    pthread_cond_broadcast(&c->cv_s);
+    ch_wake_list(c, &c->sq, &c->s_waiters);
+    pthread_mutex_unlock(&c->mu);
+}
+
+void *__mtn_chan_sender_clone(void *p) {
+    Chan *c = p;
+    /* relaxed: we already hold a handle, so the counts cannot reach zero while we increment */
+    atomic_fetch_add_explicit(&c->senders, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
+    return c;
+}
+
+void *__mtn_chan_receiver_clone(void *p) {
+    Chan *c = p;
+    atomic_fetch_add_explicit(&c->receivers, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&c->refs, 1, memory_order_relaxed);
+    return c;
+}
+
+void __mtn_chan_sender_drop(void *p) {
+    Chan *c = p;
+    if (!c) return;
+    /* seq_cst RMW: all this handle's sends happen before the count shows the drop (release), and it is the
+       first half of the handshake with a receiver about to sleep */
+    if (atomic_fetch_sub_explicit(&c->senders, 1, memory_order_seq_cst) == 1) ch_notify_recv(c); /* the last sender: receivers see "closed" */
+    ch_unref(c);
+}
+
+void __mtn_chan_receiver_drop(void *p) {
+    Chan *c = p;
+    if (!c) return;
+    if (atomic_fetch_sub_explicit(&c->receivers, 1, memory_order_seq_cst) == 1) ch_notify_send(c); /* the last receiver: senders see "closed" */
+    ch_unref(c);
+}
+
+static int ch_recv_closed(Chan *c) { return atomic_load_explicit(&c->senders, memory_order_seq_cst) == 0; }
+static int ch_send_closed(Chan *c) { return atomic_load_explicit(&c->receivers, memory_order_seq_cst) == 0; }
+
+/* ---- compensation for a pool worker that blocks -------------------------------------------------- */
+
+/* Called (holding the channel's `mu`) just before a POOL worker sleeps in a synchronous channel wait. The pool
+   keeps at least `g_nworkers` workers that are not blocked: while fewer are available it starts an extra worker
+   thread (they stay until shutdown). This is what lets a producer task and a consumer task share a
+   `channel(1)` with `MTN_WORKERS=1`: when the producer blocks on a full channel, an extra worker runs the
+   consumer. At most MAX_EXTRA extras exist; beyond that a blocked worker simply sleeps. */
+static void comp_enter(void) {
+    if (!t_is_pool) return;
+    pthread_mutex_lock(&g_mu);
+    g_blocked++;
+    while (g_extra < g_blocked && g_extra < MAX_EXTRA) {
+        if (g_extra == g_capx) {
+            g_capx = g_capx ? g_capx * 2 : 16;
+            g_xthreads = realloc(g_xthreads, (size_t)g_capx * sizeof(pthread_t));
+            if (!g_xthreads) rt_die("runtime: out of memory\n");
+        }
+        /* a compensating worker shares a deque index with an original worker (deques are guarded by g_mu) */
+        spawn_thread(&g_xthreads[g_extra], worker_main, (void *)(intptr_t)(g_extra % g_nworkers));
+        g_extra++;
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void comp_leave(void) {
+    if (!t_is_pool) return;
+    pthread_mutex_lock(&g_mu);
+    g_blocked--;
+    pthread_mutex_unlock(&g_mu);
+}
+
+/* ---- operations ---------------------------------------------------------------------------------- */
+
+/* Blocking send. 0 = sent (the value now belongs to the channel), 1 = every receiver is gone (the value stays
+   with the caller). */
+int __mtn_chan_send(void *p, void *val) {
+    Chan *c = p;
+    for (int spin = 0;;) {
+        if (ch_send_closed(c)) return 1;
+        if (ch_push(c, val, 0)) {
+            ch_notify_recv(c);
+            return 0;
+        }
+        if (spin < CH_SPIN) {
+            spin++;
+            cpu_relax();
+            continue;
+        }
+        pthread_mutex_lock(&c->mu);
+        atomic_fetch_add_explicit(&c->s_waiters, 1, memory_order_seq_cst); /* first half of the handshake */
+        int st = 0;
+        if (ch_send_closed(c)) st = 1;
+        else if (ch_push(c, val, 1)) st = 2; /* second half: a seq_cst re-check */
+        if (!st) {
+            comp_enter();
+            pthread_cond_wait(&c->cv_s, &c->mu);
+            comp_leave();
+        }
+        atomic_fetch_sub_explicit(&c->s_waiters, 1, memory_order_seq_cst);
+        pthread_mutex_unlock(&c->mu);
+        if (st == 1) return 1;
+        if (st == 2) {
+            ch_notify_recv(c);
+            return 0;
+        }
+    }
+}
+
+/* 0 = sent, 1 = closed (value stays with the caller), 2 = full (value stays with the caller). */
+int __mtn_chan_try_send(void *p, void *val) {
+    Chan *c = p;
+    if (ch_send_closed(c)) return 1;
+    if (!ch_push(c, val, 0)) return 2;
+    ch_notify_recv(c);
+    return 0;
+}
+
+/* Blocking receive. 1 = a value was moved into `out`, 0 = closed and empty. */
+int __mtn_chan_recv(void *p, void *out) {
+    Chan *c = p;
+    for (int spin = 0;;) {
+        if (ch_pop(c, out, 0)) {
+            ch_notify_send(c);
+            return 1;
+        }
+        if (ch_recv_closed(c)) { /* every sender is gone: anything they sent is visible now; take it first */
+            if (ch_pop(c, out, 1)) {
+                ch_notify_send(c);
+                return 1;
+            }
+            return 0;
+        }
+        if (spin < CH_SPIN) {
+            spin++;
+            cpu_relax();
+            continue;
+        }
+        pthread_mutex_lock(&c->mu);
+        atomic_fetch_add_explicit(&c->r_waiters, 1, memory_order_seq_cst);
+        int st = 0;
+        if (ch_pop(c, out, 1)) st = 1;
+        else if (ch_recv_closed(c)) st = ch_pop(c, out, 1) ? 1 : 2;
+        if (!st) {
+            comp_enter();
+            pthread_cond_wait(&c->cv_r, &c->mu);
+            comp_leave();
+        }
+        atomic_fetch_sub_explicit(&c->r_waiters, 1, memory_order_seq_cst);
+        pthread_mutex_unlock(&c->mu);
+        if (st == 1) {
+            ch_notify_send(c);
+            return 1;
+        }
+        if (st == 2) return 0;
+    }
+}
+
+/* 1 = a value was moved into `out`, 0 = nothing available right now. */
+int __mtn_chan_try_recv(void *p, void *out) {
+    Chan *c = p;
+    if (!ch_pop(c, out, 0)) return 0;
+    ch_notify_send(c);
+    return 1;
+}
+
+/* ---- async forms: the task registers a wake-up and the frame suspends ---------------------------- */
+
+static void ch_unregister(Chan *c, Task *me, Task **list, atomic_int *counter) {
+    if (me->chan_wait != c) return; /* a notifier already woke us and cleared the registration */
+    for (Task **pp = list; *pp; pp = &(*pp)->chan_next)
+        if (*pp == me) {
+            *pp = me->chan_next;
+            break;
+        }
+    me->chan_next = NULL;
+    me->chan_wait = NULL;
+    atomic_fetch_sub_explicit(counter, 1, memory_order_seq_cst);
+}
+
+/* `await tx.send(v)`: 0 = sent, 1 = closed (value stays), 2 = pending (the frame must suspend and call again). */
+int __mtn_chan_send_poll(void *p, void *val) {
+    Chan *c = p;
+    Task *me = t_cur;
+    if (!me) rt_die("runtime: `await` of a channel operation outside a task\n");
+    pthread_mutex_lock(&c->mu);
+    ch_unregister(c, me, &c->sq, &c->s_waiters); /* a re-poll starts clean */
+    int st = 0;
+    if (ch_send_closed(c)) st = 1;
+    else if (ch_push(c, val, 0)) st = 2;
+    if (!st) { /* register, then re-check (the handshake) */
+        me->chan_wait = c;
+        me->chan_next = c->sq;
+        c->sq = me;
+        atomic_fetch_add_explicit(&c->s_waiters, 1, memory_order_seq_cst);
+        if (ch_send_closed(c)) st = 1;
+        else if (ch_push(c, val, 1)) st = 2;
+        if (st) ch_unregister(c, me, &c->sq, &c->s_waiters);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (st == 2) {
+        ch_notify_recv(c);
+        return 0;
+    }
+    return st == 1 ? 1 : 2;
+}
+
+/* `await rx.recv()`: 1 = a value was moved into `out`, 0 = closed and empty, 2 = pending. */
+int __mtn_chan_recv_poll(void *p, void *out) {
+    Chan *c = p;
+    Task *me = t_cur;
+    if (!me) rt_die("runtime: `await` of a channel operation outside a task\n");
+    pthread_mutex_lock(&c->mu);
+    ch_unregister(c, me, &c->rq, &c->r_waiters);
+    int st = 0; /* 1 = got a value, 3 = closed and empty */
+    if (ch_pop(c, out, 0)) st = 1;
+    else if (ch_recv_closed(c)) st = ch_pop(c, out, 1) ? 1 : 3;
+    if (!st) {
+        me->chan_wait = c;
+        me->chan_next = c->rq;
+        c->rq = me;
+        atomic_fetch_add_explicit(&c->r_waiters, 1, memory_order_seq_cst);
+        if (ch_pop(c, out, 1)) st = 1;
+        else if (ch_recv_closed(c)) st = ch_pop(c, out, 1) ? 1 : 3;
+        if (st) ch_unregister(c, me, &c->rq, &c->r_waiters);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (st == 1) {
+        ch_notify_send(c);
+        return 1;
+    }
+    return st == 3 ? 0 : 2;
 }
