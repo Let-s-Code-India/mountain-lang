@@ -44,6 +44,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 _ => false,
             },
             Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => true,
+            Ty::Generic(n, _) if crate::channels::is_chan_generic(n) => true,
             Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key(n) => true,
             Ty::Generic(n, _) => crate::types::is_heap_generic(n),
             Ty::Tuple(ts) => ts.iter().any(|t| self.needs_drop_d(t, depth + 1)),
@@ -320,6 +321,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             // a guard releases its lock; a moved-out guard is a null pointer and does nothing
             Ty::Generic(n, _) if crate::locks::is_guard_generic(n) => self.guard_glue(f, p, ty)?,
+            // a channel handle counts itself out of the channel; a moved-out handle is a null pointer
+            Ty::Generic(n, _) if crate::channels::is_chan_generic(n) => self.chan_handle_glue(f, p, ty)?,
             Ty::Named(n) if n == "SpinlockGuard" && !self.structs.contains_key(n) => self.guard_glue(f, p, ty)?,
             // a lock drops the value it protects (the lock words need no clean-up)
             Ty::Generic(n, a) if crate::locks::is_lock_generic(n) => {

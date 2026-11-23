@@ -1450,6 +1450,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     return self.gen_join(receiver, &item);
                 }
             }
+            // `Sender<T>` / `Receiver<T>` (possibly behind a reference, `Box`, `Rc` or `Arc`)
+            {
+                let mut a0 = b0.clone();
+                while let Ty::Generic(n, a) = &a0 {
+                    if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() {
+                        if let crate::types::GenericArg::Type(t) = &a[0] {
+                            let mut t = t.clone();
+                            while let Ty::Ref(_, i) = t {
+                                t = *i;
+                            }
+                            a0 = t;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if crate::channels::is_chan(&a0) && matches!(name, "send" | "trySend" | "recv" | "tryRecv" | "clone") {
+                    let call_ty = self.types.get(&call_addr).cloned().ok_or_else(|| CgErr("internal: no type recorded for a channel call".into()))?;
+                    return self.chan_method(receiver, &rty, name, args, &call_ty);
+                }
+            }
             if let Ty::Generic(gn, ga) = &b0 {
                 if gn == "ActorRef" && name == "send" && args.len() == 1 {
                     if let Some(crate::types::GenericArg::Type(mt)) = ga.first() {
@@ -2959,6 +2980,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     // ---- calls --------------------------------------------------------------------
 
     fn call(&mut self, whole: &Expr, callee: &Expr, args: &[Arg]) -> R<V<'ctx>> {
+        if let Expr::TurbofishPath { path, .. } = callee {
+            if path.len() == 1 && (path[0] == "channel" || path[0] == "channelUnbounded") && !self.fns.contains_key(path[0].as_str()) {
+                return self.chan_new(whole, path[0] == "channelUnbounded", args);
+            }
+        }
         if let Expr::TurbofishPath { path, gens } = callee {
             if path.len() == 1 && (path[0] == "sizeOf" || path[0] == "alignOf") && !self.fns.contains_key(path[0].as_str()) {
                 return self.gen_size_of(&path[0], &gens[0].1[0]);

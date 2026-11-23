@@ -281,7 +281,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(())
     }
 
-    fn require_async(&self, what: &str) -> R<()> {
+    pub(super) fn require_async(&self, what: &str) -> R<()> {
         if self.gen_ctx.is_none() || self.async_item.is_none() {
             return Err(CgErr(format!("{} outside an `async fn`", what)));
         }
@@ -410,6 +410,26 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// `await e` (Doc 12 §3, §11.4).
     pub(super) fn gen_await(&mut self, inner: &Expr) -> R<V<'ctx>> {
         self.require_async("`await`")?;
+        // `await tx.send(v)` / `await rx.recv()`: a channel operation that suspends instead of blocking (Phase 13 M3)
+        if let Expr::MethodCall { receiver, name, args, .. } = inner {
+            if matches!(name.as_str(), "send" | "recv") {
+                let mut rt = self.ty_of(receiver)?;
+                loop {
+                    match rt {
+                        Ty::Ref(_, i) => rt = *i,
+                        Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+                            crate::types::GenericArg::Type(x) => rt = x.clone(),
+                            _ => break,
+                        },
+                        _ => break,
+                    }
+                }
+                if crate::channels::is_chan(&rt) {
+                    let call_ty = self.ty_of(inner)?;
+                    return self.chan_await(receiver, name, args, &call_ty);
+                }
+            }
+        }
         let ity = self.ty_of(inner)?;
         if let Some(u) = crate::types::future_item(&ity) {
             self.await_future(inner, &ity, &u)
