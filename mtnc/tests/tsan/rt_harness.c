@@ -22,6 +22,7 @@ int __mtn_chan_send(void *, void *);
 int __mtn_chan_try_send(void *, void *);
 int __mtn_chan_recv(void *, void *);
 int __mtn_chan_try_recv(void *, void *);
+int __mtn_chan_select(void **chs, int n, void **outs);
 void __mtn_lock_mutex_lock(void *);
 int __mtn_lock_mutex_trylock(void *);
 void __mtn_lock_mutex_unlock(void *);
@@ -137,6 +138,80 @@ static void run_try(void) {
     __mtn_chan_receiver_drop(c);
 }
 
+
+/* ---------------------------------------------------------------- select (Phase 13 M4) */
+
+typedef struct {
+    void *rx[3];
+    int n;
+    uint64_t sum, count;
+} SelConsumer;
+
+static void *select_consumer(void *a) {
+    SelConsumer *w = a;
+    uint64_t slot[3];
+    void *outs[3] = {&slot[0], &slot[1], &slot[2]};
+    void *chs[3] = {w->rx[0], w->rx[1], w->rx[2]};
+    for (;;) {
+        int r = __mtn_chan_select(chs, w->n, outs);
+        int idx = r >> 1, got = r & 1;
+        if (got) {
+            w->sum += slot[idx];
+            w->count++;
+            continue;
+        }
+        /* arm `idx` is closed and empty: drain the others (a closed arm stays ready, so stop selecting) */
+        for (int j = 0; j < w->n; j++) {
+            uint64_t v;
+            if (j == idx) continue;
+            while (__mtn_chan_recv(w->rx[j], &v)) { w->sum += v; w->count++; }
+        }
+        break;
+    }
+    for (int j = 0; j < w->n; j++) __mtn_chan_receiver_drop(w->rx[j]);
+    return NULL;
+}
+
+static void run_select(size_t cap, int nchan, int np, int per) {
+    void *c[3];
+    Worker ps[3 * 8];
+    pthread_t pt[3 * 8], ct;
+    SelConsumer sc = {.n = nchan};
+    for (int k = 0; k < nchan; k++) {
+        c[k] = __mtn_chan_new(8, 8, NULL, cap);
+        sc.rx[k] = c[k];
+        for (int i = 0; i < np; i++) {
+            ps[k * np + i] = (Worker){.tx = i == 0 ? c[k] : __mtn_chan_sender_clone(c[k]), .id = k * np + i, .per = per};
+        }
+    }
+    pthread_create(&ct, NULL, select_consumer, &sc);
+    for (int i = 0; i < nchan * np; i++) pthread_create(&pt[i], NULL, producer, &ps[i]);
+    for (int i = 0; i < nchan * np; i++) pthread_join(pt[i], NULL);
+    pthread_join(ct, NULL);
+    uint64_t want = 0;
+    for (int i = 0; i < nchan * np; i++) for (int j = 0; j < per; j++) want += (uint64_t)i * 1000000u + (uint64_t)j + 1;
+    assert(sc.count == (uint64_t)nchan * (uint64_t)np * (uint64_t)per);
+    assert(sc.sum == want);
+}
+
+/* the arm's value is never lost or duplicated, and arms that lose consume nothing */
+static void run_select_order(void) {
+    void *a = __mtn_chan_new(8, 8, NULL, 4), *b = __mtn_chan_new(8, 8, NULL, 4);
+    uint64_t v = 10, s0 = 0, s1 = 0, out;
+    void *chs[2] = {a, b}, *outs[2] = {&s0, &s1};
+    assert(__mtn_chan_try_send(b, &v) == 0);
+    v = 20;
+    assert(__mtn_chan_try_send(a, &v) == 0);
+    assert(__mtn_chan_select(chs, 2, outs) == 1 && s0 == 20); /* arm 0 first in source order */
+    assert(__mtn_chan_select(chs, 2, outs) == 3 && s1 == 10);
+    assert(__mtn_chan_try_recv(a, &out) == 0 && __mtn_chan_try_recv(b, &out) == 0);
+    __mtn_chan_sender_drop(a);
+    __mtn_chan_sender_drop(b);
+    assert(__mtn_chan_select(chs, 2, outs) == 0); /* all closed: arm 0 with None */
+    __mtn_chan_receiver_drop(a);
+    __mtn_chan_receiver_drop(b);
+}
+
 /* ---------------------------------------------------------------- locks */
 
 typedef struct {
@@ -227,5 +302,13 @@ int main(void) {
         run_close_and_drop(caps[k]);
     }
     puts("channels ok");
+    run_select_order();
+    for (int k = 0; k < 4; k++) {
+        run_select(caps[k], 2, 1, 20000);
+        run_select(caps[k], 2, 4, 3000);
+        run_select(caps[k], 3, 4, 2000);
+        run_select(caps[k], 3, 8, 1000);
+    }
+    puts("select ok");
     return 0;
 }
