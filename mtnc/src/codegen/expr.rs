@@ -591,7 +591,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::Closure(c) => self.gen_closure(e, c),
             Expr::Await(inner) => self.gen_await(inner),
             Expr::Spawn(inner) => self.gen_spawn(inner, false),
-            Expr::Select(_) => unsupported("`select` (channels)", 13),
+            Expr::Select(arms) => self.gen_select(e, arms, false),
             Expr::Query(_) => unsupported("`query` (embedded database)", 18),
             Expr::Yield(inner) => {
                 self.gen_yield(inner)?;
@@ -3170,7 +3170,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     /// Drops the top frame's entries when the current block is still live.
-    fn emit_top_frame_if_live(&mut self) -> R<()> {
+    pub(super) fn emit_top_frame_if_live(&mut self) -> R<()> {
         if self.dead {
             return Ok(());
         }

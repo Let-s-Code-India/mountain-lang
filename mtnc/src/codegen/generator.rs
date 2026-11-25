@@ -410,6 +410,9 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     /// `await e` (Doc 12 §3, §11.4).
     pub(super) fn gen_await(&mut self, inner: &Expr) -> R<V<'ctx>> {
         self.require_async("`await`")?;
+        if let Expr::Select(arms) = inner {
+            return self.gen_select(inner, arms, true);
+        }
         // `await tx.send(v)` / `await rx.recv()`: a channel operation that suspends instead of blocking (Phase 13 M3)
         if let Expr::MethodCall { receiver, name, args, .. } = inner {
             if matches!(name.as_str(), "send" | "recv") {

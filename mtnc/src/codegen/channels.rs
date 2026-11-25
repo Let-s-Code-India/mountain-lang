@@ -240,4 +240,105 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             self.recv_result(r, slot, &elem, call_ty)
         }
     }
+
+    /// `select { case v = <-rx1: e1, .. }` and `await select { .. }` (Document 12 §6.1, §11.13 item 5).
+    /// The receivers are only BORROWED (their handle pointers are read, nothing is moved). The runtime scans the
+    /// arms in source order and answers `idx * 2 + got` (`got` = 1: a message is in the arm's slot; 0: that
+    /// channel is closed and empty, the arm sees `None`); the winning arm binds an `Option<T>` and runs.
+    pub(super) fn gen_select(&mut self, whole: &Expr, arms: &[SelectArm], awaited: bool) -> R<V<'ctx>> {
+        if awaited {
+            self.require_async("`await select`")?;
+        }
+        let ptrt = self.context.ptr_type(AddressSpace::default());
+        let i32t = self.context.i32_type();
+        let n = arms.len();
+        if n == 0 {
+            return Err(CgErr("internal: `select` without arms".into()));
+        }
+        let ty = self.ty_of(whole)?;
+        let tab_ty = self.context.struct_type(&vec![ptrt.into(); n], false);
+        let chs = self.alloca(tab_ty.into(), "sel_chs")?;
+        let outs = self.alloca(tab_ty.into(), "sel_outs")?;
+        let mut elems: Vec<Ty> = Vec::new();
+        let mut out_slots: Vec<PointerValue<'ctx>> = Vec::new();
+        for (i, a) in arms.iter().enumerate() {
+            let rty = self.ty_of(&a.channel_expr)?;
+            let (h, hty) = self.chan_handle_value(&a.channel_expr, &rty)?;
+            let elem = crate::channels::elem_of(&hty).ok_or_else(|| CgErr("internal: `select` arm without a message type".into()))?;
+            let out = self.chan_out_slot(&elem)?;
+            let cp = self.builder.build_struct_gep(tab_ty, chs, i as u32, "sel_ch")?;
+            self.builder.build_store(cp, h)?;
+            let op = self.builder.build_struct_gep(tab_ty, outs, i as u32, "sel_out")?;
+            self.builder.build_store(op, out)?;
+            elems.push(elem);
+            out_slots.push(out);
+        }
+        let n_const = i32t.const_int(n as u64, false);
+        let r: IntValue<'ctx> = if awaited {
+            // the registrations live in the frame: one `{ chan, task, waiter, next }` slot per arm, all zero at start
+            let regs_ty = ptrt.array_type(4 * n as u32);
+            let regs = self.alloca(regs_ty.into(), "sel_regs")?;
+            self.builder.build_store(regs, regs_ty.const_zero())?;
+            let (head, pend, done) = (self.new_block("sel_head"), self.new_block("sel_pending"), self.new_block("sel_done"));
+            self.builder.build_unconditional_branch(head)?;
+            self.position(head);
+            let fv = self.rt_decl("__mtn_chan_select_poll", Some(i32t.into()), &[ptrt.into(), i32t.into(), ptrt.into(), ptrt.into()]);
+            let c = self.builder.build_call(fv, &[chs.into(), n_const.into(), outs.into(), regs.into()], "sel")?;
+            let ValueKind::Basic(rv) = c.try_as_basic_value() else { return Err(CgErr("internal: select poll returns nothing".into())) };
+            let rv = rv.into_int_value();
+            let ready = self.builder.build_int_compare(IntPredicate::SGE, rv, i32t.const_zero(), "sel_ready")?;
+            self.builder.build_conditional_branch(ready, done, pend)?;
+            self.position(pend);
+            self.gen_suspend(false, true)?;
+            self.builder.build_unconditional_branch(head)?;
+            self.position(done);
+            rv
+        } else {
+            let fv = self.rt_decl("__mtn_chan_select", Some(i32t.into()), &[ptrt.into(), i32t.into(), ptrt.into()]);
+            let c = self.builder.build_call(fv, &[chs.into(), n_const.into(), outs.into()], "sel")?;
+            let ValueKind::Basic(rv) = c.try_as_basic_value() else { return Err(CgErr("internal: select returns nothing".into())) };
+            rv.into_int_value()
+        };
+        let idx = self.builder.build_right_shift(r, i32t.const_int(1, false), false, "sel_idx")?;
+        let got = self.builder.build_and(r, i32t.const_int(1, false), "sel_got")?;
+        let slot = if is_unit_like(&ty) || ty == Ty::Never { None } else { Some(self.alloca_ty(&ty, "select")?) };
+        let merge = self.new_block("select_end");
+        let arm_bbs: Vec<BasicBlock<'ctx>> = arms.iter().map(|_| self.new_block("sel_arm")).collect();
+        let dispatch_bb = self.builder.get_insert_block().ok_or_else(|| CgErr("internal: no insert block".into()))?;
+        let unreachable_bb = self.new_block("sel_unreachable");
+        self.builder.position_at_end(unreachable_bb);
+        self.builder.build_unreachable()?;
+        self.builder.position_at_end(dispatch_bb);
+        let cases: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = arm_bbs.iter().enumerate().map(|(i, b)| (i32t.const_int(i as u64, false), *b)).collect();
+        self.builder.build_switch(idx, unreachable_bb, &cases)?;
+        for (i, a) in arms.iter().enumerate() {
+            self.position(arm_bbs[i]);
+            self.push_scope();
+            let opt_ty = Ty::OptionTy(Box::new(elems[i].clone()));
+            let res = (|| -> R<()> {
+                let opt = self.recv_result(got, out_slots[i], &elems[i], &opt_ty)?;
+                let place = self.spill_owned(opt, &opt_ty)?;
+                let mut binds = Vec::new();
+                self.pat_test(&a.pattern, place, &opt_ty, &mut binds, false)?;
+                let pending = self.materialize(binds)?;
+                self.commit_binds(pending)?;
+                let bty = self.ty_of(&a.body)?;
+                let v = self.expr(&a.body)?;
+                let bty = if self.dead { Ty::Never } else { bty };
+                if let (Some(s), true) = (slot, bty != Ty::Never) {
+                    self.builder.build_store(s, v)?;
+                }
+                self.emit_top_frame_if_live()?;
+                self.builder.build_unconditional_branch(merge)?;
+                Ok(())
+            })();
+            self.pop_scope(false)?;
+            res?;
+        }
+        self.position(merge);
+        match slot {
+            Some(s) => self.load(s, &ty),
+            None => Ok(self.unit()),
+        }
+    }
 }
