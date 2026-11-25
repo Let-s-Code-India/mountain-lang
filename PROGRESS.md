@@ -32,7 +32,7 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 
 ## Current state at a glance (consolidated by the manager, 2026-11-16)
 
-**Phases 1–12 are 🟢 (real CI logs). Phase 13 is in progress (M0–M3 accepted, M4 delivered). Phases 14–25 are ⚪ not started.** Latest confirmed CI run (Phase 12 final, 2026-11-16): **937 tests passed, 0 failed, 0 warnings, 36 `test result:` lines (35 test binaries + doc-tests); smoke tests green (`mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`, `checked 67 file(s), 0 errors`, `Hello, Mountain!`); valgrind steps green on all 9 `examples/memory/` and all 15 `examples/concurrency/` programs.**
+**Phases 1–12 are 🟢 (real CI logs). Phase 13 is in progress (M0–M4 done). Phases 14–25 are ⚪ not started.** Latest confirmed CI run (Phase 12 final, 2026-11-16): **937 tests passed, 0 failed, 0 warnings, 36 `test result:` lines (35 test binaries + doc-tests); smoke tests green (`mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`, `checked 67 file(s), 0 errors`, `Hello, Mountain!`); valgrind steps green on all 9 `examples/memory/` and all 15 `examples/concurrency/` programs.**
 
 | Phase | Status | Confirmed by (real CI) |
 |---|---|---|
@@ -48,7 +48,7 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 | 10 LLVM codegen + native backend | 🟢 | 278 |
 | 11a / 11b / 11c Memory management + codegen foundations | 🟢 | 308 / 413 / 603 (+ valgrind step) |
 | 12 Closures, generators, async, concurrency | 🟢 | 660 (M0) / 713 (M1) / 754 (M2) / 800 (M3) / 857 (M4) / 922 (M5) / **937 (final)**; valgrind on 9 + 15 programs; 10,000-task load test green in CI |
-| 13 Language completions, atomics, locks, channels, select, lock-free | 🟡 in progress: M0–M3 accepted by the manager; M4 (`select`, `join` fix, TSAN in CI) delivered: 1095 tests, 0 warnings, valgrind 19 memory + 34 concurrency programs; M5, M6 to do | — |
+| 13 Language completions, atomics, locks, channels, select, lock-free | 🟡 in progress: M0–M4 (`select`, `join` fix, TSAN in CI) confirmed by real CI: 1095 tests, 0 warnings, 41 result lines, valgrind 19 memory + 34 concurrency programs, TSAN 3/3 clean; M5, M6 to do | — |
 | 14–25 | ⚪ | — |
 
 **Session practice (owner decision 2026-11-08):** one fresh chat per phase, and the previous phase's chat is deleted after the manager has approved that phase. The coding assistant keeps this file current while it works; the manager does one final consolidation per phase (this section and the two registers below). Per-phase work files (`WORKLOG_*.md`) are scratch notes: this file is the record.
@@ -2543,7 +2543,7 @@ Per-binary counts: lib 60, assoc_types 8, borrow_checks 19, c1_carryover 40, c2_
 **Exact CI expectations (job `build-and-test`):** step "Run tests": 36 `test result: ok` lines, grand total **937 passed, 0 failed**, 0 warnings; smoke step `cargo run -- --version` prints `mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`; `mtnc check examples` -> `checked 67 file(s), 0 errors` and hello -> `Hello, Mountain!`; "Memory examples under valgrind": 9 programs clean; "Concurrency examples under valgrind": 15 programs, each line `valgrind clean: examples/concurrency/<name>.mtn`. Load-test numbers to look for are printed only locally (the test is silent in CI unless run with `--nocapture`): `rt: workers=4 spawned=10000 completed=10000 peak_live=10000`.
 **Flagged for the manager (M6):** (1) §6 matrix: checked by the manager, complete. (2) The load test relies on a 2.5 s first sleep (see 3); it passed in the real CI run. (3) ThreadSanitizer covers the runtime only. (4) Manager decision 2026-11-16: Phase 12 is 🟢. **Files changed (M6):** `src/types.rs` (`f::<T>` value, actor message wording), `src/mono.rs`, `src/codegen.rs`, `src/main.rs` (banner); tests `tests/phase12_m6.rs` (new), `tests/phase12_m5.rs` (2 expectations), `tests/c7_final.rs` (1 example); `examples/generic_fn_value.mtn` (new); `README.md`, `PROGRESS.md`, `WORKLOG_12.md`. `ci.yml` unchanged.
 
-## Phase 13 — 🟡 IN PROGRESS (M0, M1, M2, M3 accepted; M4 delivered as `checkpoint-M4.zip`). Work notes: `WORKLOG_13.md`
+## Phase 13 — 🟡 IN PROGRESS (M0–M4 accepted by the manager on 2026-11-25; M5 next). Work notes: `WORKLOG_13.md`
 
 ### M0 — language completions (checkpoint-M0)
 1. **Baseline:** 937 tests passed, 0 failed, 0 warnings before any change (fresh `cargo test`).
