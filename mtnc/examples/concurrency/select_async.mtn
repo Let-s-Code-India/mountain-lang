@@ -1,0 +1,48 @@
+// `await select { .. }` inside an `async fn` (Doc 12 §11.13): the task suspends until one of the channels can
+// proceed and holds no worker meanwhile. Two async producers feed two channels; the consumer serves whichever
+// has a value. A closed channel is "ready" with `None` forever, and when several arms are ready the first in
+// source order wins, so on `None` the consumer stops selecting and drains the other channel.
+async fn produce(tx: Sender<i64>, from: i64, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        await tx.send(from + i);
+        i = i + 1;
+    }
+    n
+}
+
+async fn drain(rx: Receiver<i64>) -> i64 {
+    let mut sum: i64 = 0;
+    loop {
+        match await rx.recv() {
+            Some(v) => { sum = sum + v; }
+            None => { break; }
+        }
+    }
+    sum
+}
+
+async fn main() {
+    let (atx, arx) = channel::<i64>(2);
+    let (btx, brx) = channel::<i64>(2);
+    let pa = spawn produce(atx, 0, 200);
+    let pb = spawn produce(btx, 1000, 100);
+
+    let mut a_sum: i64 = 0;
+    let mut b_sum: i64 = 0;
+    loop {
+        await select {
+            case a = <-arx: match a {
+                Some(v) => { a_sum = a_sum + v; }
+                None => { b_sum = b_sum + await drain(brx); break; }
+            },
+            case b = <-brx: match b {
+                Some(v) => { b_sum = b_sum + v; }
+                None => { a_sum = a_sum + await drain(arx); break; }
+            },
+        }
+    }
+    println(await pa + await pb);
+    println(a_sum);
+    println(b_sum);
+}

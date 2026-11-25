@@ -1,0 +1,53 @@
+// `select` waits on several channels and runs the arm of the first one that can proceed (Doc 12 §6.1,
+// §11.13). Here a spawned task produces "orders" and a dedicated OS thread produces "ticks"; one consumer
+// handles whichever arrives first. The bound name is an `Option<T>`: `None` means that channel is closed (its
+// sender is gone). If several arms are ready the first in source order wins. Which source is served first is
+// up to the scheduler, so the program prints only totals, which are always the same.
+fn orders(tx: Sender<i64>, n: i64) -> i64 {
+    let mut i: i64 = 1;
+    while i <= n {
+        tx.send(i);
+        i = i + 1;
+    }
+    n
+}
+
+// the rest of a channel that is still open once the other one has closed
+fn rest(rx: Receiver<i64>) -> i64 {
+    let mut sum: i64 = 0;
+    loop {
+        match rx.recv() {
+            Some(v) => { sum = sum + v; }
+            None => { break; }
+        }
+    }
+    sum
+}
+
+fn main() {
+    let (otx, orx) = channel::<i64>(4);
+    let (ttx, trx) = channel::<i64>(4);
+    let p1 = spawn move { orders(otx, 100) };
+    let p2 = thread::spawnOS(move || orders(ttx, 50));
+
+    let mut order_sum: i64 = 0;
+    let mut tick_sum: i64 = 0;
+    loop {
+        select {
+            case o = <-orx: match o {
+                Some(v) => { order_sum = order_sum + v; }
+                None => { tick_sum = tick_sum + rest(trx); break; }
+            },
+            case t = <-trx: match t {
+                Some(v) => { tick_sum = tick_sum + v; }
+                None => { order_sum = order_sum + rest(orx); break; }
+            },
+        }
+    }
+    p1.join();
+    p2.join();
+    print("orders, sum: ");
+    println(order_sum);
+    print("ticks, sum: ");
+    println(tick_sum);
+}
