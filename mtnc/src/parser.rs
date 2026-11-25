@@ -1951,8 +1951,14 @@ impl Parser {
         self.expect_delim(Delim::LBrace)?;
         let mut arms = Vec::new();
         while !self.check_delim(Delim::RBrace) {
+            if self.check_kw(Keyword::Default) {
+                return self.error("a `default` arm in `select` is not supported in Mountain 1.0 (Document 12 §11.13 item 5); poll with `tryRecv` in a loop instead");
+            }
             self.expect_kw(Keyword::Case)?;
             let pattern = self.parse_pattern()?;
+            if self.check_op(Op::Lt) {
+                return self.error("send arms (`case tx <- v: ..`) in `select` are not supported in Mountain 1.0 (Document 12 §11.13 item 5); an arm is written `case v = <-rx: ..`");
+            }
             self.expect_op(Op::Eq)?;
             // '<-' is lexed as two tokens: Lt then Minus (no combined
             // token for it in the Phase 1 lexer -- Document 2 doesn't

@@ -78,8 +78,8 @@ fn inject_prelude(program: &mut crate::ast::Program) {
 }
 
 /// Document 12 §11.8 gate for names that arrive in Phase 13. `Atomic` (M1) and `Mutex`, `RwLock`,
-/// `Spinlock` (M2) are implemented, so the list is empty; `channel` and `select` (M3/M4) and
-/// `volatile` (M6) are still reported where they are used. A program that declares its own item of
+/// `Spinlock` (M2), `channel` (M3) and `select` (M4) are implemented, so the name list is empty; only
+/// `volatile` (M6) is still reported where it is used. A program that declares its own item of
 /// a listed name (`struct X`, `fn X`, ...) is left alone.
 fn phase13_names(tokens: &[crate::token::Token]) -> Vec<String> {
     use crate::token::{Keyword, TokenKind};

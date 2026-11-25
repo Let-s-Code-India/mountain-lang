@@ -1653,7 +1653,22 @@ impl<'a> FnChecker<'a> {
                 }
                 self.check_task_closure(inner, "spawn");
             }
-            Expr::Select(_) | Expr::Query(_) => {}
+            Expr::Select(arms) => {
+                // each arm only BORROWS its receiver (a read, never a move); the arm binds an `Option<T>`
+                for a in arms {
+                    self.check_expr(&a.channel_expr, block, idx);
+                }
+                self.branch_join(arms.len(), |this, i| {
+                    let arm = &arms[i];
+                    let copy = this.checker.tuple_copy.get(&(&arm.channel_expr as *const Expr as usize)).and_then(|v| v.first().copied());
+                    this.scopes.push(Scope::default());
+                    this.declare_pattern_bindings(&arm.pattern, copy, None);
+                    this.check_branch_expr(&arm.body);
+                    this.scopes.pop();
+                    expr_diverges(&arm.body, !this.break_acc.is_empty())
+                });
+            }
+            Expr::Query(_) => {}
         }
     }
 

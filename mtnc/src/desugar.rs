@@ -137,6 +137,13 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
                 out.push(ChildMut::E(x));
             }
         }
+        // Phase 13 M4: the receivers and the arm bodies of a `select`
+        Expr::Select(arms) => {
+            for a in arms.iter_mut() {
+                out.push(ChildMut::E(&mut a.channel_expr));
+                out.push(ChildMut::E(&mut a.body));
+            }
+        }
         Expr::ArrayRepeat(x, n) => {
             out.push(ChildMut::E(x));
             out.push(ChildMut::E(n));
@@ -228,6 +235,12 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter() {
                 out.push(Child::E(x));
+            }
+        }
+        Expr::Select(arms) => {
+            for a in arms.iter() {
+                out.push(Child::E(&a.channel_expr));
+                out.push(Child::E(&a.body));
             }
         }
         Expr::ArrayRepeat(x, n) => {

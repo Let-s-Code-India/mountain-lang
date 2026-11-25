@@ -1148,6 +1148,8 @@ pub struct TypeChecker {
     chan_ops: std::collections::HashSet<usize>,
     /// the channel call that is the operand of the `await` being checked
     awaited_chan: Option<usize>,
+    /// For each `select` arm (keyed by its receiver expression): whether the `Option<T>` it binds is `Copy` (Phase 13 M4).
+    select_copy: HashMap<usize, bool>,
     /// Calls that return a lock guard (`lock`, `tryRead`, ..): the borrow checker ties the guard to its lock.
     guard_exprs: std::collections::HashSet<usize>,
     /// Phase 9: set whenever a call/method/path/field/await fell back to
@@ -1462,6 +1464,7 @@ impl TypeChecker {
             join_receivers: std::collections::HashSet::new(),
             chan_ops: std::collections::HashSet::new(),
             awaited_chan: None,
+            select_copy: HashMap::new(),
             guard_exprs: std::collections::HashSet::new(),
             functions: HashMap::new(),
             traits: HashMap::new(),
@@ -4099,7 +4102,8 @@ impl TypeChecker {
                 self.check_try_catch(expr as *const Expr as usize, try_block, catch_var, catch_block, expected, env, ctx)
             }
             Expr::Spawn(inner) => self.check_task_spawn(inner, "spawn", env, ctx),
-            Expr::Select(_) | Expr::Query(_)
+            Expr::Select(arms) => self.check_select(expr as *const Expr as usize, arms, expected, env, ctx),
+            Expr::Query(_)
             | Expr::Styled { .. } | Expr::Layout { .. }
             | Expr::ComponentChildren { .. } | Expr::EventHandler { .. } => {
                 expected.cloned().unwrap_or(Ty::Unit)
@@ -4815,6 +4819,81 @@ impl TypeChecker {
             "recv" | "tryRecv" => Ty::OptionTy(Box::new(elem)),
             _ => handle.clone(),
         }
+    }
+
+    /// `select { case v = <-rx1: e1, case w = <-rx2: e2 }` (Document 12 §6.1, §11.13 item 5; Document 23 §9).
+    /// Every arm waits on a `Receiver<T>` (behind references, `Box`, `Rc` or `Arc` is fine: the arm only borrows
+    /// it) and binds an `Option<T>` (`None` = that channel is closed). The arms share one result type.
+    fn check_select(&mut self, addr: usize, arms: &[SelectArm], expected: Option<&Ty>, env: &mut Env, ctx: &str) -> Ty {
+        self.chan_ops.insert(addr);
+        if arms.is_empty() {
+            self.errors.push(TypeError { message: "`select` needs at least one `case v = <-rx: expr` arm (Document 12 §6.1)".into(), context: ctx.into() });
+            return Ty::Unit;
+        }
+        // inside an `async fn` the blocking form is written `await select { .. }` (Document 12 §11.13 items 4 and 5)
+        if self.cur_async_fn.is_some() && self.awaited_chan != Some(addr) {
+            self.errors.push(TypeError {
+                message: "`select` blocks the worker: inside an `async fn` write `await select { .. }`, which suspends the task instead (Document 12 §11.13)".into(),
+                context: ctx.into(),
+            });
+        }
+        let mut common: Option<Ty> = expected.cloned();
+        let mut all_diverge = true;
+        for arm in arms {
+            let ct = self.check_expr(&arm.channel_expr, None, env, ctx);
+            let ct = self.zonk(&ct);
+            let mut t = ct.clone();
+            loop {
+                match t {
+                    Ty::Ref(_, i) => t = *i,
+                    Ty::Generic(ref n, ref a) if matches!(n.as_str(), "Box" | "Rc" | "Arc") && !a.is_empty() => match &a[0] {
+                        GenericArg::Type(x) => t = x.clone(),
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+            let elem = if crate::channels::is_chan(&t) && !crate::channels::is_sender(&t) {
+                crate::channels::elem_of(&t)
+            } else {
+                if !ty_has_infer(&ct) && ct != Ty::Never {
+                    let hint = if crate::channels::is_sender(&t) { " (a `Sender` cannot be waited on; there are no send arms in 1.0, Document 12 §11.13)" } else { "" };
+                    self.errors.push(TypeError {
+                        message: format!("a `select` arm waits on a `Receiver<T>` (`case v = <-rx: ..`), found `{}`{}", ct, hint),
+                        context: ctx.into(),
+                    });
+                }
+                None
+            };
+            let opt = Ty::OptionTy(Box::new(elem.clone().unwrap_or(Ty::Unit)));
+            self.select_copy.insert(&arm.channel_expr as *const Expr as usize, self.is_copy_ty(&opt));
+            env.push();
+            match &arm.pattern {
+                Pattern::Ident(_) | Pattern::Mut(_) | Pattern::Wildcard => self.bind_pattern(&arm.pattern, &opt, env, false),
+                _ => self.errors.push(TypeError {
+                    message: "a `select` arm binds the whole `Option<T>` to a name or `_` (`case v = <-rx: ..`); `match` on it inside the arm (Document 12 §11.13)".into(),
+                    context: ctx.into(),
+                }),
+            }
+            let body_ty = self.check_expr(&arm.body, common.as_ref(), env, ctx);
+            env.pop();
+            if body_ty == Ty::Never {
+                continue;
+            }
+            all_diverge = false;
+            match &common {
+                Some(c) if *c != body_ty => self.errors.push(TypeError {
+                    message: format!("`select` arms have incompatible types: `{}` and `{}` (Document 5 rule 5: no cross-branch guessing)", c, body_ty),
+                    context: ctx.into(),
+                }),
+                None => common = Some(body_ty),
+                _ => {}
+            }
+        }
+        if all_diverge && common.is_none() {
+            return Ty::Never;
+        }
+        common.unwrap_or(Ty::Unit)
     }
 
     /// Methods of `Atomic<T>` (Document 14 §9.4). All take `borrow self`.
@@ -6288,6 +6367,7 @@ impl TypeChecker {
                 Ty::Tuple(ts) => Some((*k, ts.iter().map(|x| self.is_copy_ty(x)).collect())),
                 _ => None,
             })
+            .chain(self.select_copy.iter().map(|(k, c)| (*k, vec![*c])))
             .collect()
     }
 
