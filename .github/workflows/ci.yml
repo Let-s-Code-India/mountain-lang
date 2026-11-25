@@ -58,6 +58,12 @@ jobs:
         # (the web upload loses the executable bit).
         run: bash scripts/valgrind_concurrency_examples.sh target/debug/mtnc
 
+      - name: Runtime locks, channels and select under ThreadSanitizer, AddressSanitizer and UBSan
+        # Phase 13: mtn_rt.c is compiled with -fsanitize=thread and driven by tests/tsan/rt_harness.c
+        # (3 runs), then with address+undefined sanitizers (1 run). Fails on any warning or non-zero
+        # exit. `bash` on purpose (the web upload loses the executable bit).
+        run: bash scripts/tsan_runtime.sh
+
       - name: Smoke test — mtnc --version
         run: cargo run -- --version
 
