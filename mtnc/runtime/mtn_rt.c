@@ -10,8 +10,9 @@
  *  - Workers: `MTN_WORKERS` threads (default: online CPUs, minimum 1), each with its own deque.
  *    A worker pops the BACK of its own deque and steals from the FRONT of the others'.
  *    All deques are guarded by one mutex (`g_mu`); idle workers sleep on a condition variable.
- *  - A `join` made by a worker does not block the worker: it runs other queued tasks until the
- *    awaited one is done ("helping join"), so nested `spawn` + `join` cannot starve the pool.
+ *  - A `join` made by a worker runs the awaited task itself when it is still queued; otherwise the worker waits
+ *    and the pool starts a compensating extra worker (see __mtn_rt_join), so nested `spawn` + `join` cannot
+ *    starve the pool. It never runs unrelated tasks on the joiner's stack (Phase 13 M4, register 52).
  *  - Worker and OS-thread stack size: 8 MiB (set explicitly, not left to the platform default).
  *  - At exit (`__mtn_rt_shutdown`) the runtime waits for every spawned task (including tasks
  *    spawned by tasks) and every OS thread, then joins and frees everything.
@@ -52,8 +53,8 @@
  *    counts itself in and leaves the gate; a writer holds the gate and waits for the count to reach 0. Readers
  *    that arrive while a writer waits queue behind it at the gate, so a stream of readers cannot starve a writer,
  *    and a stream of writers cannot starve a reader.
- *  - A thread that holds a lock never runs OTHER queued tasks from a helping `join` (see __mtn_rt_join): such a
- *    task could block on that very lock, below the holder on the same stack, forever.
+ *  - `join` never runs OTHER queued tasks on its stack (see __mtn_rt_join), so a thread that holds a lock cannot
+ *    be put below a task that blocks on that very lock.
  *  - Not re-entrant: locking a lock the thread already holds deadlocks (Document 14 §9.5).
  *  - A waiter blocks its thread (a pool worker included); critical sections should be short (Doc 14 §7).
  */
@@ -516,20 +517,50 @@ void __mtn_rt_actor_send(void *actor, void *msg) {
     pthread_mutex_unlock(&g_mu);
 }
 
-/* `h.join()`: waits for the task, moves its result into `out`, releases the handle. */
+/* A pool worker is about to sleep (it cannot run tasks while it does): the pool keeps at least `g_nworkers`
+   workers that are not blocked, starting an extra worker thread (they stay until shutdown) while fewer are
+   available. Caller holds g_mu. At most MAX_EXTRA extras exist; beyond that a blocked worker simply sleeps. */
+static void comp_block_locked(void) {
+    if (!t_is_pool) return;
+    g_blocked++;
+    while (g_extra < g_blocked && g_extra < MAX_EXTRA) {
+        if (g_extra == g_capx) {
+            g_capx = g_capx ? g_capx * 2 : 16;
+            g_xthreads = realloc(g_xthreads, (size_t)g_capx * sizeof(pthread_t));
+            if (!g_xthreads) rt_die("runtime: out of memory\n");
+        }
+        /* a compensating worker shares a deque index with an original worker (deques are guarded by g_mu) */
+        spawn_thread(&g_xthreads[g_extra], worker_main, (void *)(intptr_t)(g_extra % g_nworkers));
+        g_extra++;
+    }
+}
+
+static void comp_unblock_locked(void) {
+    if (t_is_pool) g_blocked--;
+}
+
+/* `h.join()`: waits for the task, moves its result into `out`, releases the handle.
+ *
+ * Phase 13 M4 (register 52). If the awaited task is still queued, the joiner runs exactly THAT task itself
+ * (it would otherwise sit in a queue until some worker reached it). It never runs any other queued task on its
+ * stack: such a task could be a channel consumer waiting for something the joiner does only AFTER the join
+ * returns, and sitting above the joiner on the same stack it could never let the joiner continue (stack
+ * inversion). If the awaited task is already running elsewhere (or is a suspended future), the joiner waits;
+ * a pool worker that waits is compensated like a worker blocked in a channel operation (comp_block_locked), so
+ * nested spawn + join still works with MTN_WORKERS=1 and the other tasks keep running. */
 void __mtn_rt_join(void *h, void *out) {
     Task *t = h;
     pthread_mutex_lock(&g_mu);
     while (!t->done) {
-        /* A worker that holds a lock may only run the awaited task itself: any other task could block on
-           that lock and never return to the frame that holds it. */
-        Task *other = t_worker < 0 ? NULL : (t_locks_held == 0 ? take_task(t_worker) : take_specific(t));
-        if (other) {
+        Task *mine = t_worker < 0 ? NULL : take_specific(t);
+        if (mine) {
             pthread_mutex_unlock(&g_mu);
-            run_task(other);
+            run_task(mine);
             pthread_mutex_lock(&g_mu);
         } else {
+            comp_block_locked();
             pthread_cond_wait(&g_cv, &g_mu);
+            comp_unblock_locked();
         }
     }
     t->handle_alive = 0;
@@ -1066,6 +1097,21 @@ typedef struct ChNode {
     /* the payload starts at `doff` */
 } ChNode;
 
+/* A `select` that waits on several channels registers one SelReg per arm in each channel's `rsel` list.
+   A synchronous select sleeps on its SelWaiter (`w`); an async select is woken as a task (`task`). */
+typedef struct SelWaiter {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int signaled;
+} SelWaiter;
+
+typedef struct SelReg {
+    struct Chan *c;          /* the channel this registration sits in, or NULL when not registered */
+    Task *task;              /* async: the task to wake */
+    SelWaiter *w;            /* sync: the waiter to signal */
+    struct SelReg *next;
+} SelReg;
+
 typedef struct Chan {
     size_t esize, ealign, doff, cellsz, cap; /* cap = ring cells (at least 2) */
     size_t lim;                              /* the logical capacity the program asked for (1 <= lim <= cap) */
@@ -1081,6 +1127,7 @@ typedef struct Chan {
     pthread_mutex_t mu;                    /* protects the wait lists and is held across cond_wait */
     pthread_cond_t cv_r, cv_s;
     Task *rq, *sq;                         /* async tasks waiting to receive / to send */
+    struct SelReg *rsel;                   /* `select` registrations waiting for a message or for the close (under mu) */
 } Chan;
 
 static size_t ch_align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
@@ -1328,11 +1375,29 @@ static void ch_wake_list(Chan *c, Task **list, atomic_int *counter) {
  * All four accesses are seq_cst, so they sit in one total order: either the notifier sees the waiter (and wakes
  * it, taking `mu`, which the waiter holds until it is really asleep in cond_wait) or the waiter sees the message
  * and does not sleep. Closing a side uses the same pattern (`senders` / `receivers` are seq_cst). */
+/* Wakes the `select`s registered on `c` (caller holds c->mu). The registration stays; its owner removes it
+   after it wakes (sel_unreg). A synchronous select's flag persists, so a signal sent before it sleeps is kept. */
+static void ch_wake_sel(Chan *c) {
+    for (SelReg *r = c->rsel; r; r = r->next) {
+        if (r->w) {
+            pthread_mutex_lock(&r->w->mu); /* lock order: c->mu, then w->mu */
+            r->w->signaled = 1;
+            pthread_cond_signal(&r->w->cv);
+            pthread_mutex_unlock(&r->w->mu);
+        } else if (r->task) {
+            pthread_mutex_lock(&g_mu); /* lock order: c->mu, then g_mu */
+            wake(r->task);
+            pthread_mutex_unlock(&g_mu);
+        }
+    }
+}
+
 static void ch_notify_recv(Chan *c) {
     if (atomic_load_explicit(&c->r_waiters, memory_order_seq_cst) == 0) return; /* fast path: nobody is waiting */
     pthread_mutex_lock(&c->mu);
     pthread_cond_broadcast(&c->cv_r);
     ch_wake_list(c, &c->rq, &c->r_waiters);
+    ch_wake_sel(c);
     pthread_mutex_unlock(&c->mu);
 }
 
@@ -1388,24 +1453,14 @@ static int ch_send_closed(Chan *c) { return atomic_load_explicit(&c->receivers, 
 static void comp_enter(void) {
     if (!t_is_pool) return;
     pthread_mutex_lock(&g_mu);
-    g_blocked++;
-    while (g_extra < g_blocked && g_extra < MAX_EXTRA) {
-        if (g_extra == g_capx) {
-            g_capx = g_capx ? g_capx * 2 : 16;
-            g_xthreads = realloc(g_xthreads, (size_t)g_capx * sizeof(pthread_t));
-            if (!g_xthreads) rt_die("runtime: out of memory\n");
-        }
-        /* a compensating worker shares a deque index with an original worker (deques are guarded by g_mu) */
-        spawn_thread(&g_xthreads[g_extra], worker_main, (void *)(intptr_t)(g_extra % g_nworkers));
-        g_extra++;
-    }
+    comp_block_locked();
     pthread_mutex_unlock(&g_mu);
 }
 
 static void comp_leave(void) {
     if (!t_is_pool) return;
     pthread_mutex_lock(&g_mu);
-    g_blocked--;
+    comp_unblock_locked();
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -1570,3 +1625,114 @@ int __mtn_chan_recv_poll(void *p, void *out) {
     }
     return st == 3 ? 0 : 2;
 }
+
+/* ---- select (Phase 13 M4; Document 12 §6.1, §11.13 item 5) ---------------------------------------- */
+
+/* One scan over the arms in SOURCE ORDER; the first arm that is ready wins and the arms after it are not
+   touched (losing arms consume nothing). An arm is ready when a message can be taken from its channel (result
+   `idx*2 + 1`, the message is in outs[idx]) or when its channel is closed and empty (`idx*2`: `None`).
+   -1 = no arm is ready. `sc` = 1 for the re-check that completes a registration (seq_cst, see ch_notify_recv). */
+static int sel_scan(void **chs, int n, void **outs, int sc) {
+    for (int i = 0; i < n; i++) {
+        Chan *c = chs[i];
+        if (ch_pop(c, outs[i], sc)) {
+            ch_notify_send(c);
+            return i * 2 + 1;
+        }
+        if (ch_recv_closed(c)) { /* every sender is gone: whatever they sent is visible now, take it first */
+            if (ch_pop(c, outs[i], 1)) {
+                ch_notify_send(c);
+                return i * 2 + 1;
+            }
+            return i * 2;
+        }
+    }
+    return -1;
+}
+
+/* Registers `r` on `c`. The counter increment is the first half of the lost-wakeup handshake (see ch_notify_recv):
+   the caller re-scans (seq_cst) AFTER registering on every channel. */
+static void sel_reg(SelReg *r, Chan *c, Task *task, SelWaiter *w) {
+    pthread_mutex_lock(&c->mu);
+    r->c = c;
+    r->task = task;
+    r->w = w;
+    r->next = c->rsel;
+    c->rsel = r;
+    atomic_fetch_add_explicit(&c->r_waiters, 1, memory_order_seq_cst);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void sel_unreg(SelReg *r) {
+    Chan *c = r->c;
+    if (!c) return;
+    pthread_mutex_lock(&c->mu);
+    for (SelReg **pp = &c->rsel; *pp; pp = &(*pp)->next)
+        if (*pp == r) {
+            *pp = r->next;
+            break;
+        }
+    atomic_fetch_sub_explicit(&c->r_waiters, 1, memory_order_seq_cst);
+    pthread_mutex_unlock(&c->mu);
+    r->c = NULL;
+    r->next = NULL;
+}
+
+/* Blocking `select` over `n` receivers: returns `idx*2 + got` (see sel_scan). `chs[i]` is arm i's channel and
+   `outs[i]` the slot its message is written to. Spins briefly, then registers on every channel and sleeps (a
+   pool worker is compensated while it sleeps, like any blocked channel operation, register 51). */
+int __mtn_chan_select(void **chs, int n, void **outs) {
+    for (int spin = 0;;) {
+        int r = sel_scan(chs, n, outs, 0);
+        if (r >= 0) return r;
+        if (spin < CH_SPIN) {
+            spin++;
+            cpu_relax();
+            continue;
+        }
+        SelWaiter w;
+        pthread_mutex_init(&w.mu, NULL);
+        pthread_cond_init(&w.cv, NULL);
+        w.signaled = 0;
+        SelReg *regs = calloc((size_t)n, sizeof(SelReg));
+        if (!regs) rt_die("runtime: out of memory\n");
+        for (int i = 0; i < n; i++) sel_reg(&regs[i], chs[i], NULL, &w);
+        r = sel_scan(chs, n, outs, 1); /* the second half of the handshake: every channel was registered first */
+        if (r < 0) {
+            pthread_mutex_lock(&w.mu);
+            if (!w.signaled) {
+                comp_enter();
+                while (!w.signaled) pthread_cond_wait(&w.cv, &w.mu);
+                comp_leave();
+            }
+            pthread_mutex_unlock(&w.mu);
+        }
+        for (int i = 0; i < n; i++) sel_unreg(&regs[i]);
+        free(regs);
+        pthread_mutex_destroy(&w.mu);
+        pthread_cond_destroy(&w.cv);
+        if (r >= 0) return r;
+        spin = CH_SPIN; /* woken: scan again, without spinning first */
+    }
+}
+
+/* `await select { .. }`: `regs` points at `n` zero-initialised SelReg slots that live in the async frame.
+   Returns `idx*2 + got`, or -1 = pending (the registrations are in place: the frame must suspend and call again). */
+int __mtn_chan_select_poll(void **chs, int n, void **outs, void *regs_) {
+    SelReg *regs = regs_;
+    Task *me = t_cur;
+    if (!me) rt_die("runtime: `await` of a channel operation outside a task\n");
+    for (int i = 0; i < n; i++) sel_unreg(&regs[i]); /* a re-poll starts clean */
+    int r = sel_scan(chs, n, outs, 0);
+    if (r >= 0) return r;
+    for (int i = 0; i < n; i++) sel_reg(&regs[i], chs[i], me, NULL);
+    r = sel_scan(chs, n, outs, 1);
+    if (r >= 0) {
+        for (int i = 0; i < n; i++) sel_unreg(&regs[i]);
+        return r;
+    }
+    return -1;
+}
+
+/* the size of one registration slot, for the compiler's frame allocation */
+size_t __mtn_sel_reg_size(void) { return sizeof(SelReg); }
