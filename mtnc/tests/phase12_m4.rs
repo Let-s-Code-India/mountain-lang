@@ -104,9 +104,11 @@ fn channel_is_no_longer_gated_by_phase13() {
     rejects("fn main() { let (tx, rx) = channel(); }", "`channel` needs its message type: write `channel::<T>()`");
 }
 
+// Phase 13 M4 implemented `select`: the old gate is gone (tests/phase13_m4.rs covers it).
 #[test]
-fn phase13_select() {
-    rejects("fn main() { select { } }", "`select` (channels) is not yet supported by codegen — Phase 13");
+fn select_is_no_longer_gated_by_phase13() {
+    assert_eq!(out("fn main() { let (tx, rx) = channel::<i32>(2); tx.send(5); println(select { case v = <-rx: match v { Some(x) => x, None => 0 }, }); }"), "5\n");
+    rejects("fn main() { select { } }", "`select` needs at least one");
 }
 
 #[test]

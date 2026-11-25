@@ -493,8 +493,8 @@ fn check_subcommand_runs_the_whole_front_end() {
 #[test]
 fn unsupported_features_give_clear_codegen_errors_not_crashes() {
     let cases = [
-        // `spawn` and `await` are supported since Phase 12, `Atomic`/locks since Phase 13 M1/M2; `select` (M4) is not yet
-        ("fn main() { select { } }\n", "Phase"),
+        // `spawn` and `await` are supported since Phase 12, `Atomic`/locks/`channel`/`select` since Phase 13 M1-M4; `volatile` (M6) is not yet
+        ("fn main() { let x = 1; volatile x; }\n", "Phase"),
     ];
     for (src, needle) in cases {
         let err = build_must_fail(src);
