@@ -1,0 +1,175 @@
+// Michael-Scott queue (Document 14 §3.2, §9.6), written in Mountain on Atomic<*mut Node<T>>, raw pointers,
+// alloc/dealloc and Arc. Follows the 1996 algorithm including the "help the lagging tail forward" step.
+//
+// ALGORITHM. The queue always holds one dummy node: `head` points at the dummy, the first real element is
+// head.next; `tail` points at the last node or, briefly, at the one before it (a lagging tail).
+//  * enqueue links the new node with a CAS on tail.next (null -> node: the linearisation point), then swings
+//    `tail` forward. If the thread is preempted between the two steps, `tail` lags; every other thread that
+//    sees tail.next != null first swings `tail` forward itself ("helping") and retries. That is what keeps
+//    the queue lock-free: a stalled enqueuer never blocks anybody.
+//  * dequeue swings `head` to head.next with a CAS (the linearisation point); the value is the one in the node
+//    that became the new dummy. If head == tail but tail.next != null it helps the tail forward first, so
+//    `head` never overtakes `tail`.
+//
+// MEMORY RECLAMATION AND ABA. No node is freed while the queue lives. A dequeued dummy stays linked behind
+// `head`; Drop walks the whole chain from the very first node (`first`) and frees it. Since no address is ever
+// reused during the run, a pointer value that is seen again is always the same node, so the ABA problem
+// (Document 14 §5) cannot occur for this queue: the mitigation is "no reuse", which is also why no tag is
+// needed here (the stack, which does recycle nodes, uses tagged words). The price is that memory grows with
+// the number of enqueues until the queue is dropped; a recycling queue needs a tag or hazard pointers.
+//
+// MEMORY ORDERINGS (each one, and why it is enough):
+//  * new node: next.store(null, Relaxed) and the value write happen before the linking CAS, which is Release,
+//    so any thread that reaches the node through an Acquire load sees them.
+//  * tail.load / head.load / next.load (Acquire): pair with the Release of the CAS that published the pointer
+//    they return, so everything written to that node before publication is visible.
+//  * tail.next CAS (AcqRel): Release publishes the node; Acquire on success keeps the successful enqueuer's
+//    view of the old tail consistent. On failure the derived failure ordering is Acquire (used by the retry).
+//  * tail CAS (Release): only moves `tail` along; whoever reads `tail` re-checks `next` with Acquire, so no
+//    stronger ordering is needed. Its failure is ignored on purpose: someone else (a helper) already advanced it.
+//  * head CAS (AcqRel): Acquire on success makes the new dummy's value (written by the enqueuer before its
+//    Release CAS) visible to the dequeuer that now owns it; Release publishes the new head to later loaders.
+//  * the value is read AFTER the head CAS succeeded: from then on only this thread may read it (nobody else
+//    ever reads a value of a node that is, or becomes, the dummy), so the plain read is not a race and works
+//    for non-Copy payloads too.
+struct Node<T> { next: Atomic<*mut Node<T>>, value: T }
+
+struct LockFreeQueue<T> { head: Atomic<*mut Node<T>>, tail: Atomic<*mut Node<T>>, first: usize }
+
+fn null_node<T>() -> *mut Node<T> { 0 as usize as *mut Node<T> }
+
+impl<T> LockFreeQueue<T> {
+    fn new() -> LockFreeQueue<T> {
+        unsafe {
+            let dummy = alloc(sizeOf::<Node<T>>(), alignOf::<Node<T>>()) as *mut Node<T>;
+            (*dummy).next.store(null_node::<T>(), Ordering::Relaxed);
+            LockFreeQueue { head: Atomic::new(dummy), tail: Atomic::new(dummy), first: dummy as usize }
+        }
+    }
+
+    fn enqueue(borrow self, value: T) {
+        unsafe {
+            let node = alloc(sizeOf::<Node<T>>(), alignOf::<Node<T>>()) as *mut Node<T>;
+            let vp = &mut (*node).value as *mut T;
+            vp.write(value);
+            (*node).next.store(null_node::<T>(), Ordering::Relaxed);
+            loop {
+                let tail = self.tail.load(Ordering::Acquire);
+                let next = (*tail).next.load(Ordering::Acquire);
+                if tail == self.tail.load(Ordering::Acquire) {
+                    if next.isNull() {
+                        // tail really is the last node: try to link ours behind it
+                        if (*tail).next.compareAndSwap(next, node, Ordering::AcqRel).isOk() {
+                            // swing tail to our node; if this fails somebody already helped
+                            self.tail.compareAndSwap(tail, node, Ordering::Release);
+                            return;
+                        }
+                    } else {
+                        // tail is lagging: help it forward, then retry
+                        self.tail.compareAndSwap(tail, next, Ordering::Release);
+                    }
+                }
+            }
+        }
+    }
+
+    fn dequeue(borrow self) -> Option<T> {
+        unsafe {
+            loop {
+                let head = self.head.load(Ordering::Acquire);
+                let tail = self.tail.load(Ordering::Acquire);
+                let next = (*head).next.load(Ordering::Acquire);
+                if head == self.head.load(Ordering::Acquire) {
+                    if head == tail {
+                        if next.isNull() { return None; }
+                        // tail is lagging behind a finished link: help it, then retry
+                        self.tail.compareAndSwap(tail, next, Ordering::Release);
+                    } else {
+                        if self.head.compareAndSwap(head, next, Ordering::AcqRel).isOk() {
+                            let vp = &mut (*next).value as *mut T;
+                            return Some(vp.read());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> Drop for LockFreeQueue<T> {
+    fn drop(borrow mut self) {
+        unsafe {
+            let head = self.head.load(Ordering::Acquire);
+            // retired dummies (before head): no value left in them
+            let mut n = self.first as *mut Node<T>;
+            while n != head {
+                let nx = (*n).next.load(Ordering::Acquire);
+                dealloc(n as *mut u8, sizeOf::<Node<T>>(), alignOf::<Node<T>>());
+                n = nx;
+            }
+            // the current dummy (its value was already taken) and then the nodes still holding values
+            let mut after = (*head).next.load(Ordering::Acquire);
+            dealloc(head as *mut u8, sizeOf::<Node<T>>(), alignOf::<Node<T>>());
+            while !after.isNull() {
+                let nx = (*after).next.load(Ordering::Acquire);
+                let vp = &mut (*after).value as *mut T;
+                dropInPlace(vp);
+                dealloc(after as *mut u8, sizeOf::<Node<T>>(), alignOf::<Node<T>>());
+                after = nx;
+            }
+        }
+    }
+}
+
+// producer `id` enqueues id * 1,000,000 + k for k = 0 .. n-1
+fn produce(q: Arc<LockFreeQueue<i64>>, id: i64, n: i64) -> i64 {
+    let mut k: i64 = 0;
+    while k < n {
+        q.enqueue(id * 1000000 + k);
+        k = k + 1;
+    }
+    n
+}
+
+// a consumer takes `want` items in all (shared with the others through `taken`) and returns their sum
+fn consume(q: Arc<LockFreeQueue<i64>>, taken: Arc<Atomic<i64>>, total: i64) -> i64 {
+    let mut sum: i64 = 0;
+    while taken.load(Ordering::Acquire) < total {
+        match q.dequeue() {
+            Some(v) => { sum = sum + v; taken.fetchAdd(1, Ordering::AcqRel); }
+            None => { sum = sum + 0; }
+        }
+    }
+    sum
+}
+
+fn main() {
+    let q: LockFreeQueue<i64> = LockFreeQueue::new();
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+    q.enqueue(1);
+    q.enqueue(2);
+    q.enqueue(3);
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+    q.enqueue(4);
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+    println(match q.dequeue() { Some(v) => v, None => -1 });
+
+    // two producer threads, two consumer threads
+    let shared: Arc<LockFreeQueue<i64>> = Arc::new(LockFreeQueue::new());
+    let taken: Arc<Atomic<i64>> = Arc::new(Atomic::new(0));
+    let p1 = shared.clone();
+    let p2 = shared.clone();
+    let c1 = shared.clone();
+    let c2 = shared.clone();
+    let k1 = taken.clone();
+    let k2 = taken.clone();
+    let tp1 = thread::spawnOS(move || produce(p1, 1, 25000));
+    let tp2 = thread::spawnOS(move || produce(p2, 2, 25000));
+    let tc1 = thread::spawnOS(move || consume(c1, k1, 50000));
+    let tc2 = thread::spawnOS(move || consume(c2, k2, 50000));
+    tp1.join();
+    tp2.join();
+    println(tc1.join() + tc2.join());
+}
