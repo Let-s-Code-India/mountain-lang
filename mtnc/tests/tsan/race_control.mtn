@@ -1,0 +1,17 @@
+fn bump(p: usize, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        unsafe { let q = p as *mut i64; *q = *q + 1; }
+        i = i + 1;
+    }
+    0
+}
+fn main() {
+    let mut cell: i64 = 0;
+    let addr = &mut cell as *mut i64 as usize;
+    let a = thread::spawnOS(move || bump(addr, 100000));
+    let b = thread::spawnOS(move || bump(addr, 100000));
+    a.join();
+    b.join();
+    println(cell);
+}
