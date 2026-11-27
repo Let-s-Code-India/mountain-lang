@@ -32,7 +32,7 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 
 ## Current state at a glance (consolidated by the manager, 2026-11-16)
 
-**Phases 1–12 are 🟢 (real CI logs). Phase 13 is in progress (M0–M4 accepted, M5 delivered). Phases 14–25 are ⚪ not started.** Latest confirmed CI run (Phase 12 final, 2026-11-16): **937 tests passed, 0 failed, 0 warnings, 36 `test result:` lines (35 test binaries + doc-tests); smoke tests green (`mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`, `checked 67 file(s), 0 errors`, `Hello, Mountain!`); valgrind steps green on all 9 `examples/memory/` and all 15 `examples/concurrency/` programs.**
+**Phases 1–12 are 🟢 (real CI logs). Phase 13 is in progress (M0–M5 done). Phases 14–25 are ⚪ not started.** Latest confirmed CI run (Phase 12 final, 2026-11-16): **937 tests passed, 0 failed, 0 warnings, 36 `test result:` lines (35 test binaries + doc-tests); smoke tests green (`mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`, `checked 67 file(s), 0 errors`, `Hello, Mountain!`); valgrind steps green on all 9 `examples/memory/` and all 15 `examples/concurrency/` programs.**
 
 | Phase | Status | Confirmed by (real CI) |
 |---|---|---|
@@ -48,7 +48,7 @@ Updated at the end of every phase per Document 25 §2.2, point 5.
 | 10 LLVM codegen + native backend | 🟢 | 278 |
 | 11a / 11b / 11c Memory management + codegen foundations | 🟢 | 308 / 413 / 603 (+ valgrind step) |
 | 12 Closures, generators, async, concurrency | 🟢 | 660 (M0) / 713 (M1) / 754 (M2) / 800 (M3) / 857 (M4) / 922 (M5) / **937 (final)**; valgrind on 9 + 15 programs; 10,000-task load test green in CI |
-| 13 Language completions, atomics, locks, channels, select, lock-free | 🟡 in progress: M0–M4 accepted by the manager; M5 (lock-free stack and queue in Mountain, ABA test, stress, sanitizers) delivered: 1115 tests, 0 warnings, valgrind 19 memory + 36 concurrency programs; M6 to do | — |
+| 13 Language completions, atomics, locks, channels, select, lock-free | 🟡 in progress: M0–M5 (lock-free stack and queue in Mountain, ABA test, stress, sanitizers) confirmed by real CI: 1115 tests, 0 warnings, 42 result lines, valgrind 19 memory + 36 concurrency programs, TSAN 3/3 clean; M6 (volatile, audit, banner, final-13.zip) to do | — |
 | 14–25 | ⚪ | — |
 
 **Session practice (owner decision 2026-11-08):** one fresh chat per phase, and the previous phase's chat is deleted after the manager has approved that phase. The coding assistant keeps this file current while it works; the manager does one final consolidation per phase (this section and the two registers below). Per-phase work files (`WORKLOG_*.md`) are scratch notes: this file is the record.
@@ -2552,7 +2552,7 @@ Per-binary counts: lib 60, assoc_types 8, borrow_checks 19, c1_carryover 40, c2_
 **Exact CI expectations (job `build-and-test`):** step "Run tests": 36 `test result: ok` lines, grand total **937 passed, 0 failed**, 0 warnings; smoke step `cargo run -- --version` prints `mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)`; `mtnc check examples` -> `checked 67 file(s), 0 errors` and hello -> `Hello, Mountain!`; "Memory examples under valgrind": 9 programs clean; "Concurrency examples under valgrind": 15 programs, each line `valgrind clean: examples/concurrency/<name>.mtn`. Load-test numbers to look for are printed only locally (the test is silent in CI unless run with `--nocapture`): `rt: workers=4 spawned=10000 completed=10000 peak_live=10000`.
 **Flagged for the manager (M6):** (1) §6 matrix: checked by the manager, complete. (2) The load test relies on a 2.5 s first sleep (see 3); it passed in the real CI run. (3) ThreadSanitizer covers the runtime only. (4) Manager decision 2026-11-16: Phase 12 is 🟢. **Files changed (M6):** `src/types.rs` (`f::<T>` value, actor message wording), `src/mono.rs`, `src/codegen.rs`, `src/main.rs` (banner); tests `tests/phase12_m6.rs` (new), `tests/phase12_m5.rs` (2 expectations), `tests/c7_final.rs` (1 example); `examples/generic_fn_value.mtn` (new); `README.md`, `PROGRESS.md`, `WORKLOG_12.md`. `ci.yml` unchanged.
 
-## Phase 13 — 🟡 IN PROGRESS (M0–M4 accepted; M5 delivered as `checkpoint-M5.zip`). Work notes: `WORKLOG_13.md`
+## Phase 13 — 🟡 IN PROGRESS (M0–M5 accepted by the manager on 2026-11-27; M6 next; docs v11). Work notes: `WORKLOG_13.md`
 
 ### M0 — language completions (checkpoint-M0)
 1. **Baseline:** 937 tests passed, 0 failed, 0 warnings before any change (fresh `cargo test`).
@@ -2608,7 +2608,7 @@ Spec contradictions / approvals needed, at the top: **none new.** The three M3 r
 9. **Files to upload by hand (beyond the zip's tree):** `.github/workflows/ci.yml` (one new step, `bash scripts/tsan_runtime.sh`, after the valgrind steps). Delete the stale `PROGRESS .md` (with a space) on GitHub if it is still there.
 
 ### M5 — lock-free structures written in Mountain (checkpoint-M5)
-Spec contradictions / approvals needed, at the top: **one decision for the manager to confirm (register 62):** Doc 14 §4 sketches the stack head as `Atomic<*mut Node<T>>`, but a pointer plus a tag in one word needs a packed integer; I used `Atomic<usize>` (48-bit address + 16-bit tag), which Doc 14 §5 describes ("packed alongside the pointer") and which needs no new language feature. The queue uses `Atomic<*mut Node<T>>` as specified. No other contradiction: Doc 14 §3.2 (help the lagging tail), §4, §5, §9.6 and the Doc 25 Phase 13 exit criterion are implemented as written. Nothing was invented.
+Spec contradictions / approvals needed, at the top: **one decision for the manager (register 62) — APPROVED 2026-11-27:** Doc 14 §4 sketches the stack head as `Atomic<*mut Node<T>>`, but a pointer plus a tag in one word needs a packed integer; I used `Atomic<usize>` (48-bit address + 16-bit tag), which Doc 14 §5 describes ("packed alongside the pointer") and which needs no new language feature. The queue uses `Atomic<*mut Node<T>>` as specified. No other contradiction: Doc 14 §3.2 (help the lagging tail), §4, §5, §9.6 and the Doc 25 Phase 13 exit criterion are implemented as written. Nothing was invented.
 1. **`examples/concurrency/lockfree_stack.mtn`:** Treiber stack, tagged word, recycling free list, `Drop`; every memory ordering has a comment saying why it is enough; the classic ABA sequence is a function (`aba_sequence`) with a negative control (tag off: corruption).
 2. **`examples/concurrency/lockfree_queue.mtn`:** Michael-Scott queue on `Atomic<*mut Node<T>>` with the lagging-tail helping step in `enqueue` and `dequeue`; never frees until Drop (so no ABA); every ordering commented.
 3. **Reclamation:** stated in both examples and in registers 63, 64.
