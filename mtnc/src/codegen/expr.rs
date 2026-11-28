@@ -544,6 +544,19 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let v = self.expr_as(inner, &from)?;
                 self.cast(v, &from, &to)
             }
+            Expr::Volatile(inner) => {
+                // Doc 23 §17.17: an LLVM volatile load with the natural alignment of the scalar
+                let ty = self.ty_of(e)?;
+                let pv = self.expr(inner)?.into_pointer_value();
+                let lt = self.llty(&ty)?;
+                let v = self.builder.build_load(lt, pv, "vol")?;
+                let align = (self.td.get_abi_alignment(&lt) as u32).max(1);
+                if let Some(i) = v.as_instruction_value() {
+                    let _ = i.set_volatile(true);
+                    let _ = i.set_alignment(align);
+                }
+                Ok(v)
+            }
             Expr::Deref(inner) => {
                 let ty = self.ty_of(e)?;
                 let ity = self.ty_of(inner)?;
@@ -958,6 +971,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     let bptr = self.builder.build_load(ptrt, bp, "box")?.into_pointer_value();
                     return Ok((bptr, ty));
                 }
+                let pv = self.expr(inner)?.into_pointer_value();
+                Ok((pv, ty))
+            }
+            Expr::Volatile(inner) => {
+                let ty = self.ty_of(e)?;
                 let pv = self.expr(inner)?.into_pointer_value();
                 Ok((pv, ty))
             }
@@ -1672,6 +1690,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 return Err(CgErr(format!("cannot assign to the constant/static `{}` (statics are immutable; interior mutability needs `Atomic<T>`, `Mutex<T>` or `RwLock<T>`, Document 14)", n)));
             }
         }
+        let is_volatile = {
+            let mut l = lhs;
+            while let Expr::Paren(i) = l {
+                l = i;
+            }
+            matches!(l, Expr::Volatile(_))
+        };
+        if is_volatile && op != AssignOp::Eq {
+            return Err(CgErr("compound assignment through `volatile` is not allowed; read and write explicitly (Document 23 §17.17)".into()));
+        }
         let (p, lty) = self.place(lhs)?;
         if op == AssignOp::Eq {
             let rty = self.ty_of(rhs)?;
@@ -1682,6 +1710,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     self.drop_in_place(p, &lty)?;
                 }
                 let st = self.builder.build_store(p, v)?;
+                if is_volatile {
+                    let lt = self.llty(&lty)?;
+                    let _ = st.set_volatile(true);
+                    let _ = st.set_alignment((self.td.get_abi_alignment(&lt) as u32).max(1));
+                }
                 if self.packed_ptrs.contains(&(p.as_value_ref() as usize)) {
                     let _ = st.set_alignment(1);
                 }
