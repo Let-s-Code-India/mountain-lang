@@ -115,7 +115,7 @@ fn a3_no_phase_12_in_user_facing_errors() {
 #[test]
 fn e1_version_banner() {
     let o = Command::new(mtnc()).arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)");
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "mtnc 1.0.0-dev (Phase 13 — atomics, locks, channels, select)");
 }
 
 // ---- (b) load test: 10,000 tasks SIMULTANEOUSLY SUSPENDED (Doc 25 §2.3, Phase 12 exit criterion)

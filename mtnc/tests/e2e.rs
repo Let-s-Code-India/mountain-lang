@@ -493,8 +493,9 @@ fn check_subcommand_runs_the_whole_front_end() {
 #[test]
 fn unsupported_features_give_clear_codegen_errors_not_crashes() {
     let cases = [
-        // `spawn` and `await` are supported since Phase 12, `Atomic`/locks/`channel`/`select` since Phase 13 M1-M4; `volatile` (M6) is not yet
-        ("fn main() { let x = 1; volatile x; }\n", "Phase"),
+        // `spawn` and `await` are supported since Phase 12, everything of Phase 13 since its M6; the remaining gates name a later phase
+        ("mod m { fn f() {} }\nfn main() {}\n", "Phase 14"),
+        ("server S { listen(80); }\nfn main() {}\n", "Phase 17"),
     ];
     for (src, needle) in cases {
         let err = build_must_fail(src);

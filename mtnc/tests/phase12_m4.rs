@@ -78,10 +78,6 @@ fn sorted_lines(s: &str) -> Vec<String> {
 
 // ---------------------------------------------------------------- M3 leftovers
 
-fn phase13(src: &str, name: &str) {
-    rejects(src, &format!("`{}` is not yet supported by codegen — Phase 13", name));
-}
-
 // Phase 13 M2 implemented `Mutex<T>`, `RwLock<T>` and `Spinlock`: the old gate is gone (tests/phase13_m2.rs covers them).
 #[test]
 fn locks_are_no_longer_gated_by_phase13() {
@@ -109,11 +105,6 @@ fn channel_is_no_longer_gated_by_phase13() {
 fn select_is_no_longer_gated_by_phase13() {
     assert_eq!(out("fn main() { let (tx, rx) = channel::<i32>(2); tx.send(5); println(select { case v = <-rx: match v { Some(x) => x, None => 0 }, }); }"), "5\n");
     rejects("fn main() { select { } }", "`select` needs at least one");
-}
-
-#[test]
-fn phase13_volatile() {
-    phase13("fn main() { let x = 1; volatile x; }", "volatile");
 }
 
 #[test]
