@@ -637,6 +637,9 @@ pub enum Expr {
     Unsafe(Box<Block>),
     /// Phase 11b M6 (Doc 23 §17.9): prefix `*p`, the dereference of a raw pointer (`ptr_expr`).
     Deref(Box<Expr>),
+    /// Phase 13 M6 (Doc 23 §17.17): `volatile *p`, a volatile read of the raw pointer `p` (as the left side of `=`:
+    /// a volatile write). The operand is the pointer expression, as in `Deref`.
+    Volatile(Box<Expr>),
 }
 
 // ---------- Database query expression (Document 20 / Doc23 §11) ----------

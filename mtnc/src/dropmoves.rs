@@ -110,7 +110,7 @@ impl<'a> Walker<'a> {
                 self.visit(base, false);
             }
             Expr::Paren(x) => self.visit(x, mv),
-            Expr::Borrow { expr, .. } | Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Deref(expr) => self.visit(expr, false),
+            Expr::Borrow { expr, .. } | Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Deref(expr) | Expr::Volatile(expr) => self.visit(expr, false),
             Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) => self.visit(x, true),
             Expr::Return(x) => {
                 if let Some(x) = x {

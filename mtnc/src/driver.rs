@@ -77,41 +77,12 @@ fn inject_prelude(program: &mut crate::ast::Program) {
     program.items = items;
 }
 
-/// Document 12 §11.8 gate for names that arrive in Phase 13. `Atomic` (M1) and `Mutex`, `RwLock`,
-/// `Spinlock` (M2), `channel` (M3) and `select` (M4) are implemented, so the name list is empty; only
-/// `volatile` (M6) is still reported where it is used. A program that declares its own item of
-/// a listed name (`struct X`, `fn X`, ...) is left alone.
-fn phase13_names(tokens: &[crate::token::Token]) -> Vec<String> {
-    use crate::token::{Keyword, TokenKind};
-    const NAMES: [&str; 0] = [];
-    let declares = |name: &str| {
-        tokens.windows(2).any(|w| {
-            matches!(&w[0].kind, TokenKind::Keyword(Keyword::Struct | Keyword::Enum | Keyword::Trait | Keyword::Fn | Keyword::Type))
-                && matches!(&w[1].kind, TokenKind::Ident(n) if n == name)
-        })
-    };
-    let mut out = Vec::new();
-    for t in tokens {
-        let name = match &t.kind {
-            TokenKind::Ident(n) if NAMES.contains(&n.as_str()) && !declares(n) => n.clone(),
-            TokenKind::Keyword(Keyword::Volatile) => "volatile".to_string(),
-            _ => continue,
-        };
-        out.push(format!("error: `{}` is not yet supported by codegen — Phase 13 (Document 12 §11.8) --> {}", name, t.span));
-    }
-    out
-}
-
 pub fn check_source(src: &str) -> Result<Checked, Vec<String>> {
     let (tokens, lex_errs) = lexer::tokenize(src);
     if !lex_errs.is_empty() {
         return Err(lex_errs.iter().map(|d| d.to_string()).collect());
     }
     let wants_async_leaves = tokens.iter().any(|t| matches!(&t.kind, crate::token::TokenKind::Ident(n) if n == "yieldNow" || n == "sleepMs"));
-    let phase13 = phase13_names(&tokens);
-    if !phase13.is_empty() {
-        return Err(phase13);
-    }
     let (mut program, parse_errs) = parse_program(tokens);
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| format!("error: {} --> {}", e.message, e.span)).collect());

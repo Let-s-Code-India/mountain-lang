@@ -2984,6 +2984,40 @@ impl TypeChecker {
                 t
             }
 
+            Expr::Volatile(inner) => {
+                // Phase 13 M6, Document 23 §17.17: `volatile *p`
+                let t = self.check_expr(inner, None, env, ctx);
+                match t {
+                    Ty::RawPtr(_, pointee) => {
+                        if self.unsafe_depth == 0 {
+                            self.errors.push(TypeError {
+                                message: "a `volatile` access is only allowed inside an `unsafe` block (Document 23 §17.17)".into(),
+                                context: ctx.into(),
+                            });
+                        }
+                        let scalar = matches!(
+                            *pointee,
+                            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Char | Ty::RawPtr(..)
+                        );
+                        if !scalar {
+                            self.errors.push(TypeError {
+                                message: format!("`volatile` works on scalar types (`bool`, `char`, integers, floats, raw pointers), not `{}`; read or write the fields or elements one by one (Document 23 §17.17)", pointee),
+                                context: ctx.into(),
+                            });
+                        }
+                        *pointee
+                    }
+                    Ty::Never => Ty::Never,
+                    other => {
+                        self.errors.push(TypeError {
+                            message: format!("`volatile` needs a raw pointer (`*const T` or `*mut T`), found `{}`; it is written `volatile *p` (Document 23 §17.17)", other),
+                            context: ctx.into(),
+                        });
+                        Ty::Unit
+                    }
+                }
+            }
+
             Expr::Deref(inner) => {
                 let t = self.check_expr(inner, None, env, ctx);
                 match t {
@@ -3056,6 +3090,20 @@ impl TypeChecker {
                         if let Some(Ty::RawPtr(false, _)) = self.expr_types.get(&(p.as_ref() as *const Expr as usize)) {
                             self.errors.push(TypeError {
                                 message: "cannot assign through a `*const T` pointer; only `*mut T` is writable (Document 23 §17.9)".into(),
+                                context: ctx.into(),
+                            });
+                        }
+                    }
+                    if let Expr::Volatile(p) = l {
+                        if let Some(Ty::RawPtr(false, _)) = self.expr_types.get(&(p.as_ref() as *const Expr as usize)) {
+                            self.errors.push(TypeError {
+                                message: "cannot write through a `*const T` pointer with `volatile`; only `*mut T` is writable (Document 23 §17.17)".into(),
+                                context: ctx.into(),
+                            });
+                        }
+                        if *op != AssignOp::Eq {
+                            self.errors.push(TypeError {
+                                message: "compound assignment (`volatile *p += 1`) is not allowed: it would be a hidden read and write; read with `let v = volatile *p;` and write with `volatile *p = v + 1;` explicitly (Document 23 §17.17)".into(),
                                 context: ctx.into(),
                             });
                         }

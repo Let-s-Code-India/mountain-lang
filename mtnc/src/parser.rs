@@ -1385,6 +1385,17 @@ impl Parser {
             let e = self.parse_prefix()?;
             return Ok(Expr::Deref(Box::new(Expr::Deref(Box::new(e)))));
         }
+        // Phase 13 M6 (Doc 23 §17.17): `volatile "*" unary_expr` is a volatile read; as the left side of `=` a write.
+        if self.check_kw(Keyword::Volatile) {
+            let span = self.peek().span.clone();
+            self.advance();
+            if !self.check_op(Op::Star) {
+                return Err(ParseError { message: "`volatile` is written `volatile *p` (a volatile read) or `volatile *p = v;` (a volatile write) on a raw pointer `p`; it is not a variable or field modifier in Mountain 1.0 (Document 23 §17.17)".into(), span });
+            }
+            self.advance();
+            let e = self.parse_prefix()?;
+            return Ok(Expr::Volatile(Box::new(e)));
+        }
         if self.check_op(Op::Amp) {
             self.advance();
             let mutable = self.eat_kw(Keyword::Mut);

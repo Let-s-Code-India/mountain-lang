@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         "build" => cmd_build(&args[2..], false),
         "run" => cmd_build(&args[2..], true),
         "--version" | "-V" => {
-            println!("mtnc 1.0.0-dev (Phase 12 — closures, generators, async, concurrency)");
+            println!("mtnc 1.0.0-dev (Phase 13 — atomics, locks, channels, select)");
             ExitCode::SUCCESS
         }
         "test" | "bench" | "doc" | "fmt" => {

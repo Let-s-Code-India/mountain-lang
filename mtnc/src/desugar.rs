@@ -131,7 +131,7 @@ pub(crate) fn block_children(b: &Block) -> Vec<Child<'_>> {
 pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Spawn(x) => out.push(ChildMut::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Volatile(x) | Expr::Spawn(x) => out.push(ChildMut::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter_mut() {
                 out.push(ChildMut::E(x));
@@ -231,7 +231,7 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<ChildMut<'_>> {
 pub(crate) fn expr_children(e: &Expr) -> Vec<Child<'_>> {
     let mut out = Vec::new();
     match e {
-        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Spawn(x) => out.push(Child::E(x)),
+        Expr::Paren(x) | Expr::Await(x) | Expr::Propagate(x) | Expr::Throw(x) | Expr::Yield(x) | Expr::Deref(x) | Expr::Volatile(x) | Expr::Spawn(x) => out.push(Child::E(x)),
         Expr::Tuple(v) | Expr::Array(v) => {
             for x in v.iter() {
                 out.push(Child::E(x));

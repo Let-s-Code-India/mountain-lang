@@ -1014,7 +1014,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
 
     /// A `static` (Document 3 Category A): one fixed global with a constant
     /// initializer. Statics are read-only in this phase (the AST has no
-    /// `static mut`; interior mutability needs `Atomic<T>`, Phase 13).
+    /// `static mut`; interior mutability needs `Atomic<T>`, `Mutex<T>` or `RwLock<T>`).
     fn declare_static(&mut self, st: &StaticDecl) -> R<()> {
         let ty = resolve_type(&st.ty);
         let init = self.const_val(&st.value, &ty)?;

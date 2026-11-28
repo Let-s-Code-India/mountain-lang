@@ -1440,7 +1440,7 @@ impl<'a> FnChecker<'a> {
             Expr::Literal(_) => {}
             Expr::Path(_) | Expr::TurbofishPath { .. } => {}
             Expr::Paren(e) | Expr::Propagate(e) | Expr::Throw(e)
-            | Expr::Unary { expr: e, .. } | Expr::Deref(e) => self.check_expr(e, block, idx),
+            | Expr::Unary { expr: e, .. } | Expr::Deref(e) | Expr::Volatile(e) => self.check_expr(e, block, idx),
             // `await e` consumes the future / join handle: awaiting it twice is a use after move
             Expr::Yield(e) | Expr::Await(e) => self.check_moving_operand(e, block, idx),
             Expr::Tuple(items) | Expr::Array(items) => {
@@ -1884,7 +1884,7 @@ fn expr_reads_ident(expr: &Expr, name: &str) -> bool {
         Expr::Literal(_) | Expr::Path(_) | Expr::TurbofishPath { .. } => false,
         Expr::Paren(e) | Expr::Await(e) | Expr::Propagate(e) | Expr::Throw(e)
         | Expr::Unary { expr: e, .. } | Expr::Yield(e) | Expr::Field { expr: e, .. }
-        | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } | Expr::Deref(e) => expr_reads_ident(e, name),
+        | Expr::Cast { expr: e, .. } | Expr::Borrow { expr: e, .. } | Expr::Deref(e) | Expr::Volatile(e) => expr_reads_ident(e, name),
         Expr::Tuple(items) | Expr::Array(items) => items.iter().any(|e| expr_reads_ident(e, name)),
         Expr::ArrayRepeat(x, n) => expr_reads_ident(x, name) || expr_reads_ident(n, name),
         Expr::StructLit { fields, spread, .. } => {
